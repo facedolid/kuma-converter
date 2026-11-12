@@ -981,18 +981,31 @@ class Compiler(DeclarationSupport):
         return Value("([&]() { " + " ".join(statements) + " }())", output)
 
     def sort_call(self, node: Node) -> Value:
-        if node.extra.get("kwargs") or len(node.children) not in (1, 2):
-            self.fail("sort(a[,compare]) / sorted(a[,compare]) と書いてください", node)
+        kwargs = node.extra.get("kwargs", {})
+        sorting = node.value in ("sort", "sorted")
+        allowed = {"start", "end", "compare"} if sorting else {"start", "end"}
+        if set(kwargs) - allowed or len(node.children) not in ((1, 2) if sorting else (1,)):
+            self.fail("sort/sorted(a[,compare], start=0, end=len(a))、reverse/reversed(a, start=0, end=len(a)) と書いてください", node)
+        if len(node.children) == 2 and "compare" in kwargs:
+            self.fail("比較関数は位置引数かcompareのどちらかで1回指定してください", node)
         sequence = self.expr(node.children[0])
         if sequence.type.name != "vec":
-            self.fail("sort/sortedは配列に使ってください", node)
-        inplace = node.value == "sort"
+            self.fail("sort/sorted/reverse/reversedは配列に使ってください", node)
+        inplace = node.value in ("sort", "reverse")
         if inplace:
             self.writable(sequence, node)
         code = None
-        if len(node.children) == 2:
-            with self.protect(sequence.origins):
-                compare = self.expr(node.children[1])
+        bounds = []
+        with self.protect(sequence.origins):
+            for key, expr in kwargs.items():
+                if key == "compare": continue
+                bound = self.expr(expr)
+                if bound.type not in INTEGER:
+                    self.fail("start/endは整数の添字にしてください", node)
+                bounds.append((key, bound))
+            comparator = node.children[1] if len(node.children) == 2 else kwargs.get("compare")
+            if comparator is not None:
+                compare = self.expr(comparator)
                 if compare.function is None:
                     self.fail("比較関数は2引数の関数にしてください", node)
                 code, result = self.lower_function(compare.function, [sequence.type.args[0]] * 2)
@@ -1002,8 +1015,18 @@ class Compiler(DeclarationSupport):
         output = VOID if inplace else sequence.type
         # sorted owns its copy before the comparator runs; sort borrows in place.
         qualifier = "auto&" if inplace else sequence.type.cpp()
-        expression = f"kuma_rt::sort({source}" + (", " + code if code is not None else "") + ");"
-        body = f"{qualifier} {source} = {sequence.code}; {expression}"
+        body = f"{qualifier} {source} = {sequence.code}; "
+        arguments = [source]
+        operation = "sort" if sorting else "reverse"
+        if bounds:
+            names = {}
+            for key, bound in bounds:
+                names[key] = self.fresh(key)
+                body += f"long long {names[key]} = {bound.code}; "
+            arguments.extend((names.get("start", "0LL"), names.get("end", "std::nullopt")))
+            operation += "_range"
+        if code is not None: arguments.append(code)
+        body += f"kuma_rt::{operation}(" + ", ".join(arguments) + ");"
         if not inplace:
             body += f" return {source};"
         return Value("([&]() { " + body + " }())", output)
@@ -1029,7 +1052,7 @@ class Compiler(DeclarationSupport):
             return self.iter_adapter(node)
         if name in ("reduce", "any", "all", "count", "some", "every"):
             return self.aggregate_call(node)
-        if name in ("sort", "sorted"):
+        if name in ("sort", "sorted", "reverse", "reversed"):
             return self.sort_call(node)
         collection = self.collection_call(node, expected)
         if collection is not None:

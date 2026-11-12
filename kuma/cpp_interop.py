@@ -187,6 +187,27 @@ class CppParser(InitializerSupport, Parser):
                 self.layout_headers.pop()
             self.depth -= 1
 
+    def ordering_call_needs_lowering(self, tokens: list[Token]) -> bool:
+        for index, token in enumerate(tokens[:-1]):
+            if (token.text not in {'sort', 'sorted', 'reverse', 'reversed'}
+                    or tokens[index + 1].text != '('
+                    or index and tokens[index - 1].text in {'.', '->', '::'}):
+                continue
+            depth, commas, named = 0, 0, False
+            for at in range(index + 1, len(tokens)):
+                text = tokens[at].text
+                if text in {'(', '[', '{'}: depth += 1
+                elif text in {')', ']', '}'}:
+                    depth -= 1
+                    if depth == 0: break
+                elif depth == 1:
+                    commas += text == ','
+                    named |= (text in {'start', 'end', 'compare'} and at + 1 < len(tokens)
+                              and tokens[at + 1].text == '=')
+            # Keep ordinary two-iterator C++ calls intact.
+            if named or (commas == 0 and token.text not in self.native_bare_functions): return True
+        return False
+
     def needs_native_shortcuts(self, content: list[Token]) -> bool:
         """Recognize omitted punctuation in native function bodies, not arbitrary C++.
 
@@ -300,7 +321,7 @@ class CppParser(InitializerSupport, Parser):
                 self.group('{', '}')
                 content = self.tokens[opening:self.position]
                 sugar = any(t.text in {':=', '=>', '..', '**', 'input'} for t in content)
-                sugar |= any(t.text in {'map', 'filter', 'sum', 'sorted'} and i and content[i-1].text == '.'
+                sugar |= any(t.text in {'map', 'filter', 'sum', 'sort', 'sorted', 'reverse', 'reversed'} and i and content[i-1].text == '.'
                              for i, t in enumerate(content))
                 square = 0
                 for t in content:
@@ -310,6 +331,7 @@ class CppParser(InitializerSupport, Parser):
                 sugar |= any(t.text in _BARE_CALLS and i + 1 < len(content) and content[i+1].text != '('
                              for i, t in enumerate(content))
                 sugar |= self.needs_native_shortcuts(content)
+                sugar |= self.ordering_call_needs_lowering(content)
                 is_main = name.text == 'main'
                 if not sugar:
                     return Node('cpp_global', start, self.source_range(start, self.tokens[self.position - 1]),
@@ -374,7 +396,9 @@ class CppParser(InitializerSupport, Parser):
         text = [t.text for t in tokens]
         if any(t in {':=', '=>', '..'} for t in text):
             return True
-        if any(t in {'map', 'filter', 'sum', 'sorted'} and i and text[i - 1] == '.'
+        if self.ordering_call_needs_lowering(tokens):
+            return True
+        if any(t in {'map', 'filter', 'sum', 'sort', 'sorted', 'reverse', 'reversed'} and i and text[i - 1] == '.'
                for i, t in enumerate(text)):
             return True
         square = 0
@@ -646,9 +670,11 @@ class CppParser(InitializerSupport, Parser):
         if any(t == '[' and (i == 0 or texts[i-1] in {'=', '(', ',', 'return'})
                for i, t in enumerate(texts)):
             return None
-        helpers = {'sum', 'map', 'filter', 'sorted', 'reduce', 'len', 'any', 'all',
+        helpers = {'sum', 'map', 'filter', 'sort', 'sorted', 'reverse', 'reduce', 'len', 'any', 'all',
                    'some', 'every', 'reversed'}
         if any(texts[i] in {'.', '->'} and texts[i+1] in helpers for i in range(len(texts)-1)):
+            return None
+        if self.ordering_call_needs_lowering(part):
             return None
         if start.text in _BARE_CALLS and (len(texts) < 2 or texts[1] != '('):
             return None
@@ -1217,6 +1243,33 @@ class CppEmitter:
                           'all', 'some', 'every', 'discard_line', 'min', 'max', 'abs'}
             native_args = kind == 'method' or (kind == 'call' and value not in kuma_calls | set(_TYPES))
             args = [self.expr(c, native=native_args) for c in node.children]
+            if value in {'sort', 'sorted', 'reverse', 'reversed'} and not node.extra.get('pointer'):
+                sorting = value in {'sort', 'sorted'}
+                self.options(node, kw, {'start', 'end', 'compare'} if sorting else {'start', 'end'})
+                if len(args) not in ((1, 2) if sorting else (1,)):
+                    self.fail(node, 'sort/sorted(a[,compare])、reverse/reversed(a) にstart/endを指定してください')
+                if len(args) == 2 and 'compare' in kw:
+                    self.fail(node, '比較関数は位置引数かcompareのどちらかで1回指定してください')
+                if 'compare' in kw: args.append(self.expr(kw['compare']))
+                if 'start' in kw or 'end' in kw:
+                    source = self.fresh('range_source')
+                    copying = value in {'sorted', 'reversed'}
+                    body = ('auto' if copying else 'auto&') + f' {source} = {args[0]}; '
+                    bounds = {}
+                    for key, expr in kw.items():
+                        if key == 'compare': continue
+                        bounds[key] = self.fresh(key)
+                        body += f'auto {bounds[key]} = kuma_rt::algorithm_index({self.expr(expr)}); '
+                    parameters = [source, bounds.get('start', '0LL'), bounds.get('end', 'std::nullopt'), *args[1:]]
+                    operation = 'sort' if sorting else 'reverse'
+                    body += f'kuma_rt::{operation}_range(' + ', '.join(parameters) + '); '
+                    if copying: body += f'return {source};'
+                    return '([&]() { ' + body + ' }())'
+                # Preserve native member priority for calls without range keywords.
+                helper = ('cpp_member_' + value) if kind == 'method' else {
+                    'sort': 'cpp_sort', 'sorted': 'cpp_sorted',
+                    'reverse': 'cpp_reverse', 'reversed': 'cpp_reversed'}[value]
+                return 'kuma_rt::' + helper + '(' + ', '.join(args) + ')'
             if kind == 'method' and value in member_helpers and not node.extra.get('pointer'):
                 self.options(node, kw)
                 return f'kuma_rt::cpp_member_{value}(' + ', '.join(args) + ')'
