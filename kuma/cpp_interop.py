@@ -1224,7 +1224,8 @@ class CppEmitter:
         if kind == 'slice':
             self.fail(node, '混在モードのスライスは未対応です。std::vectorの範囲構築などを使用してください')
         if kind == 'member':
-            return f'({self.expr(node.children[0])})' + ('->' if node.extra.get('pointer') else '.') + value
+            access = f'({self.expr(node.children[0])})' + ('->' if node.extra.get('pointer') else '.') + value
+            return access + ('()' if node.extra.get('optional_collection_call') else '')
         if kind == 'lambda':
             return self.callback(node.extra['params'], self.expr(node.children[0]) if node.extra.get('expression') else self.statements(node.extra['body']), bool(node.extra.get('expression')))
         if kind == 'comprehension': return self.comprehension(node)
@@ -1465,6 +1466,71 @@ class CppEmitter:
         self.fail(node, '混在モードで未対応の文です: ' + kind)
 
 
+def mark_optional_collection_calls(nodes, known=None):
+    """Conservative lexical proof for mixed-mode zero-argument calls.
+
+    Only auto-bound Kuma vector/string values qualify. Opaque C++ discards
+    knowledge rather than guessing declarations or shadowing. Unrelated native
+    fields (including bit-fields) are never routed through a value helper.
+    """
+    known = set(known or ())
+
+    def collection(value):
+        if value.kind == 'name':
+            return value.value in known
+        if value.kind == 'array':
+            return bool(value.children)
+        if value.kind == 'literal':
+            return value.extra.get('type') == 'string'
+        if value.kind == 'call' and value.value == 'input':
+            return bool(value.children) and not value.extra.get('types')
+        return False
+
+    def expression(value, names):
+        # Lambda parameters and native fragments may shadow every outer name.
+        if value.kind in {'lambda', 'comprehension', 'cpp_opaque_sections'}:
+            return
+        for child in value.children:
+            expression(child, names)
+        if (value.kind == 'member' and value.value in {'size', 'empty', 'clear', 'pop_back'}
+                and not value.extra.get('pointer') and value.children[0].kind == 'name'
+                and value.children[0].value in names):
+            value.extra['optional_collection_call'] = True
+
+    for node in nodes:
+        if node.kind == 'cpp_stmt':
+            bare = re.fullmatch(r'([A-Za-z_]\w*)\s*\.\s*(size|empty|clear|pop_back)\s*;', node.value)
+            if bare and bare[1] in known:
+                node.value = bare[1] + '.' + bare[2] + '();'
+                continue
+        if node.kind.startswith('cpp_'):
+            # No inference across unknown native declarations/macros/scopes.
+            known.clear()
+            if node.kind == 'cpp_opaque_sections':
+                for section in node.extra.get('sections', []):
+                    if section[0] not in {'raw', 'expression', 'field'}:
+                        mark_optional_collection_calls(section[1])
+            else:
+                for key in ('body', 'else'):
+                    mark_optional_collection_calls(node.extra.get(key, []))
+                for _, body in node.extra.get('handlers', []):
+                    mark_optional_collection_calls(body)
+            continue
+        inferred = (node.kind == 'declare' and len(node.value) == 1
+                    and not node.extra.get('type') and collection(node.children[0]))
+        for child in node.children:
+            expression(child, known)
+        if node.kind == 'declare':
+            known.difference_update(node.value)
+            if inferred:
+                known.add(node.value[0])
+        for key in ('body', 'else'):
+            # Conditions cannot declare locals in Kuma; loop/function bindings
+            # can. Their scopes deliberately start fresh until fully resolved.
+            mark_optional_collection_calls(node.extra.get(key, []),
+                                           known if node.kind in {'if', 'while'} else None)
+
+
 def transpile_cpp(source: str, filename: str, *, emitter=None,
                   native_checked: bool = False) -> str:
     from .native_cpp import native_cpp
@@ -1475,6 +1541,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
         if t.kind == 'IDENT' and t.text.startswith('kuma_gen_'):
             raise KumaError('kuma_gen_ は生成コード用の予約名です', t, code='KUMA_CPP')
     nodes = parser.program()
+    mark_optional_collection_calls(nodes)
     emitter = emitter or CppEmitter(filename)
     # Dependent bases, class members and preprocessing can hide declarations.
     # Keep their native assignment semantics; := remains explicit everywhere.

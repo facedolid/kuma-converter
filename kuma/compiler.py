@@ -298,6 +298,10 @@ class Compiler(DeclarationSupport):
 
     def expr(self, node: Node, expected: Type | None = None) -> Value:
         kind = node.kind
+        if kind == "resolved_value":
+            # Internal only: reuse a checked receiver without consuming or
+            # evaluating its expression a second time during member lowering.
+            return node.value
         if self.optimize and kind in ("call", "method") and node.value == "sum" and not lazy_root(node):
             from .fusion import lower_sum
             fused = lower_sum(self, node)

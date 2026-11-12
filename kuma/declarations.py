@@ -115,6 +115,20 @@ class DeclarationSupport:
     def member(self, node):
         from .compiler import Value
         owner = self.expr(node.children[0])
+        # Only typed Kuma collections have implicit zero-argument methods.
+        # Record members (including callable fields) remain ordinary fields.
+        zero_arg = {
+            'vec': {'size', 'len', 'empty', 'clear', 'pop_back', 'sum',
+                    'sort', 'sorted', 'reverse', 'reversed'},
+            'string': {'size', 'len', 'empty', 'clear', 'pop_back'},
+            'set': {'size', 'len', 'empty', 'clear'},
+            'dict': {'size', 'len', 'empty', 'clear'},
+        }
+        if node.value in zero_arg.get(owner.type.name, ()):
+            from .model import Node
+            return self.call(Node('method', node.token, node.value,
+                                  [Node('resolved_value', node.children[0].token, owner)],
+                                  {'kwargs': {}}), None)
         fields = self.records.get(owner.type.name.removeprefix('record:'), [])
         field = next((t for name, t, _ in fields if name == node.value), None)
         if field is None:
