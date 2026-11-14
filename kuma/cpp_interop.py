@@ -69,7 +69,7 @@ class CppParser(InitializerSupport, Parser):
         # C++ function names are discovered syntactically, without pretending
         # to resolve overloads or reconstruct header declarations. The C++
         # compiler remains the authority on whether a bare call is legal.
-        self.native_bare_functions = {'YN', 'fast_io'}
+        self.native_bare_functions = {'YN', 'fast_io', 'println'}
         class_names = {self.tokens[i + 1].text for i, token in enumerate(self.tokens[:-1])
                        if token.text in {'class', 'struct'} and self.tokens[i + 1].kind == 'IDENT'}
         self.native_bare_functions.update(self.macro_names)
@@ -758,6 +758,37 @@ class CppParser(InitializerSupport, Parser):
         return Node('cpp_if_native', start, header,
                     extra={'body': body, 'else': otherwise})
 
+    def parenthesized_println_slice(self) -> Node | None:
+        """Lower explicit slice arguments without taking ownership of C++ calls.
+
+        Ordinary println calls remain byte-for-byte native, including custom
+        overloads/macros. Only a successfully parsed Kuma slice opts in.
+        """
+        begin = self.position
+        if self.current.text != 'println' or self.tokens[begin + 1].text != '(':
+            return None
+        start = self.take()
+        self.take()
+        saved_depth = self.group_depth
+        self.group_depth += 1
+        try:
+            args = []
+            if self.current.text != ')':
+                args.append(self.expression())
+                while self.accept(','):
+                    args.append(self.expression())
+            self.expect(')')
+            def contains_slice(node):
+                return node.kind == 'slice' or any(contains_slice(c) for c in node.children)
+            if self.at_end() and any(contains_slice(arg) for arg in args):
+                return Node('cpp_bare_call', start, 'println', args)
+        except KumaError:
+            pass
+        finally:
+            self.group_depth = saved_depth
+        self.position = begin
+        return None
+
     def bare_native_call(self) -> Node | None:
         """Allow single-line native callee + arguments, without type guessing.
 
@@ -939,6 +970,9 @@ class CppParser(InitializerSupport, Parser):
             header = self.source_range(start, self.tokens[self.position - 1])
             return Node('cpp_loop', start, header, extra={'body': self.block(start)})
         if self.depth:
+            parenthesized = self.parenthesized_println_slice()
+            if parenthesized is not None:
+                return parenthesized
             bare = self.bare_native_call()
             if bare is not None:
                 return bare
@@ -1222,7 +1256,13 @@ class CppEmitter:
             # operator[] as vector indexing or turn map keys into offsets.
             return f'({a})[{i}]'
         if kind == 'slice':
-            self.fail(node, '混在モードのスライスは未対応です。std::vectorの範囲構築などを使用してください')
+            values = iter(node.children[1:])
+            bounds = [('kuma_rt::cpp_slice_bound(' + self.expr(next(values)) + ')')
+                      if present else 'std::nullopt' for present in node.extra['present']]
+            # Aggregate initialization sequences the source and every bound;
+            # no captured lambda or duplicate evaluation is needed.
+            return ('kuma_rt::cpp_slice(kuma_rt::CppSliceRequest{' +
+                    ', '.join([self.expr(node.children[0]), *bounds]) + '})')
         if kind == 'member':
             access = f'({self.expr(node.children[0])})' + ('->' if node.extra.get('pointer') else '.') + value
             return access + ('()' if node.extra.get('optional_collection_call') else '')
@@ -1286,8 +1326,8 @@ class CppEmitter:
                 names = []
                 for arg in args:
                     name = self.fresh('arg'); names.append(name); prefix += f'auto {name} = {arg}; '
-                if value == 'debug': self.fail(node, '混在モードのdebugは未対応です。std::cerrを使用してください')
-                return '([&]() { ' + prefix + f'(kuma_rt::print)({options}' + (', ' + ', '.join(names) if names else '') + '); }())'
+                helper = 'debug_print' if value == 'debug' else 'print'
+                return '([&]() { ' + prefix + f'(kuma_rt::{helper})({options}' + (', ' + ', '.join(names) if names else '') + '); }())'
             if value in {'zip', 'enumerate'}:
                 allowed = {'strict'} if value == 'zip' else {'start'}
                 self.options(node, kw, allowed)
@@ -1431,6 +1471,10 @@ class CppEmitter:
                 return prefix + 'auto [' + ', '.join(names) + '] = ' + self.expr(node.children[0], expected) + ';'
             return prefix + target + ' ' + self.mark(names[0], node.token) + ' = ' + self.expr(node.children[0], annotation) + ';'
         if kind == 'assign':
+            def has_slice(target):
+                return target.kind == 'slice' or any(has_slice(child) for child in target.children)
+            if has_slice(node.children[0]):
+                self.fail(node, '混在モードのスライス代入は未対応です。スライスはコピーを返します')
             marker = ''
             if (self.implicit_assignments and self.in_implicit_main and node.value == '='
                     and node.children[0].kind == 'name'):
@@ -1483,7 +1527,8 @@ def mark_optional_collection_calls(nodes, known=None):
         if value.kind == 'literal':
             return value.extra.get('type') == 'string'
         if value.kind == 'call' and value.value == 'input':
-            return bool(value.children) and not value.extra.get('types')
+            return (value.extra.get('types') == ['string']
+                    or (bool(value.children) and not value.extra.get('types')))
         return False
 
     def expression(value, names):
