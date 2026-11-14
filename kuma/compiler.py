@@ -230,7 +230,7 @@ class Compiler(DeclarationSupport):
         if not value.lvalue:
             self.fail("変更先は変数または配列要素にしてください。関数の再代入は未対応です", node)
         if value.readonly:
-            self.fail("内包表記の束縛変数は読み取り専用です", node, code="KUMA_BORROW")
+            self.fail("この変数・要素は読み取り専用です", node, code="KUMA_BORROW")
         if value.origins & self.protected_roots:
             self.fail("走査中、または要素参照を使用中のコンテナは変更できません", node,
                       code="KUMA_BORROW", hint="独立したコピーを変更するか、走査が終わってから変更してください。")
@@ -478,7 +478,8 @@ class Compiler(DeclarationSupport):
                 result = self.ordered([sequence], target, lambda ns: f"std::get<{int(index.constant)}>({ns[0]})")
                 return result
             if sequence.type.name not in ("vec", "string") or index.type not in INTEGER:
-                self.fail("添字は配列・文字列に対する整数だけに対応しています", node)
+                self.fail("添字は配列・文字列に対する整数だけに対応しています", node,
+                          hint=f"添字を付ける対象の型は {sequence.type}、添字の型は {index.type} です。")
             target = CHAR if sequence.type == STRING else sequence.type.args[0]
             seqname, idxname = self.fresh(), self.fresh()
             # A temporary container must yield an owning element, not a dangling reference.

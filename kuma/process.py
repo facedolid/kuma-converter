@@ -4,7 +4,11 @@ import signal
 import subprocess
 
 def stop_process_group(process: subprocess.Popen[bytes]) -> None:
-    """Terminate the process and children started for the testcase."""
+    """Terminate a child started with start_new_session=True on POSIX.
+
+    Callers must not pass a process that shares their own process group.
+    Windows retains the existing direct-child-only termination behavior.
+    """
     if os.name == "nt":
         process.kill()
         return
@@ -17,7 +21,10 @@ def stop_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         process.wait(timeout=0.2)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        pass
+    # The leader can exit on SIGTERM while a descendant ignores it. Reap the
+    # whole group even when waiting for the leader completed successfully.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass

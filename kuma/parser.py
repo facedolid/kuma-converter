@@ -331,7 +331,23 @@ class Parser:
             self.soft_newlines()
             self.expect(")")
             self.group_depth -= 1
-        return Node("rep", start, name.text, [count], {"body": self.block(start)})
+        missing_body_start = self.current.kind != "NEWLINE" and self.current.text != "{"
+        body_position = self.position
+        while self.tokens[body_position].kind == "NEWLINE":
+            body_position += 1
+        first_body = self.tokens[body_position]
+        missing_indented_body = (self.current.kind == "NEWLINE" and first_body.text != "{" and
+                                 (first_body.kind == "EOF" or first_body.text == "}" or
+                                  first_body.indent <= start.indent))
+        try:
+            body = self.block(start)
+        except KumaError as error:
+            if count.token.line > start.line and (missing_body_start or missing_indented_body):
+                note = ("rep のカンマの後には回数の式が必要です。"
+                        "次の行を回数として読んでいるため、回数の書き忘れも確認してください。")
+                error.hint = (error.hint + "\n" if error.hint else "") + note
+            raise
+        return Node("rep", start, name.text, [count], {"body": body})
 
     def binding_pattern(self) -> Node:
         """Names or recursively nested tuple patterns; no reference bindings."""
