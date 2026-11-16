@@ -16,7 +16,7 @@ import re
 
 from .pipelines import lazy_root, lower_pipeline, pure_expression
 from .declarations import DeclarationSupport
-from .model import KumaError, Node, Token
+from .model import KumaError, Node, Token, safe_sorted_key, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
 from .parser import parse
 from .runtime import CPP_RUNTIME
 from .power import CPP_POWER
@@ -30,17 +30,30 @@ class Type:
     def cpp(self) -> str:
         scalar = {"i64": "long long", "i32": "int", "f64": "double",
                   "string": "std::string", "bool": "bool", "char": "char",
-                  "void": "void", "range": "kuma_rt::Range"}
+                  "void": "void", "range": "kuma_rt::Range", "union_find": "::UnionFind", "dfs_result": "::DfsResult"}
         if self.name.startswith("record:"):
             return "kuma_gen_type_" + self.name.removeprefix("record:")
         if self.name in scalar:
             return scalar[self.name]
+        if self.name in ("min_heap", "max_heap"):
+            element = self.args[0].cpp()
+            comparator = "greater" if self.name == "min_heap" else "less"
+            return f"std::priority_queue<{element}, std::vector<{element}>, std::{comparator}<{element}>>"
+        if self.name == "coordinate_compressor":
+            return "::CoordinateCompressor<long long>"
+        if self.name == "range_fenwick":
+            return "::RangeFenwick<long long>"
+        if self.name == "fenwick":
+            return "::Fenwick<long long>"
+        if self.name == "segment_tree":
+            element = self.args[0].cpp()
+            return f"::SegmentTree<{element}, {element} (*)({element}, {element})>"
         if self.name == "enumerate_view":
             return "kuma_rt::EnumerateView<" + self.args[1].cpp() + ", " + self.args[0].cpp() + ">"
         if self.name == "zip_view":
             return "kuma_rt::ZipView<" + ", ".join(t.cpp() for t in self.args) + ">"
         template = {"vec": "std::vector", "tuple": "std::tuple", "pair": "std::pair",
-                    "set": "std::set", "dict": "std::map"}[self.name]
+                    "set": "std::set", "dict": "std::map", "deque": "std::deque", "SortedList": "kuma_rt::SortedList", "prefix2d": "kuma_rt::Prefix2D"}[self.name]
         return template + "<" + ", ".join(t.cpp() for t in self.args) + ">"
 
     def __str__(self) -> str:
@@ -55,6 +68,7 @@ NUMBER = (I32, I64, F64)
 ALIASES = {"int": "i32", "ll": "i64", "longlong": "i64", "double": "f64",
            "str": "string", "vector": "vec", "map": "dict"}
 RESERVED = {
+    "range", "SortedList",
     "input", "print", "if", "else", "while", "for", "in", "rep", "break",
     "EOF", "continue", "return", "true", "false", "auto", "long", "void", "tuple",
     "i64", "i32", "f64", "bool", "char", "string", "vec", *ALIASES,
@@ -64,6 +78,7 @@ RESERVED = {
     "template", "abs", "flush", "reduce", "any", "all", "count", "some", "every",
 }
 BUILTINS = {
+    "range", "SortedList", "deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "prefix_sum", "prefix_sum2d", "prefix2d", "range_sum", "lower_bound_idx", "upper_bound_idx", "equal_range_idx", "has_bit", "bit_count", "bit_ctz", "rotate90", "transpose", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices", "frequencies", "read_graph", "read_weighted_graph", "bfs_dist", "dijkstra_dist", "bfs_path", "dijkstra_path",
     "input", "print", "len", "size", "sum", "sort", "sorted", "reverse",
     "reversed", "min", "max", "discard_line", "map", "filter",
     "i32", "int", "i64", "ll", "f64", "double", "zip", "enumerate", "lazy", "zip_view", "enumerate_view",
@@ -71,7 +86,7 @@ BUILTINS = {
 }
 
 
-def parse_type(text: str, token: Token, *, records=None) -> Type:
+def parse_type(text: str, token: Token, *, records=None, allow_owned_heaps=False) -> Type:
     tokens = re.findall(r"[A-Za-z_][A-Za-z_0-9]*|[<>,()]", text.replace("long long", "longlong"))
     pos = 0
 
@@ -98,7 +113,11 @@ def parse_type(text: str, token: Token, *, records=None) -> Type:
             if pos >= len(tokens) or tokens[pos] != close:
                 raise KumaError("型の括弧が閉じていません", token)
             pos += 1
+        if name == "prefix2d" and len(args) == 1 and args[0] in NUMBER:
+            return Type("prefix2d", tuple(args))
         if name in ("vec", "set") and len(args) == 1 and args[0] != VOID:
+            return Type(name, tuple(args))
+        if name == "deque" and len(args) == 1 and args[0] != VOID and not (records and name in records):
             return Type(name, tuple(args))
         if name in ("dict", "pair") and len(args) == 2 and VOID not in args:
             return Type(name, tuple(args))
@@ -106,6 +125,23 @@ def parse_type(text: str, token: Token, *, records=None) -> Type:
             return Type(name, tuple(args))
         if not args and records and name in records:
             return Type("record:" + name)
+        if (name in ("min_heap", "max_heap") and len(args) == 1
+                and (allow_owned_heaps or args[0] == Type("pair", (I64, I64)))):
+            return Type(name, tuple(args))
+        if not args and name == "max_heap":
+            return Type("max_heap", (I64,))
+        if not args and name == "min_heap":
+            return Type("min_heap", (I64,))
+        if not args and name == "coordinate_compressor":
+            return Type("coordinate_compressor", (I64,))
+        if not args and name == "range_fenwick":
+            return Type("range_fenwick", (I64,))
+        if not args and name == "fenwick":
+            return Type("fenwick", (I64,))
+        if not args and name == "union_find":
+            return Type("union_find")
+        if not args and name == "dfs_result":
+            return Type("dfs_result")
         if not args and name in {"i64", "i32", "f64", "bool", "char", "string", "void"}:
             return Type(name)
         raise KumaError(f"現在は未対応の型です: {text}", token)
@@ -162,6 +198,9 @@ class Compiler(DeclarationSupport):
         self.line_directives = True
         self.optimize = optimize
         self.uses_power = False
+        self.uses_graph = False
+        self.uses_math = False
+        self.uses_algo = False
         self.observing = False
         self.scopes: list[dict[str, Symbol]] = [{}]
         self.counter = 0
@@ -176,6 +215,30 @@ class Compiler(DeclarationSupport):
         self.function_prototypes = []
         self.function_definitions = []
         self.top_definitions = set()
+
+    def parse_type(self, text, token):
+        type_ = parse_type(text, token, records=self.records, allow_owned_heaps=True)
+        def validate_heap_type(current):
+            if current.name == "deque" and not self.ordered_owned_type_supported(current.args[0]):
+                raise KumaError("deque には対応する所有値を使ってください", token)
+            if current.name in ("min_heap", "max_heap"):
+                element = current.args[0]
+                if not self.heap_owned_type_supported(element):
+                    raise KumaError("ヒープには対応する f64 を含まない所有値を使ってください", token)
+            for child in current.args:
+                validate_heap_type(child)
+        validate_heap_type(type_)
+        if self.has_type(type_, "coordinate_compressor"):
+            self.uses_algo = True
+        if self.has_type(type_, "range_fenwick"):
+            self.uses_algo = True
+        if self.has_type(type_, "fenwick"):
+            self.uses_algo = True
+        if self.has_type(type_, "union_find"):
+            self.uses_algo = True
+        if self.has_type(type_, "dfs_result"):
+            self.uses_graph = True
+        return type_
 
     def fresh(self, suffix: str = "tmp") -> str:
         self.counter += 1
@@ -309,6 +372,12 @@ class Compiler(DeclarationSupport):
                 return fused
         if kind in ("call", "method") and lazy_root(node):
             return lower_pipeline(self, node)
+        if kind == "default_init":
+            type_ = self.parse_type(node.value, node.token)
+            if type_ == VOID:
+                self.fail("void は値初期化できません", node)
+            # This internal node is only the initializer of a typed declaration.
+            return Value("{}", type_)
         if kind == "literal":
             return self.literal(node)
         if kind == "name":
@@ -434,8 +503,8 @@ class Compiler(DeclarationSupport):
             return self.ordered(values, type_, lambda ns: type_.cpp() + "{" + ", ".join(ns) + "}")
         if kind == "slice":
             sequence = self.expr(node.children[0])
-            if sequence.type.name not in ("vec", "string"):
-                self.fail("スライスは配列・文字列に使ってください", node)
+            if sequence.type.name not in ("vec", "string", "SortedList"):
+                self.fail("スライスは配列・文字列・SortedListに使ってください", node)
             # The receiver is borrowed before evaluating bounds. Their effects
             # cannot invalidate it; each present bound is evaluated exactly once.
             with self.protect(sequence.origins):
@@ -455,18 +524,29 @@ class Compiler(DeclarationSupport):
                 else:
                     optional_bounds.append("std::nullopt")
             statements.append(f"return kuma_rt::slice({source_name}, {', '.join(optional_bounds)});")
-            return Value("([&]() { " + " ".join(statements) + " }())", sequence.type)
+            result_type = Type("vec", (sequence.type.args[0],)) if sequence.type.name == "SortedList" else sequence.type
+            return Value("([&]() { " + " ".join(statements) + " }())", result_type)
         if kind == "index":
             sequence = self.expr(node.children[0])
             with self.protect(sequence.origins):
                 index = self.expr(node.children[1])
+            if sequence.type.name == "SortedList":
+                if index.type not in INTEGER:
+                    self.fail("SortedListの添字は整数にしてください", node)
+                return self.ordered([sequence, index], sequence.type.args[0], lambda ns: f"{ns[0]}[{ns[1]}]", borrow=True)
             if sequence.type.name == "dict":
                 self.writable(sequence, node)
                 index = self.coerce(index, sequence.type.args[0], node)
                 target = sequence.type.args[1]
                 seqname, idxname = self.fresh(), self.fresh()
+                key_type = sequence.type.args[0]
+                if self.nested_vector_float_key(key_type):
+                    check = self.check_nested_float_key(key_type, idxname)
+                else:
+                    check = (f"::ac_detail::validate_ordered_finite({idxname}); "
+                             if self.ordered_owned_type_supported(key_type) and self.ordered_key_features(key_type)[1] else "")
                 code = (f"([&]() -> {target.cpp()}& {{ auto& {seqname} = {sequence.code}; "
-                        f"auto {idxname} = {index.code}; return {seqname}[{idxname}]; }}())")
+                        f"auto {idxname} = {index.code}; {check}return {seqname}[{idxname}]; }}())")
                 return Value(code, target, lvalue=True, origins=sequence.origins)
             if sequence.type.name in ("tuple", "pair"):
                 if index.type not in INTEGER or index.constant is None or not 0 <= index.constant < len(sequence.type.args):
@@ -477,8 +557,8 @@ class Compiler(DeclarationSupport):
                                  lvalue=True, origins=sequence.origins, readonly=True)
                 result = self.ordered([sequence], target, lambda ns: f"std::get<{int(index.constant)}>({ns[0]})")
                 return result
-            if sequence.type.name not in ("vec", "string") or index.type not in INTEGER:
-                self.fail("添字は配列・文字列に対する整数だけに対応しています", node,
+            if sequence.type.name not in ("vec", "string", "deque") or index.type not in INTEGER:
+                self.fail("添字は配列・文字列・deque に対する整数だけに対応しています", node,
                           hint=f"添字を付ける対象の型は {sequence.type}、添字の型は {index.type} です。")
             target = CHAR if sequence.type == STRING else sequence.type.args[0]
             seqname, idxname = self.fresh(), self.fresh()
@@ -515,7 +595,7 @@ class Compiler(DeclarationSupport):
                 self.parameter(annotation, None, node)
 
         def use(name: str, at: Node, local: set[str], *, callee=False) -> None:
-            if name in local or (callee and (name in BUILTINS or name in self.records)):
+            if name in local or (callee and (name in BUILTINS or name in self.records) and not (name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices") and name in available)):
                 return
             if name not in available:
                 self.fail(f"定義位置から参照できない名前です: {name}。後方参照・再帰は未対応です", at)
@@ -664,18 +744,20 @@ class Compiler(DeclarationSupport):
                 body, element = lower(index + 1)
                 return f"if ({condition.code}) {{\n{body}\n}}", element
             sequence = self.expr(clause.children[0])
-            item_type = self.iter_element(sequence.type, clause)
+            is_sorted = sequence.type.name == "SortedList"
+            item_type = sequence.type.args[0] if is_sorted or sequence.type.name == "deque" else self.iter_element(sequence.type, clause)
             source_name = self.fresh("iterable")
             item_name = self.fresh("item")
             self.scopes.append({})
             try:
                 self.bind_pattern(clause.extra["pattern"], item_type, item_name,
-                                  readonly=True, origins=sequence.origins)
-                with self.protect(sequence.origins):
+                                  readonly=True, origins=frozenset() if is_sorted else sequence.origins)
+                with self.protect(frozenset() if is_sorted else sequence.origins):
                     body, element = lower(index + 1)
             finally:
                 self.scopes.pop()
-            return (f"{{ auto&& {source_name} = {sequence.code};\n"
+            source = f"({sequence.code}).snapshot()" if is_sorted else sequence.code
+            return (f"{{ auto&& {source_name} = {source};\n"
                     f"for (const {item_type.cpp()}& {item_name} : {source_name}) {{\n"
                     + body + "\n}\n}", element)
 
@@ -728,7 +810,7 @@ class Compiler(DeclarationSupport):
             if len(args) not in (1, 2) or set(kwargs) - {"start"} or len(args) == 2 and kwargs:
                 self.fail("enumerate(a, start=0) と書いてください", node)
             values = [self.expr(args[0])]
-            element = self.iter_element(values[0].type, node)
+            element = values[0].type.args[0] if not is_view and values[0].type.name == "deque" else self.iter_element(values[0].type, node)
             start = self.expr(args[1] if len(args) == 2 else kwargs["start"]) if len(args) == 2 or kwargs else Value("0LL", I64)
             if start.type not in INTEGER:
                 self.fail("enumerateの開始番号は整数にしてください", node)
@@ -741,7 +823,7 @@ class Compiler(DeclarationSupport):
         if len(args) < 2 or set(kwargs) - {"strict"}:
             self.fail("zip(a, b, ..., strict=false) と書いてください", node)
         values = [self.expr(arg) for arg in args]
-        elements = [self.iter_element(v.type, node) for v in values]
+        elements = [v.type.args[0] if not is_view and v.type.name == "deque" else self.iter_element(v.type, node) for v in values]
         strict = self.expr(kwargs["strict"]) if kwargs else Value("false", BOOL)
         if strict.type != BOOL:
             self.fail("zipのstrictにはboolを指定してください", node)
@@ -796,8 +878,24 @@ class Compiler(DeclarationSupport):
             self.fail("空コンテナには set<i64>() / dict<string,i64>() などの型が必要です", node)
         result = Type(name, tuple(types))
         if name == "set" and values:
+            if self.nested_vector_float_key(types[0]):
+                key = self.fresh("set_key")
+                return self.ordered(values, result, lambda ns:
+                    f"([&]() {{ for (const auto& {key} : {ns[0]}) {{ {self.check_nested_float_key(types[0], key)} }} "
+                    f"return {result.cpp()}({ns[0]}.begin(), {ns[0]}.end()); }}())")
+            if self.ordered_owned_type_supported(types[0]) and self.ordered_key_features(types[0])[1]:
+                return self.ordered(values, result, lambda ns: f"::to_set({ns[0]})")
             return self.ordered(values, result, lambda ns: f"{result.cpp()}({ns[0]}.begin(), {ns[0]}.end())")
         if name == "dict" and values:
+            if self.nested_vector_float_key(types[0]):
+                row = self.fresh("dict_row")
+                return self.ordered(values, result, lambda ns:
+                    f"([&]() {{ for (const auto& {row} : {ns[0]}) {{ {self.check_nested_float_key(types[0], f'std::get<0>({row})')} }} "
+                    f"return kuma_rt::dict_from_rows<{types[0].cpp()}, {types[1].cpp()}>({ns[0]}); }}())")
+            if self.ordered_owned_type_supported(types[0]) and self.ordered_key_features(types[0])[1]:
+                return self.ordered(values, result, lambda ns:
+                    f"([&]() {{ for (const auto& row : {ns[0]}) ::ac_detail::validate_ordered_finite(std::get<0>(row)); "
+                    f"return kuma_rt::dict_from_rows<{types[0].cpp()}, {types[1].cpp()}>({ns[0]}); }}())")
             return self.ordered(values, result,
                                 lambda ns: f"kuma_rt::dict_from_rows<{types[0].cpp()}, {types[1].cpp()}>({ns[0]})")
         return self.ordered(values, result, lambda ns: result.cpp() + "{" + ", ".join(ns) + "}")
@@ -811,14 +909,14 @@ class Compiler(DeclarationSupport):
             self.fail("この操作には位置引数を指定してください", node)
         receiver = self.expr(args[0])
         kind = receiver.type.name
-        if kind not in ("vec", "string", "set", "dict"):
+        if kind not in ("vec", "string", "set", "dict") and not (kind == "deque" and name == "contains"):
             self.fail("この操作はコンテナに使ってください", node)
         # Borrow receiver only while other arguments cannot invalidate it.
         with self.protect(receiver.origins):
             rest = [self.expr(arg) for arg in args[1:]]
         for value in rest:
             self.owned(value, node)
-        key_type = receiver.type.args[0] if kind in ("dict", "set", "vec") else CHAR
+        key_type = receiver.type.args[0] if kind in ("dict", "set", "vec", "deque") else CHAR
         if name in ("empty", "clear", "pop_back"):
             if rest:
                 self.fail(f"{name} の引数は不要です", node)
@@ -859,7 +957,18 @@ class Compiler(DeclarationSupport):
                     self.fail(f"{kind} の {name} は未対応です", node)
         # Rest arguments are owning values; do not leave proxy/reference arguments live.
         recv = self.fresh("receiver")
-        tail = self.ordered(rest, result, lambda ns: expr([recv, *ns]))
+        if kind in ("set", "dict") and name in ("contains", "insert", "erase", "get", "at") and self.nested_vector_float_key(key_type):
+            tail = self.ordered(rest, result, lambda ns:
+                f"([&]() {{ {self.check_nested_float_key(key_type, ns[0])} return {expr([recv, *ns])}; }}())")
+        elif (kind == "set" and name in ("contains", "insert", "erase")
+                and self.ordered_owned_type_supported(key_type) and self.ordered_key_features(key_type)[1]):
+            tail = self.ordered(rest, result, lambda ns: expr([recv, f"kuma_rt::checked_ordered_value({ns[0]})"]))
+        elif (kind == "dict" and name in ("contains", "get", "at", "erase")
+              and self.ordered_owned_type_supported(key_type) and self.ordered_key_features(key_type)[1]):
+            tail = self.ordered(rest, result, lambda ns:
+                f"(::ac_detail::validate_ordered_finite({ns[0]}), {expr([recv, *ns])})")
+        else:
+            tail = self.ordered(rest, result, lambda ns: expr([recv, *ns]))
         ret = "" if result == VOID else "return "
         return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; {ret}{tail.code}; }}())", result)
 
@@ -945,7 +1054,7 @@ class Compiler(DeclarationSupport):
         if not valid:
             self.fail("reduce(a,f,initial)、count(a,predicate_or_value)、any/all(a[,predicate]) と書いてください", node)
         sequence = self.expr(args[0])
-        element = self.iter_element(sequence.type, node)
+        element = sequence.type.args[0] if name == "count" and sequence.type.name == "deque" else self.iter_element(sequence.type, node)
         with self.protect(sequence.origins):
             callback = self.expr(args[1]) if len(args) > 1 else None
             if name == "reduce":
@@ -1036,9 +1145,394 @@ class Compiler(DeclarationSupport):
             body += f" return {source};"
         return Value("([&]() { " + body + " }())", output)
 
+    def nested_vector_float_key(self, type_: Type) -> bool:
+        # Do not broaden other collection APIs: only statically known owning
+        # values composed of scalars, vectors, tuples and Kuma records qualify.
+        def visit(t, active):
+            if t in (I32, I64, F64, BOOL, CHAR, STRING):
+                return True, False
+            if t.name == "vec":
+                valid, _ = visit(t.args[0], active)
+                return valid, True
+            if t.name in ("tuple", "pair"):
+                parts = [visit(child, active) for child in t.args]
+                return all(valid for valid, _ in parts), any(vector for _, vector in parts)
+            if t.name.startswith("record:"):
+                name = t.name.removeprefix("record:")
+                fields = self.records.get(name)
+                if fields is None or name in active:
+                    return False, False
+                parts = [visit(field, active | {name}) for _, field, _ in fields]
+                return all(valid for valid, _ in parts), any(vector for _, vector in parts)
+            return False, False
+        valid, vector = visit(type_, frozenset())
+        return valid and vector and self.ordered_key_features(type_)[1]
+
+    def check_nested_float_key(self, type_: Type, value: str) -> str:
+        if type_ == F64:
+            return f"::ac_detail::validate_ordered_finite({value}); "
+        if type_.name == "vec":
+            element = self.fresh("key_element")
+            body = self.check_nested_float_key(type_.args[0], element)
+            return f"for (const auto& {element} : {value}) {{ {body} }} " if body else ""
+        if type_.name in ("tuple", "pair"):
+            return "".join(self.check_nested_float_key(child, f"std::get<{i}>({value})")
+                           for i, child in enumerate(type_.args))
+        if type_.name.startswith("record:"):
+            fields = self.records[type_.name.removeprefix("record:")]
+            return "".join(self.check_nested_float_key(child, f"({value}).kuma_field_{name}")
+                           for name, child, _ in fields)
+        return ""
+
+    def equality_owned_type_supported(self, type_: Type, active=frozenset(), *, key=False) -> bool:
+        if type_ in (I32, I64, F64, BOOL, CHAR, STRING):
+            return True
+        if type_.name in ("vec", "tuple", "pair"):
+            return bool(type_.args) and all(self.equality_owned_type_supported(t, active, key=key) for t in type_.args)
+        if type_.name.startswith("record:"):
+            name = type_.name.removeprefix("record:")
+            fields = self.records.get(name)
+            return (fields is not None and name not in active
+                    and all(self.equality_owned_type_supported(t, active | {name}, key=key) for _, t, _ in fields))
+        # Key validation covers scalar, vector, tuple and Kuma record keys;
+        # it does not inspect a set or dictionary nested inside a key.
+        if not key and type_.name in ("set", "dict"):
+            arity = 1 if type_.name == "set" else 2
+            return (len(type_.args) == arity
+                    and self.equality_owned_type_supported(type_.args[0], active, key=True)
+                    and (arity == 1 or self.equality_owned_type_supported(type_.args[1], active)))
+        return False
+
+    def ordered_owned_type_supported(self, type_: Type) -> bool:
+        if type_ in (I32, I64, F64, BOOL, CHAR, STRING):
+            return True
+        if type_.name in ("tuple", "pair"):
+            return all(self.ordered_owned_type_supported(t) for t in type_.args)
+        if type_.name.startswith("record:"):
+            fields = self.records.get(type_.name.removeprefix("record:"))
+            return fields is not None and all(self.ordered_owned_type_supported(t) for _, t, _ in fields)
+        return False
+
+    def heap_owned_type_supported(self, type_: Type) -> bool:
+        allowed_shape = type_ == I64 or type_.name in ("pair", "tuple") or type_.name.startswith("record:")
+        return allowed_shape and self.ordered_owned_type_supported(type_) and not self.ordered_key_features(type_)[1]
+
+    def ordered_key_features(self, type_: Type) -> tuple[bool, bool]:
+        if type_.name.startswith("record:"):
+            children = [field for _, field, _ in self.records[type_.name.removeprefix("record:")]]
+            features = [self.ordered_key_features(child) for child in children]
+            return True, any(floating for _, floating in features)
+        features = [self.ordered_key_features(part) for part in type_.args]
+        return any(record for record, _ in features), type_ == F64 or any(floating for _, floating in features)
+
     def call(self, node: Node, expected: Type | None) -> Value:
         name, args = node.value, node.children
         kwargs = node.extra.get("kwargs", {})
+        if node.kind == "call" and name == "SortedList":
+            if set(kwargs) - {"key"} or node.extra.get("types") or len(args) > 1:
+                self.fail("SortedList([配列], key=関数) と書いてください", node)
+            if args and args[0].kind == "array" and not args[0].children:
+                values = [self.expr(args[0], Type("vec", (I64,)))]
+            else:
+                values = [self.expr(arg) for arg in args]
+            element = values[0].type.args[0] if values and values[0].type.name == "vec" else I64
+            if values and (values[0].type.name != "vec" or not self.ordered_owned_type_supported(element)):
+                self.fail("SortedListには対応するスカラー・タプル・Kuma構造体を使ってください", node)
+            if "key" not in kwargs:
+                result = Type("SortedList", (element,))
+                return self.ordered(values, result, lambda ns: result.cpp() + "(" + ", ".join(ns) + ")")
+            key_node = kwargs["key"]
+            callback = self.expr(key_node)
+            function = callback.function
+            if function is None:
+                self.fail("keyは1引数の関数にしてください", key_node)
+            named = key_node.kind == "name" and function.code is not None
+            if named:
+                nodes = {name: symbol.function.node for name, symbol in self.named_functions.items()}
+                def chain_signature(fn):
+                    if len(fn.extra.get('params', ())) != 1:
+                        return None
+                    _, annotation = fn.extra['params'][0]
+                    if not annotation:
+                        return None
+                    parameter, mode = self.parameter(annotation, None, fn)
+                    result = self.parse_type(fn.extra['result'], fn.token)
+                    return (parameter, result) if safe_value_call_signature(parameter, result, mode) else None
+                chain = safe_sorted_function_chain(function.node.value, nodes, chain_signature, BOOL)
+                if chain is None:
+                    self.fail("通常関数のkeyは安全な単一return式と非再帰の検査済み呼び出しにしてください", key_node)
+            elif not safe_sorted_key(key_node):
+                self.fail("keyは安全な1引数の式にしてください", key_node)
+            if not named and any(not self.ordered_owned_type_supported(symbol.type) for symbol in function.captures.values()):
+                self.fail("keyの値キャプチャには対応する所有値を使ってください", key_node)
+            code, key_type = self.lower_function(function, [element])
+            if named and chain.signature_of(function.node.value) is not None:
+                _, verified_result = chain.signature_of(function.node.value)
+                if verified_result != key_type:
+                    self.fail("key関数の検査結果と生成時の戻り値型が一致しません", key_node)
+            if not self.ordered_owned_type_supported(key_type):
+                self.fail("keyの戻り値には対応するスカラー・タプル・Kuma構造体を使ってください", key_node)
+            code = code.replace("[&]", "[=]", 1)
+            result = Type("SortedList", (element, key_type))
+            if not values:
+                values = [Value(f"std::vector<{element.cpp()}>{{}}", Type("vec", (element,)))]
+            return self.ordered(values, result, lambda ns: result.cpp() + "(" + ns[0] + ", " + code + ")")
+        if node.kind == "method" and name in ("size", "empty", "front", "back", "clear", "push_front", "push_back", "pop_front", "pop_back"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "deque":
+                arity = 1 if name in ("push_front", "push_back") else 0
+                if kwargs or node.extra.get("types") or len(args) != arity + 1:
+                    self.fail(f"deque の {name} の引数を確認してください", node)
+                if name in ("clear", "push_front", "push_back", "pop_front", "pop_back"):
+                    self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = [self.coerce(self.expr(arg), receiver.type.args[0], node) for arg in args[1:]]
+                recv = self.fresh("deque")
+                result_type = VOID if name == "clear" or name.startswith(("push_", "pop_")) else BOOL if name == "empty" else I64 if name == "size" else receiver.type.args[0]
+                def checked(ns):
+                    if name == "size":
+                        return (f'([&]() {{ if ({recv}.size() > static_cast<size_t>(std::numeric_limits<long long>::max())) '
+                                f'throw std::length_error("deque: size too large"); return static_cast<long long>({recv}.size()); }}())')
+                    check = f'if ({recv}.empty()) throw std::out_of_range("deque: empty"); ' if name in ("front", "back", "pop_front", "pop_back") else ""
+                    call = f"{recv}.{name}(" + ", ".join(ns) + ")"
+                    return "([&]() { " + check + ("" if result_type == VOID else "return ") + call + "; }())"
+                result = self.ordered(values, result_type, checked)
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; " + ("" if result_type == VOID else "return ") + result.code + "; }())", result_type)
+        if node.kind == "method" and name in ("size", "empty", "push", "top", "pop"):
+            receiver = self.expr(args[0])
+            if receiver.type.name in ("min_heap", "max_heap"):
+                arity = 1 if name == "push" else 0
+                if kwargs or node.extra.get("types") or len(args) != arity + 1:
+                    self.fail(f"{receiver.type.name} の {name} の引数を確認してください", node)
+                if name in ("push", "pop"): self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = [self.coerce(self.expr(arg), receiver.type.args[0], node) for arg in args[1:]]
+                recv = self.fresh(receiver.type.name)
+                result_type = VOID if name in ("push", "pop") else BOOL if name == "empty" else receiver.type.args[0] if name == "top" else I64
+                def checked(ns):
+                    if name == "size":
+                        return (f'([&]() {{ if ({recv}.size() > static_cast<size_t>(std::numeric_limits<long long>::max())) '
+                                f'throw std::length_error("{receiver.type.name}: size too large"); return static_cast<long long>({recv}.size()); }}())')
+                    check = f'if ({recv}.empty()) throw std::out_of_range("{receiver.type.name}: empty"); ' if name in ("top", "pop") else ""
+                    call = f"{recv}.{name}(" + ", ".join(ns) + ")"
+                    return "([&]() { " + check + ("" if result_type == VOID else "return ") + call + "; }())"
+                result = self.ordered(values, result_type, checked)
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; " + ("" if result_type == VOID else "return ") + result.code + "; }())", result_type)
+        if node.kind == "method" and name in ("add", "remove", "pop", "bisect_left", "bisect_right"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "SortedList":
+                if kwargs or len(args) not in ((1, 2) if name == "pop" else (2,)):
+                    self.fail("SortedListの引数を確認してください", node)
+                if name in ("add", "remove", "pop"):
+                    self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    rest = [self.coerce(self.expr(arg), I64 if name == "pop" else receiver.type.args[0], node) for arg in args[1:]]
+                result = VOID if name in ("add", "remove") else receiver.type.args[0] if name == "pop" else I64
+                recv = self.fresh("sortedlist")
+                tail = self.ordered(rest, result, lambda ns: f"{recv}.{name}(" + ", ".join(ns) + ")")
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; " + ("" if result == VOID else "return ") + tail.code + "; }())", result)
+        if node.kind == "method" and name in ("size", "index", "lower_bound", "upper_bound", "value", "values", "indices"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "coordinate_compressor":
+                arity = 0 if name in ("size", "values") else 1
+                if kwargs or node.extra.get("types") or len(args) != arity + 1:
+                    self.fail(f"coordinate_compressor の {name} の引数を確認してください", node)
+                if name == "indices":
+                    with self.protect(receiver.origins):
+                        arg = args[1]
+                        value = self.expr(arg, Type("vec", (I64,)) if arg.kind == "array" and not arg.children else None)
+                    if value.type not in (Type("vec", (I32,)), Type("vec", (I64,))):
+                        self.fail("indices の引数は vec<i32> または vec<i64> にしてください", node)
+                    recv = self.fresh("coordinate_compressor")
+                    def indices(ns):
+                        return (f'([&]() {{ std::vector<int> result; result.reserve({ns[0]}.size()); '
+                                f'for (long long x : {ns[0]}) {{ int i = {recv}.lower_bound(x); '
+                                f'if (i == {recv}.size() || {recv}[i] != x) '
+                                f'throw std::out_of_range("coordinate_compressor: value not found"); '
+                                f'result.push_back(i); }} return result; }}())')
+                    result = self.ordered([value], Type("vec", (I32,)), indices, borrow=True)
+                    return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", result.type)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                if values:
+                    if values[0].type not in INTEGER:
+                        self.fail("座標または順位は整数にしてください", node)
+                    values[0] = self.coerce(values[0], I64, node)
+                recv = self.fresh("coordinate_compressor")
+                result_type = Type("vec", (I64,)) if name == "values" else I64 if name == "value" else I32
+                def checked(ns):
+                    if name == "size": return f"{recv}.size()"
+                    if name == "values": return f"std::vector<long long>({recv}.values())"
+                    if name == "lower_bound": return f"{recv}.lower_bound({ns[0]})"
+                    if name == "upper_bound":
+                        return (f"([&]() {{ const auto& v = {recv}.values(); "
+                                f"return static_cast<int>(std::upper_bound(v.begin(), v.end(), {ns[0]}) - v.begin()); }}())")
+                    if name == "value":
+                        return (f'([&]() {{ if ({ns[0]} < 0 || {ns[0]} >= {recv}.size()) '
+                                f'throw std::out_of_range("coordinate_compressor: invalid index"); '
+                                f'return {recv}[static_cast<int>({ns[0]})]; }}())')
+                    return (f'([&]() {{ int i = {recv}.lower_bound({ns[0]}); '
+                            f'if (i == {recv}.size() || {recv}[i] != {ns[0]}) '
+                            f'throw std::out_of_range("coordinate_compressor: value not found"); return i; }}())')
+                result = self.ordered(values, result_type, checked)
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", result_type)
+        if node.kind == "method" and name in ("size", "add", "sum", "get"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "range_fenwick":
+                counts = {"size": (0,), "add": (3,), "sum": (1, 2), "get": (1,)}
+                if kwargs or node.extra.get("types") or len(args) - 1 not in counts[name]:
+                    self.fail(f"range_fenwick の {name} の引数を確認してください", node)
+                if name == "add": self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                index_count = 2 if name == "add" else len(values)
+                if any(v.type not in INTEGER for v in values[:index_count]):
+                    self.fail("range_fenwick の添字と端点は整数にしてください", node)
+                if name == "add": values[2] = self.coerce(values[2], I64, node)
+                recv = self.fresh("range_fenwick")
+                result_type = VOID if name == "add" else I32 if name == "size" else I64
+                def checked(ns):
+                    check = ""
+                    if name == "get":
+                        check = f'if ({ns[0]} < 0 || {ns[0]} >= {recv}.size()) throw std::out_of_range("range_fenwick: invalid index"); '
+                    elif name in ("add", "sum"):
+                        left, right = ("0", ns[0]) if name == "sum" and len(ns) == 1 else ns[:2]
+                        check = f'if ({left} < 0 || {left} > {right} || {right} > {recv}.size()) throw std::out_of_range("range_fenwick: invalid interval"); '
+                    callargs = [f"static_cast<int>({v})" if i < index_count else v for i, v in enumerate(ns)]
+                    call = f"{recv}.{name}(" + ", ".join(callargs) + ")"
+                    return "([&]() { " + check + ("" if result_type == VOID else "return ") + call + "; }())"
+                result = self.ordered(values, result_type, checked)
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; " + ("" if result_type == VOID else "return ") + result.code + "; }())", result_type)
+        if node.kind == "method" and name in ("size", "add", "sum", "get", "lower_bound_prefix"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "fenwick":
+                counts = {"size": (0,), "add": (2,), "get": (1,), "sum": (1, 2), "lower_bound_prefix": (1,)}
+                if kwargs or node.extra.get("types") or len(args) - 1 not in counts[name]:
+                    self.fail(f"fenwick の {name} の引数を確認してください", node)
+                if name == "add": self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                index_count = len(values) if name == "sum" else (1 if name in ("add", "get") else 0)
+                if any(v.type not in INTEGER for v in values[:index_count]):
+                    self.fail("fenwick の添字と端点は整数にしてください", node)
+                if name == "add": values[1] = self.coerce(values[1], I64, node)
+                if name == "lower_bound_prefix": values[0] = self.coerce(values[0], I64, node)
+                recv = self.fresh("fenwick")
+                result_type = VOID if name == "add" else I32 if name in ("size", "lower_bound_prefix") else I64
+                def checked(ns):
+                    check = ""
+                    if name in ("add", "get"):
+                        check = f'if ({ns[0]} < 0 || {ns[0]} >= {recv}.size()) throw std::out_of_range("fenwick: invalid index"); '
+                    elif name == "sum":
+                        left, right = ("0", ns[0]) if len(ns) == 1 else ns
+                        check = f'if ({left} < 0 || {left} > {right} || {right} > {recv}.size()) throw std::out_of_range("fenwick: invalid interval"); '
+                    callargs = [f"static_cast<int>({v})" if i < index_count else v for i, v in enumerate(ns)]
+                    call = f"{recv}.{name}(" + ", ".join(callargs) + ")"
+                    return "([&]() { " + check + ("" if result_type == VOID else "return ") + call + "; }())"
+                result = self.ordered(values, result_type, checked)
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; " + ("" if result_type == VOID else "return ") + result.code + "; }())", result_type)
+        if node.kind == "method" and name in ("max_right", "min_left"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "segment_tree":
+                if kwargs or node.extra.get("types") or len(args) != 3:
+                    self.fail(f"segment_tree の {name} は端点と通常述語を指定してください", node)
+                with self.protect(receiver.origins):
+                    endpoint = self.expr(args[1])
+                if endpoint.type not in INTEGER:
+                    self.fail(f"{name} の端点は整数にしてください", node)
+                predicate = args[2]
+                if predicate.kind != "name":
+                    self.fail(f"{name} の述語は検査可能な通常関数名にしてください", predicate)
+                symbol = self.lookup(predicate.value, predicate)
+                if self.named_functions.get(predicate.value) is not symbol or not symbol.function:
+                    self.fail(f"{name} の述語は検査可能な通常関数名にしてください", predicate)
+                function = symbol.function.node
+                params = function.extra.get("params", ())
+                if len(params) != 1 or not params[0][1] or self.parameter(params[0][1], None, function) != (receiver.type.args[0], "value") or self.parse_type(function.extra["result"], function.token) != BOOL:
+                    self.fail(f"{name} の述語は要素型の値を受け取って bool を返してください", predicate)
+                if not safe_sorted_function(function):
+                    self.fail(f"{name} の述語は捕捉や副作用のない単一 return 式にしてください", predicate)
+                recv = self.fresh("segment_tree")
+                def checked(ns):
+                    return (f'([&]() {{ if ({ns[0]} < 0 || {ns[0]} > {recv}.size()) '
+                            f'throw std::out_of_range("segment_tree: invalid endpoint"); '
+                            f'if (!{symbol.function.code}({recv}.prod(0, 0))) '
+                            f'throw std::invalid_argument("segment_tree: predicate must accept identity"); '
+                            f'return {recv}.{name}(static_cast<int>({ns[0]}), &{symbol.function.code}); }}())')
+                result = self.ordered([endpoint], I32, checked)
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", I32)
+        if node.kind == "method" and name in ("size", "set", "get", "prod", "all_prod"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "segment_tree":
+                arity = {"size": 0, "set": 2, "get": 1, "prod": 2, "all_prod": 0}[name]
+                if kwargs or node.extra.get("types") or len(args) != arity + 1:
+                    self.fail(f"segment_tree の {name} の引数を確認してください", node)
+                if name == "set":
+                    self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                if values and values[0].type not in INTEGER:
+                    self.fail(f"{name} の添字は整数にしてください", node)
+                if name == "prod" and values[1].type not in INTEGER:
+                    self.fail("prod の端点は整数にしてください", node)
+                if name == "set":
+                    values[1] = self.coerce(values[1], receiver.type.args[0], node)
+                recv = self.fresh("segment_tree")
+                result_type = VOID if name == "set" else I32 if name == "size" else receiver.type.args[0]
+                def checked(ns):
+                    check = ""
+                    if name in ("set", "get"):
+                        check = f'if ({ns[0]} < 0 || {ns[0]} >= {recv}.size()) throw std::out_of_range("segment_tree: invalid index"); '
+                    elif name == "prod":
+                        check = f'if ({ns[0]} < 0 || {ns[0]} > {ns[1]} || {ns[1]} > {recv}.size()) throw std::out_of_range("segment_tree: invalid interval"); '
+                    callargs = ([f"static_cast<int>({ns[0]})", ns[1]] if name == "set" else
+                                [f"static_cast<int>({x})" for x in ns])
+                    call = f"{recv}.{name}(" + ", ".join(callargs) + ")"
+                    return "([&]() { " + check + ("" if result_type == VOID else "return ") + call + "; }())"
+                result = self.ordered(values, result_type, checked)
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; " + ("" if result_type == VOID else "return ") + result.code + "; }())", result_type)
+        if node.kind == "method" and name in ("unite", "same", "find", "component_size", "count", "size"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "union_find":
+                arity = 2 if name in ("unite", "same") else 1 if name in ("find", "component_size") else 0
+                if kwargs or node.extra.get("types") or len(args) != arity + 1:
+                    self.fail(f"union_find の {name} の引数を確認してください", node)
+                if name in ("unite", "same", "find", "component_size"):
+                    self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                if any(value.type not in INTEGER for value in values):
+                    self.fail(f"{name} の添字は整数にしてください", node)
+                recv = self.fresh("union_find")
+                result_type = BOOL if name in ("unite", "same") else I32
+                def invoke(ns):
+                    checks = "".join(f'if ({v} < 0 || {v} >= {recv}.size()) throw std::out_of_range("union_find: invalid index"); ' for v in ns)
+                    return ("([&]() { " + checks + f"return {recv}.{name}(" + ", ".join(f"static_cast<int>({v})" for v in ns) + "); }())")
+                result = self.ordered(values, result_type, invoke)
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", result_type)
+        if node.kind == "method" and name in ("reachable", "is_ancestor"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "dfs_result":
+                arity = 1 if name == "reachable" else 2
+                if kwargs or node.extra.get("types") or len(args) != arity + 1:
+                    self.fail(f"{name} の頂点の数を確認してください", node)
+                with self.protect(receiver.origins):
+                    indices = [self.expr(arg) for arg in args[1:]]
+                if any(index.type not in INTEGER for index in indices):
+                    self.fail(f"{name} の頂点は整数にしてください", node)
+                recv = self.fresh("dfs_result")
+                def call_checked(ns):
+                    checks = "".join(f'if ({v} < 0 || static_cast<unsigned long long>({v}) >= {recv}.parent.size()) throw std::out_of_range("dfs: invalid vertex"); ' for v in ns)
+                    return "([&]() { " + checks + f"return {recv}.{name}(" + ", ".join(f"static_cast<int>({v})" for v in ns) + "); }())"
+                result = self.ordered(indices, BOOL, call_checked)
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", BOOL)
+        if node.kind == "call" and name == "range":
+            if kwargs or node.extra.get("types") or not 1 <= len(args) <= 3:
+                self.fail("range(stop)、range(start, stop[, step]) の形で使用してください", node)
+            values = [self.expr(arg) for arg in args]
+            if any(value.type not in INTEGER for value in values):
+                self.fail("rangeの引数は整数にしてください", node)
+            return self.ordered(values, Type("range"), lambda ns: "kuma_rt::range(" + ", ".join(ns) + ")")
         if node.kind == "call" and name in self.records:
             return self.construct_record(node)
         if name == "input" and node.kind == "call":
@@ -1047,12 +1541,180 @@ class Compiler(DeclarationSupport):
             return self.construct_collection(node, expected)
         if node.extra.get("types"):
             self.fail("この呼び出しの明示型引数は未対応です", node)
-        if node.kind == "call" and name not in BUILTINS:
+        if node.kind == "call" and (name not in BUILTINS or name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")):
             symbol = next((scope[name] for scope in reversed(self.scopes) if name in scope), None)
             if symbol and symbol.function:
                 if kwargs:
                     self.fail("アロー関数は位置引数だけに対応しています", node)
                 return self.invoke(Value("", FUNCTION, function=symbol.function), args, node)
+            if symbol and name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices"):
+                self.fail(name + " は関数として呼び出せません", node)
+        if node.kind == "call" and name == "segment_tree":
+            if kwargs or node.extra.get("types") or len(args) != 3:
+                self.fail("segment_tree(配列, 演算関数, 単位元) と書いてください", node)
+            values = self.expr(args[0])
+            if values.type.name != "vec" or not self.ordered_owned_type_supported(values.type.args[0]):
+                self.fail("segment_tree は対応する所有値の配列に使ってください", node)
+            element = values.type.args[0]
+            op = args[1]
+            if op.kind != "name":
+                self.fail("segment_tree の演算には検査可能な通常関数名を指定してください", op)
+            symbol = self.lookup(op.value, op)
+            if self.named_functions.get(op.value) is not symbol or not symbol.function:
+                self.fail("segment_tree の演算には通常関数名を指定してください", op)
+            function = symbol.function.node
+            params = function.extra.get("params", ())
+            if len(params) != 2 or any(not ann for _, ann in params):
+                self.fail("segment_tree の演算関数は同型の値引数2個が必要です", op)
+            if any(self.parameter(ann, None, function) != (element, 'value') for _, ann in params) or self.parse_type(function.extra['result'], function.token) != element:
+                self.fail("segment_tree の演算関数の引数と戻り値は要素型と一致させてください", op)
+            body = function.extra.get('body', ())
+            if not body or body[-1].kind != 'return' or len(body[-1].children) != 1:
+                self.fail("segment_tree の演算関数は最後にreturn式が必要です", op)
+            local_types = {n: element for n, _ in params}
+            def projection(expr):
+                # Only known owning fields and constant tuple indices may be read.
+                if expr.kind == 'name': return local_types.get(expr.value)
+                if expr.kind == 'member' and not expr.extra.get('pointer'):
+                    owner = projection(expr.children[0])
+                    if owner is None or not owner.name.startswith('record:'): return None
+                    fields = self.records.get(owner.name.removeprefix('record:'), ())
+                    return next((t for n, t, _ in fields if n == expr.value), None)
+                if expr.kind == 'index' and len(expr.children) == 2:
+                    owner = projection(expr.children[0])
+                    index = expr.children[1]
+                    if owner is None or owner.name not in ('tuple', 'pair') or index.kind != 'literal': return None
+                    if index.extra.get('type') != 'i64' or not re.fullmatch(r'[0-9]+', str(index.value)): return None
+                    position = int(index.value)
+                    return owner.args[position] if position < len(owner.args) else None
+                return None
+            def safe(expr):
+                if projection(expr) is not None: return True
+                if expr.kind == 'literal':
+                    return expr.extra.get('type') in {'i32', 'i64', 'f64', 'bool', 'char', 'string'}
+                if expr.kind == 'tuple': return len(expr.children) >= 2 and all(safe(c) for c in expr.children)
+                if expr.kind == 'ternary': return len(expr.children) == 3 and all(safe(c) for c in expr.children)
+                if expr.kind == 'unary': return expr.value in ('+', '-', '~', '!') and all(safe(c) for c in expr.children)
+                if expr.kind == 'binary': return expr.value in ('+', '-', '*', '%', '&', '|', '^', '==', '!=', '<', '<=', '>', '>=', '&&', '||') and all(safe(c) for c in expr.children)
+                if expr.kind == 'call':
+                    if expr.extra.get('kwargs') or expr.extra.get('types'): return False
+                    if expr.value in ('min', 'max', 'pair'): return len(expr.children) == 2 and all(safe(c) for c in expr.children)
+                    if expr.value in self.records: return len(expr.children) == len(self.records[expr.value]) and all(safe(c) for c in expr.children)
+                return False
+            for stmt in body[:-1]:
+                if (stmt.kind != 'declare' or len(stmt.value) != 1 or len(stmt.children) != 1
+                        or stmt.extra.get('type') not in (None, 'auto')):
+                    self.fail("segment_tree の演算関数では検査可能な値のローカル宣言だけ使えます", op)
+                name = stmt.value[0]
+                if name in local_types or name in BUILTINS or name in self.records or name in self.named_functions:
+                    self.fail("segment_tree の演算関数で名前の重複は使えません", op)
+                initializer = stmt.children[0]
+                inferred = projection(initializer)
+                if inferred is None:
+                    def numeric_expr(expr):
+                        projected = projection(expr)
+                        if projected is not None: return projected in NUMBER
+                        if expr.kind == 'literal': return expr.extra.get('type') in {'i32', 'i64', 'f64'}
+                        if expr.kind == 'unary': return expr.value in ('+', '-') and len(expr.children) == 1 and numeric_expr(expr.children[0])
+                        if expr.kind == 'binary': return expr.value in ('+', '-', '*', '/', '%') and len(expr.children) == 2 and all(numeric_expr(c) for c in expr.children)
+                        return False
+                    if not numeric_expr(initializer):
+                        self.fail("segment_tree のローカル変数には検査可能な値や数値式を使ってください", op)
+                    # Reuse the normal expression type checker in an isolated scope.
+                    checker = Compiler(self.filename, optimize=False)
+                    checker.records = self.records
+                    checker.scopes = [{n: Symbol(n, t) for n, t in local_types.items()}]
+                    inferred = checker.expr(initializer).type
+                    if inferred not in NUMBER:
+                        self.fail("segment_tree の数値式の型を確認できません", op)
+                local_types[name] = inferred
+            if not safe(body[-1].children[0]):
+                self.fail("segment_tree の演算関数は引数と検査可能な演算だけを使ってください", op)
+            with self.protect(values.origins):
+                identity = self.coerce(self.expr(args[2]), element, node)
+            self.uses_algo = True
+            tree_type = Type("segment_tree", (element,))
+            return self.ordered([values, identity], tree_type,
+                                lambda ns: f"{tree_type.cpp()}({ns[0]}, {ns[1]}, &{symbol.function.code})", borrow=True)
+        if node.kind == "call" and name == "deque":
+            if kwargs or node.extra.get("types") or len(args) > 1:
+                self.fail("deque() または deque(配列) と書いてください", node)
+            if not args:
+                return Value("std::deque<long long>{}", Type("deque", (I64,)))
+            value = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if value.type.name != "vec" or not self.ordered_owned_type_supported(value.type.args[0]):
+                self.fail("deque は対応する所有値の配列に使ってください", node)
+            result = Type("deque", (value.type.args[0],))
+            return self.ordered([value], result, lambda ns: f"{result.cpp()}({ns[0]}.begin(), {ns[0]}.end())", borrow=True)
+        if node.kind == "call" and name in ("min_heap", "max_heap"):
+            if kwargs or node.extra.get("types") or len(args) > 1:
+                self.fail(f"{name}() または {name}(配列) と書いてください", node)
+            result = Type(name, (I64,))
+            if not args:
+                return Value(result.cpp() + "{}", result)
+            value = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if value.type.name != "vec":
+                self.fail(f"{name} は対応する所有値の配列に使ってください", node)
+            element = I64 if value.type.args[0] == I32 else value.type.args[0]
+            if not self.heap_owned_type_supported(element):
+                self.fail(f"{name} は f64 を含まない対応する所有値を使ってください", node)
+            result = Type(name, (element,))
+            comparator = "greater" if name == "min_heap" else "less"
+            def construct(ns):
+                element_cpp = element.cpp()
+                source = (f"std::vector<{element_cpp}>({ns[0]})" if value.type.args[0] == element else
+                          f"std::vector<{element_cpp}>({ns[0]}.begin(), {ns[0]}.end())")
+                return f"{result.cpp()}(std::{comparator}<{element_cpp}>{{}}, {source})"
+            return self.ordered([value], result, construct, borrow=True)
+        if node.kind == "call" and name == "coordinate_compressor":
+            if kwargs or node.extra.get("types") or len(args) != 1:
+                self.fail("coordinate_compressor(配列) と書いてください", node)
+            value = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if value.type not in (Type("vec", (I32,)), Type("vec", (I64,))):
+                self.fail("coordinate_compressor は vec<i32> または vec<i64> に使ってください", node)
+            self.uses_algo = True
+            result = Type("coordinate_compressor", (I64,))
+            def from_array(ns):
+                source = ns[0] if value.type.args[0] == I64 else f"std::vector<long long>({ns[0]}.begin(), {ns[0]}.end())"
+                return (f'([&]() {{ if ({ns[0]}.size() > static_cast<size_t>(std::numeric_limits<int>::max())) '
+                        f'throw std::length_error("coordinate_compressor: size too large"); return ::CoordinateCompressor<long long>({source}); }}())')
+            return self.ordered([value], result, from_array, borrow=True)
+        if node.kind == "call" and name == "range_fenwick":
+            if kwargs or node.extra.get("types") or len(args) != 1:
+                self.fail("range_fenwick(n) または range_fenwick(配列) と書いてください", node)
+            value = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            self.uses_algo = True
+            result = Type("range_fenwick", (I64,))
+            if value.type in INTEGER:
+                return self.ordered([value], result, lambda ns: f"::RangeFenwick<long long>(kuma_rt::dimension({ns[0]}))")
+            if value.type == Type("vec", (I64,)):
+                def from_array(ns):
+                    return (f'([&]() {{ if ({ns[0]}.size() >= static_cast<size_t>(std::numeric_limits<int>::max())) '
+                            f'throw std::length_error("range_fenwick: size too large"); return ::RangeFenwick<long long>({ns[0]}); }}())')
+                return self.ordered([value], result, from_array, borrow=True)
+            self.fail("range_fenwick の引数は整数の要素数か vec<i64> にしてください", node)
+        if node.kind == "call" and name == "fenwick":
+            if kwargs or node.extra.get("types") or len(args) != 1:
+                self.fail("fenwick(n) または fenwick(配列) と書いてください", node)
+            value = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            self.uses_algo = True
+            result = Type("fenwick", (I64,))
+            if value.type in INTEGER:
+                return self.ordered([value], result, lambda ns: f"::Fenwick<long long>(kuma_rt::dimension({ns[0]}))")
+            if value.type == Type("vec", (I64,)):
+                def from_array(ns):
+                    return (f'([&]() {{ if ({ns[0]}.size() >= static_cast<size_t>(std::numeric_limits<int>::max())) '
+                            f'throw std::length_error("fenwick: size too large"); return ::Fenwick<long long>({ns[0]}); }}())')
+                return self.ordered([value], result, from_array, borrow=True)
+            self.fail("fenwick の引数は整数の要素数か vec<i64> にしてください", node)
+        if node.kind == "call" and name == "union_find":
+            if kwargs or node.extra.get("types") or len(args) != 1:
+                self.fail("union_find(n) と書いてください", node)
+            size = self.expr(args[0])
+            if size.type not in INTEGER:
+                self.fail("union_find の要素数は整数にしてください", node)
+            self.uses_algo = True
+            return self.ordered([size], Type("union_find"), lambda ns: f"::UnionFind(kuma_rt::dimension({ns[0]}))")
         if name in ("zip", "enumerate", "zip_view", "enumerate_view"):
             return self.iter_adapter(node)
         if name in ("reduce", "any", "all", "count", "some", "every"):
@@ -1062,6 +1724,68 @@ class Compiler(DeclarationSupport):
         collection = self.collection_call(node, expected)
         if collection is not None:
             return collection
+        if name == "partition_vec" and node.kind in ("call", "method"):
+            if kwargs or node.extra.get("types") or len(args) != 2:
+                self.fail("partition_vec(配列, 条件) または 配列.partition_vec(条件) と書いてください", node)
+            sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if sequence.type.name != "vec" or not self.ordered_owned_type_supported(sequence.type.args[0]):
+                self.fail("partition_vec は対応する所有値の配列に使ってください", node)
+            callback = self.expr(args[1])
+            if not callback.function:
+                self.fail("partition_vec の条件には1引数の関数を指定してください", node)
+            with self.protect(sequence.origins):
+                code, result = self.lower_function(callback.function, [sequence.type.args[0]])
+            self.condition(Value("", result), node)
+            output = Type("pair", (sequence.type, sequence.type))
+            source_name = self.fresh("partition_source")
+            return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; return ::partition_vec({source_name}, {code}); }}())", output)
+        if name == "sorted_by" and node.kind in ("call", "method"):
+            if kwargs or node.extra.get("types") or len(args) != 2:
+                self.fail("sorted_by(配列, 関数) または 配列.sorted_by(関数) と書いてください", node)
+            sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if sequence.type.name != "vec" or not self.ordered_owned_type_supported(sequence.type.args[0]):
+                self.fail("sorted_by は対応する所有値の配列に使ってください", node)
+            callback = self.expr(args[1])
+            if not callback.function:
+                self.fail("sorted_by のキーには1引数の関数を指定してください", node)
+            with self.protect(sequence.origins):
+                code, key_type = self.lower_function(callback.function, [sequence.type.args[0]])
+            if not self.ordered_owned_type_supported(key_type):
+                self.fail("sorted_by のキーは対応する順序付き所有値にしてください", node)
+            source_name = self.fresh("sorted_by_source")
+            return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; return ::sorted_by({source_name}, {code}); }}())", sequence.type)
+        if name == "count_by" and node.kind in ("call", "method"):
+            if kwargs or node.extra.get("types") or len(args) != 2:
+                self.fail("count_by(配列, 関数) または 配列.count_by(関数) と書いてください", node)
+            sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if sequence.type.name != "vec" or not self.ordered_owned_type_supported(sequence.type.args[0]):
+                self.fail("count_by は対応する所有値の配列に使ってください", node)
+            callback = self.expr(args[1])
+            if not callback.function:
+                self.fail("count_by のキーには1引数の関数を指定してください", node)
+            with self.protect(sequence.origins):
+                code, key_type = self.lower_function(callback.function, [sequence.type.args[0]])
+            if not self.ordered_owned_type_supported(key_type):
+                self.fail("count_by のキーは対応する順序付き所有値にしてください", node)
+            output = Type("dict", (key_type, I64))
+            source_name = self.fresh("count_by_source")
+            return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; return ::count_by({source_name}, {code}); }}())", output)
+        if name == "group_by" and node.kind in ("call", "method"):
+            if kwargs or node.extra.get("types") or len(args) != 2:
+                self.fail("group_by(配列, 関数) または 配列.group_by(関数) と書いてください", node)
+            sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if sequence.type.name != "vec" or not self.ordered_owned_type_supported(sequence.type.args[0]):
+                self.fail("group_by は対応する所有値の配列に使ってください", node)
+            callback = self.expr(args[1])
+            if not callback.function:
+                self.fail("group_by のキーには1引数の関数を指定してください", node)
+            with self.protect(sequence.origins):
+                code, key_type = self.lower_function(callback.function, [sequence.type.args[0]])
+            if not self.ordered_owned_type_supported(key_type):
+                self.fail("group_by のキーは対応する順序付き所有値にしてください", node)
+            output = Type("dict", (key_type, sequence.type))
+            source_name = self.fresh("group_by_source")
+            return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; return ::group_by({source_name}, {code}); }}())", output)
         if name in ("map", "filter"):
             if kwargs or len(args) != 2:
                 self.fail(f"{name} は配列と1引数の関数を指定してください", node)
@@ -1109,7 +1833,821 @@ class Compiler(DeclarationSupport):
             self.fail("この組み込み関数は名前付き引数に対応していません", node)
         if name == "discard_line" and node.kind == "call" and not args:
             return Value("kuma_rt::discard_line()", VOID)
+        # With nonnegative weights, any reachable vertex at/above the sentinel
+        # has a path crossing from a finite-distance vertex into the sentinel set.
+        # Scan those boundary edges after Dijkstra instead of running a second BFS.
+        if node.kind in ("call", "method") and name == "dijkstra_path":
+            if len(args) != 3 or node.extra.get("types"):
+                self.fail("dijkstra_path(重み付き隣接リスト, 始点, 終点) と書いてください", node)
+            graph = self.expr(args[0])
+            edge_type = Type("pair", (I32, I64))
+            graph_type = Type("vec", (Type("vec", (edge_type,)),))
+            if graph.type != graph_type:
+                self.fail("dijkstra_path のグラフは vec<vec<pair<i32,i64>>> にしてください", node)
+            with self.protect(graph.origins):
+                source = self.expr(args[1])
+                target = self.expr(args[2])
+            if target.type not in INTEGER:
+                self.fail(name + " の終点は整数にしてください", node)
+            if source.type not in INTEGER:
+                self.fail("dijkstra_path の始点は整数にしてください", node)
+            self.uses_graph = True
+            def dijkstra_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; auto source = {ns[1]}; auto target = {ns[2]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"dijkstra_path: too many vertices\"); "
+                        "int n = static_cast<int>(input.size()); "
+                        "if (source < 0 || source >= n) throw std::out_of_range(\"dijkstra_path: invalid source\"); "
+                        "if (target < 0 || target >= n) throw std::out_of_range(\"dijkstra_path: invalid target\"); "
+                        "Graph<long long> graph(n, true); "
+                        "for (int v = 0; v < n; ++v) for (const auto& [to, cost] : input[v]) { "
+                        "if (to < 0 || to >= n) throw std::out_of_range(\"dijkstra_path: invalid neighbor\"); "
+                        "if (cost < 0) throw std::invalid_argument(\"dijkstra_path: negative edge weight\"); "
+                        "graph.add_edge(v, to, cost); } "
+                        "auto result = ::dijkstra(graph, static_cast<int>(source), std::numeric_limits<long long>::max()); "
+                        "for (int v = 0; v < n; ++v) if (result.dist[v] != result.inf) "
+                        "for (const auto& edge : graph[v]) if (result.dist[edge.to] == result.inf) "
+                        "throw std::overflow_error(\"dijkstra_path: shortest distance exceeds supported range\"); "
+                        "return result.path_to(static_cast<int>(target)); }())")
+            graph_ref = self.fresh("path_graph")
+            result = self.ordered([source, target], Type("vec", (I32,)), lambda ns: dijkstra_code([graph_ref, *ns]))
+            return Value(f"([&]() {{ auto&& {graph_ref} = {graph.code}; return {result.code}; }}())", result.type)
+        if node.kind in ("call", "method") and name == "bfs_path":
+            if len(args) != 3 or node.extra.get("types"):
+                self.fail("bfs_path(隣接リスト, 始点, 終点) と書いてください", node)
+            graph = self.expr(args[0])
+            if graph.type.name != "vec" or graph.type.args[0].name != "vec" or graph.type.args[0].args[0] not in INTEGER:
+                self.fail("bfs_path のグラフは整数の2次元配列にしてください", node)
+            with self.protect(graph.origins):
+                source = self.expr(args[1])
+                target = self.expr(args[2])
+            if target.type not in INTEGER:
+                self.fail(name + " の終点は整数にしてください", node)
+            if source.type not in INTEGER:
+                self.fail("bfs_path の始点は整数にしてください", node)
+            self.uses_graph = True
+            def bfs_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; auto source = {ns[1]}; auto target = {ns[2]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"bfs_path: too many vertices\"); "
+                        "int n = static_cast<int>(input.size()); "
+                        "if (source < 0 || source >= n) throw std::out_of_range(\"bfs_path: invalid source\"); "
+                        "if (target < 0 || target >= n) throw std::out_of_range(\"bfs_path: invalid target\"); "
+                        "std::vector<std::vector<int>> adjacency(n); "
+                        "for (int v = 0; v < n; ++v) for (auto to : input[v]) { "
+                        "if (to < 0 || to >= n) throw std::out_of_range(\"bfs_path: invalid neighbor\"); "
+                        "adjacency[v].push_back(static_cast<int>(to)); } "
+                        "auto result = ::bfs(::to_graph(adjacency, true), static_cast<int>(source)); "
+                        "return result.path_to(static_cast<int>(target)); }())")
+            graph_ref = self.fresh("path_graph")
+            result = self.ordered([source, target], Type("vec", (I32,)), lambda ns: bfs_code([graph_ref, *ns]))
+            return Value(f"([&]() {{ auto&& {graph_ref} = {graph.code}; return {result.code}; }}())", result.type)
+        if node.kind in ("call", "method") and name == "dijkstra_dist":
+            if len(args) != 2 or node.extra.get("types"):
+                self.fail("dijkstra_dist(重み付き隣接リスト, 始点) と書いてください", node)
+            graph = self.expr(args[0])
+            edge_type = Type("pair", (I32, I64))
+            graph_type = Type("vec", (Type("vec", (edge_type,)),))
+            if graph.type != graph_type:
+                self.fail("dijkstra_dist のグラフは vec<vec<pair<i32,i64>>> にしてください", node)
+            with self.protect(graph.origins):
+                source = self.expr(args[1])
+            if source.type not in INTEGER:
+                self.fail("dijkstra_dist の始点は整数にしてください", node)
+            self.uses_graph = True
+            def dijkstra_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; auto source = {ns[1]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"dijkstra_dist: too many vertices\"); "
+                        "int n = static_cast<int>(input.size()); "
+                        "if (source < 0 || source >= n) throw std::out_of_range(\"dijkstra_dist: invalid source\"); "
+                        "Graph<long long> graph(n, true); "
+                        "for (int v = 0; v < n; ++v) for (const auto& [to, cost] : input[v]) { "
+                        "if (to < 0 || to >= n) throw std::out_of_range(\"dijkstra_dist: invalid neighbor\"); "
+                        "if (cost < 0) throw std::invalid_argument(\"dijkstra_dist: negative edge weight\"); "
+                        "graph.add_edge(v, to, cost); } "
+                        "auto result = ::dijkstra(graph, static_cast<int>(source), std::numeric_limits<long long>::max()); "
+                        "for (int v = 0; v < n; ++v) if (result.dist[v] != result.inf) "
+                        "for (const auto& edge : graph[v]) if (result.dist[edge.to] == result.inf) "
+                        "throw std::overflow_error(\"dijkstra_dist: shortest distance exceeds supported range\"); "
+                        "for (auto& distance : result.dist) if (distance == result.inf) distance = -1; "
+                        "return result.dist; }())")
+            return self.ordered([graph, source], Type("vec", (I64,)), dijkstra_code, borrow=True)
+        if node.kind in ("call", "method") and name == "zero_one_bfs_dist":
+            if len(args) != 2 or node.extra.get("types"):
+                self.fail("zero_one_bfs_dist(重み付き隣接リスト, 始点) と書いてください", node)
+            graph = self.expr(args[0])
+            edge_type = Type("pair", (I32, I64))
+            graph_type = Type("vec", (Type("vec", (edge_type,)),))
+            if graph.type != graph_type:
+                self.fail("zero_one_bfs_dist のグラフは vec<vec<pair<i32,i64>>> にしてください", node)
+            with self.protect(graph.origins):
+                source = self.expr(args[1])
+            if source.type not in INTEGER:
+                self.fail("zero_one_bfs_dist の始点は整数にしてください", node)
+            self.uses_graph = True
+            def zero_one_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; auto source = {ns[1]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"zero_one_bfs_dist: too many vertices\"); "
+                        "int n = static_cast<int>(input.size()); "
+                        "if (source < 0 || source >= n) throw std::out_of_range(\"zero_one_bfs_dist: invalid source\"); "
+                        "Graph<long long> graph(n, true); "
+                        "for (int v = 0; v < n; ++v) for (const auto& [to, cost] : input[v]) { "
+                        "if (to < 0 || to >= n) throw std::out_of_range(\"zero_one_bfs_dist: invalid neighbor\"); "
+                        "if (cost != 0 && cost != 1) throw std::invalid_argument(\"zero_one_bfs_dist: edge weight must be 0 or 1\"); "
+                        "graph.add_edge(v, to, cost); } "
+                        "auto result = ::zero_one_bfs(graph, static_cast<int>(source)); "
+                        "for (auto& d : result.dist) if (d == result.inf) d = -1; "
+                        "return result.dist; }())")
+            return self.ordered([graph, source], Type("vec", (I64,)), zero_one_code, borrow=True)
+        if node.kind in ("call", "method") and name in ("strongly_connected_component_ids", "strongly_connected_component_groups"):
+            if kwargs or len(args) != 1 or node.extra.get("types"):
+                self.fail(f"{name}(隣接リスト) と書いてください", node)
+            graph = self.expr(args[0])
+            if graph.type.name != "vec" or graph.type.args[0].name != "vec" or graph.type.args[0].args[0] not in INTEGER:
+                self.fail(f"{name} のグラフは整数の2次元配列にしてください", node)
+            self.uses_graph = True
+            field = "groups" if name == "strongly_connected_component_groups" else "id"
+            def component_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        f"throw std::out_of_range(\"{name}: too many vertices\"); "
+                        "int n = static_cast<int>(input.size()); "
+                        "std::vector<std::vector<int>> adjacency(n); "
+                        "for (int v = 0; v < n; ++v) { "
+                        "if (input[v].size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        f"throw std::out_of_range(\"{name}: too many neighbors\"); "
+                        "for (auto to : input[v]) { "
+                        f"if (to < 0 || to >= n) throw std::out_of_range(\"{name}: invalid neighbor\"); "
+                        "adjacency[v].push_back(static_cast<int>(to)); } } "
+                        f"return ::strongly_connected_components(::to_graph(adjacency, true)).{field}; }}())")
+            return self.ordered([graph], Type("vec", (Type("vec", (I32,)) if field == "groups" else I32,)), component_code, borrow=True)
+        if node.kind in ("call", "method") and name == "connected_component_ids":
+            if kwargs or len(args) != 1 or node.extra.get("types"):
+                self.fail("connected_component_ids(隣接リスト) と書いてください", node)
+            graph = self.expr(args[0])
+            if graph.type.name != "vec" or graph.type.args[0].name != "vec" or graph.type.args[0].args[0] not in INTEGER:
+                self.fail("connected_component_ids のグラフは整数の2次元配列にしてください", node)
+            self.uses_graph = True
+            def component_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"connected_component_ids: too many vertices\"); "
+                        "int n = static_cast<int>(input.size()); "
+                        "std::vector<std::vector<int>> adjacency(n); "
+                        "for (int v = 0; v < n; ++v) for (auto to : input[v]) { "
+                        "if (to < 0 || to >= n) throw std::out_of_range(\"connected_component_ids: invalid neighbor\"); "
+                        "adjacency[v].push_back(static_cast<int>(to)); } "
+                        "return ::connected_components(::to_graph(adjacency, true)).id; }())")
+            return self.ordered([graph], Type("vec", (I32,)), component_code, borrow=True)
+        if node.kind in ("call", "method") and name == "bipartite_colors":
+            if kwargs or len(args) != 1 or node.extra.get("types"):
+                self.fail("bipartite_colors(隣接リスト) と書いてください", node)
+            graph = self.expr(args[0])
+            if graph.type.name != "vec" or graph.type.args[0].name != "vec" or graph.type.args[0].args[0] not in INTEGER:
+                self.fail("bipartite_colors のグラフは整数の2次元配列にしてください", node)
+            self.uses_graph = True
+            def color_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"bipartite_colors: too many vertices\"); "
+                        "int n = static_cast<int>(input.size()); "
+                        "std::vector<std::vector<int>> adjacency(n); "
+                        "for (int v = 0; v < n; ++v) for (auto to : input[v]) { "
+                        "if (to < 0 || to >= n) throw std::out_of_range(\"bipartite_colors: invalid neighbor\"); "
+                        "adjacency[v].push_back(static_cast<int>(to)); } "
+                        "auto result = ::bipartite_coloring(::to_graph(adjacency, true)); "
+                        "return std::pair<bool, std::vector<int>>{result.has_value(), result.value_or(std::vector<int>{})}; }())")
+            return self.ordered([graph], Type("pair", (BOOL, Type("vec", (I32,)))), color_code, borrow=True)
+        if node.kind in ("call", "method") and name == "topological_order":
+            if kwargs or len(args) != 1 or node.extra.get("types"):
+                self.fail("topological_order(隣接リスト) と書いてください", node)
+            graph = self.expr(args[0])
+            if graph.type.name != "vec" or graph.type.args[0].name != "vec" or graph.type.args[0].args[0] not in INTEGER:
+                self.fail("topological_order のグラフは整数の2次元配列にしてください", node)
+            self.uses_graph = True
+            def topo_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"topological_order: too many vertices\"); "
+                        "int n = static_cast<int>(input.size()); "
+                        "std::vector<std::vector<int>> adjacency(n); std::vector<int> indegree(n); "
+                        "for (int v = 0; v < n; ++v) for (auto to : input[v]) { "
+                        "if (to < 0 || to >= n) throw std::out_of_range(\"topological_order: invalid neighbor\"); "
+                        "if (indegree[static_cast<int>(to)] == std::numeric_limits<int>::max()) "
+                        "throw std::out_of_range(\"topological_order: indegree overflow\"); "
+                        "++indegree[static_cast<int>(to)]; adjacency[v].push_back(static_cast<int>(to)); } "
+                        "auto result = ::topological_sort(::to_graph(adjacency, true)); "
+                        "return std::pair<bool, std::vector<int>>{result.has_value(), result.value_or(std::vector<int>{})}; }())")
+            return self.ordered([graph], Type("pair", (BOOL, Type("vec", (I32,)))), topo_code, borrow=True)
+        if node.kind == "call" and name == "grid_bfs_dist":
+            if kwargs or not 3 <= len(args) <= 4 or node.extra.get("types"):
+                self.fail("grid_bfs_dist(盤面, 行, 列[, 壁文字]) と書いてください", node)
+            grid = self.expr(args[0])
+            if grid.type != Type("vec", (STRING,)):
+                self.fail("grid_bfs_dist の盤面は文字列の配列にしてください", node)
+            with self.protect(grid.origins):
+                rest = [self.expr(arg) for arg in args[1:]]
+            if any(value.type not in INTEGER for value in rest[:2]):
+                self.fail("grid_bfs_dist の始点は整数にしてください", node)
+            if len(rest) == 3 and rest[2].type != CHAR:
+                self.fail("grid_bfs_dist の壁は char にしてください", node)
+            if len(rest) == 2:
+                rest.append(Value("'#'", CHAR))
+            self.uses_graph = True
+            def grid_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; auto row = {ns[1]}; auto col = {ns[2]}; auto wall = {ns[3]}; "
+                        "if (input.empty() || input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"grid_bfs_dist: invalid height\"); "
+                        "std::size_t width = input[0].size(); "
+                        "if (width == 0 || width > static_cast<std::size_t>(std::numeric_limits<int>::max()) / input.size()) "
+                        "throw std::out_of_range(\"grid_bfs_dist: invalid width or too many cells\"); "
+                        "for (const auto& line : input) if (line.size() != width) "
+                        "throw std::invalid_argument(\"grid_bfs_dist: rows must have equal length\"); "
+                        "if (row < 0 || static_cast<std::size_t>(row) >= input.size() || col < 0 || static_cast<std::size_t>(col) >= width) "
+                        "throw std::out_of_range(\"grid_bfs_dist: invalid source\"); "
+                        "auto result = ::grid_bfs(input, static_cast<int>(row), static_cast<int>(col), wall); "
+                        "std::vector<std::vector<long long>> out(input.size(), std::vector<long long>(width)); "
+                        "for (std::size_t r = 0; r < input.size(); ++r) for (std::size_t c = 0; c < width; ++c) { "
+                        "auto d = result.dist[r * width + c]; out[r][c] = d == result.inf ? -1 : d; } "
+                        "return out; }())")
+            ref = self.fresh("grid")
+            result = self.ordered(rest, Type("vec", (Type("vec", (I64,)),)), lambda ns: grid_code([ref, *ns]))
+            return Value(f"([&]() {{ auto&& {ref} = {grid.code}; return {result.code}; }}())", result.type)
+        if node.kind in ("call", "method") and name in ("dfs", "dfs_forest"):
+            if kwargs or node.extra.get("types") or len(args) != (2 if name == "dfs" else 1):
+                self.fail(f"{name} の引数を確認してください", node)
+            graph = self.expr(args[0])
+            if graph.type.name != "vec" or graph.type.args[0].name != "vec" or graph.type.args[0].args[0] not in INTEGER:
+                self.fail(f"{name} のグラフは整数の2次元配列にしてください", node)
+            with self.protect(graph.origins):
+                source = self.expr(args[1]) if name == "dfs" else None
+            if source is not None and source.type not in INTEGER:
+                self.fail("dfs の始点は整数にしてください", node)
+            self.uses_graph = True
+            def dfs_code(ns):
+                source_check = (f'if ({ns[1]} < 0 || {ns[1]} >= n) throw std::out_of_range("dfs: invalid source"); ' if source else "")
+                call = f"::dfs(::to_graph(adjacency, true), static_cast<int>({ns[1]}))" if source else "::dfs_forest(::to_graph(adjacency, true))"
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; "
+                        'if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max() / 2)) throw std::out_of_range("dfs: too many vertices for timestamps"); '
+                        "int n = static_cast<int>(input.size()); " + source_check +
+                        "std::vector<std::vector<int>> adjacency(n); "
+                        "for (int v = 0; v < n; ++v) for (auto to : input[v]) { "
+                        'if (to < 0 || to >= n) throw std::out_of_range("dfs: invalid neighbor"); '
+                        "adjacency[v].push_back(static_cast<int>(to)); } "
+                        f"return {call}; }}())")
+            return self.ordered([graph] + ([source] if source else []), Type("dfs_result"), dfs_code, borrow=True)
+        if node.kind in ("call", "method") and name == "bfs_dist":
+            if len(args) != 2 or node.extra.get("types"):
+                self.fail("bfs_dist(隣接リスト, 始点) と書いてください", node)
+            graph = self.expr(args[0])
+            if graph.type.name != "vec" or graph.type.args[0].name != "vec" or graph.type.args[0].args[0] not in INTEGER:
+                self.fail("bfs_dist のグラフは整数の2次元配列にしてください", node)
+            with self.protect(graph.origins):
+                source = self.expr(args[1])
+            if source.type.name == "vec" and source.type.args[0] in INTEGER:
+                self.uses_graph = True
+                def multisource_code(ns):
+                    return ("([&]() { "
+                            f"const auto& input = {ns[0]}; const auto& sources = {ns[1]}; "
+                            "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                            "throw std::out_of_range(\"bfs_dist: too many vertices\"); "
+                            "int n = static_cast<int>(input.size()); "
+                            "std::vector<int> starts; starts.reserve(sources.size()); "
+                            "for (auto source : sources) { "
+                            "if (source < 0 || source >= n) throw std::out_of_range(\"bfs_dist: invalid source\"); "
+                            "starts.push_back(static_cast<int>(source)); } "
+                            "std::vector<std::vector<int>> adjacency(n); "
+                            "for (int v = 0; v < n; ++v) for (auto to : input[v]) { "
+                            "if (to < 0 || to >= n) throw std::out_of_range(\"bfs_dist: invalid neighbor\"); "
+                            "adjacency[v].push_back(static_cast<int>(to)); } "
+                            "auto result = ::bfs(::to_graph(adjacency, true), starts); "
+                            "for (auto& d : result.dist) if (d == result.inf) d = -1; "
+                            "return result.dist; }())")
+                return self.ordered([graph, source], Type("vec", (I64,)), multisource_code, borrow=True)
+            if source.type not in INTEGER:
+                self.fail("bfs_dist の始点は整数または整数配列にしてください", node)
+            self.uses_graph = True
+            def bfs_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; auto source = {ns[1]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"bfs_dist: too many vertices\"); "
+                        "int n = static_cast<int>(input.size()); "
+                        "if (source < 0 || source >= n) throw std::out_of_range(\"bfs_dist: invalid source\"); "
+                        "std::vector<std::vector<int>> adjacency(n); "
+                        "for (int v = 0; v < n; ++v) for (auto to : input[v]) { "
+                        "if (to < 0 || to >= n) throw std::out_of_range(\"bfs_dist: invalid neighbor\"); "
+                        "adjacency[v].push_back(static_cast<int>(to)); } "
+                        "auto result = ::bfs(::to_graph(adjacency, true), static_cast<int>(source)); "
+                        "for (auto& d : result.dist) if (d == result.inf) d = -1; "
+                        "return result.dist; }())")
+            return self.ordered([graph, source], Type("vec", (I64,)), bfs_code, borrow=True)
+        if node.kind == "call" and name == "read_weighted_graph":
+            if len(args) not in (2, 3) or node.extra.get("types"):
+                self.fail("read_weighted_graph(n, m[, directed]) と書いてください", node)
+            values = [self.expr(arg) for arg in args]
+            if any(v.type not in INTEGER for v in values[:2]) or (len(values) == 3 and values[2].type != BOOL):
+                self.fail("read_weighted_graph の頂点数と辺数は整数、directed はboolにしてください", node)
+            edge_type = Type("pair", (I32, I64))
+            graph_type = Type("vec", (Type("vec", (edge_type,)),))
+            def graph_code(ns):
+                directed = ns[2] if len(ns) == 3 else "false"
+                return ("([&]() { "
+                        f"int n = kuma_rt::dimension({ns[0]}); int m = kuma_rt::dimension({ns[1]}); "
+                        "std::vector<std::vector<std::pair<int, long long>>> graph(n); "
+                        "for (int edge = 0; edge < m; ++edge) { "
+                        "auto u = kuma_rt::read<long long>(); auto v = kuma_rt::read<long long>(); "
+                        "auto cost = kuma_rt::read<long long>(); "
+                        "if (u < 1 || u > n || v < 1 || v > n) "
+                        "throw std::out_of_range(\"read_weighted_graph: endpoint must be 1..n\"); "
+                        "--u; --v; graph[u].emplace_back(static_cast<int>(v), cost); "
+                        f"if (!{directed}) graph[v].emplace_back(static_cast<int>(u), cost); "
+                        "} return graph; }())")
+            result = self.ordered(values, graph_type, graph_code)
+            result.code = self.input_guard(result.code, node)
+            return result
+        if node.kind == "call" and name == "read_graph":
+            if len(args) not in (2, 3) or node.extra.get("types"):
+                self.fail("read_graph(n, m[, directed]) と書いてください", node)
+            values = [self.expr(arg) for arg in args]
+            if any(v.type not in INTEGER for v in values[:2]) or (len(values) == 3 and values[2].type != BOOL):
+                self.fail("read_graph の頂点数と辺数は整数、directed はboolにしてください", node)
+            graph_type = Type("vec", (Type("vec", (I32,)),))
+            def graph_code(ns):
+                directed = ns[2] if len(ns) == 3 else "false"
+                return ("([&]() { "
+                        f"int n = kuma_rt::dimension({ns[0]}); int m = kuma_rt::dimension({ns[1]}); "
+                        "std::vector<std::vector<int>> graph(n); "
+                        "for (int edge = 0; edge < m; ++edge) { "
+                        "auto u = kuma_rt::read<long long>(); auto v = kuma_rt::read<long long>(); "
+                        "if (u < 1 || u > n || v < 1 || v > n) "
+                        "throw std::out_of_range(\"read_graph: endpoint must be 1..n\"); "
+                        "--u; --v; graph[u].push_back(static_cast<int>(v)); "
+                        f"if (!{directed}) graph[v].push_back(static_cast<int>(u)); "
+                        "} return graph; }())")
+            result = self.ordered(values, graph_type, graph_code)
+            result.code = self.input_guard(result.code, node)
+            return result
+        if node.kind == "call" and name == "prefix2d":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("prefix2d(2次元配列) と書いてください", node)
+            grid = self.expr(args[0])
+            if grid.type.name != "vec" or grid.type.args[0].name != "vec" or grid.type.args[0].args[0] not in NUMBER:
+                self.fail("prefix2d は2次元の数値配列に使ってください", node)
+            result_type = Type("prefix2d", (grid.type.args[0].args[0],))
+            return self.ordered([grid], result_type, lambda ns: f"{result_type.cpp()}({ns[0]})", borrow=True)
+        if node.kind == "call" and name == "prefix_sum2d":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("prefix_sum2d(2次元配列) と書いてください", node)
+            grid = self.expr(args[0])
+            if grid.type.name != "vec" or grid.type.args[0].name != "vec" or grid.type.args[0].args[0] not in NUMBER:
+                self.fail("prefix_sum2d は2次元の数値配列に使ってください", node)
+            def prefix2d_code(ns):
+                return ("([&]() { "
+                        f"const auto& grid = {ns[0]}; "
+                        "const auto width = grid.empty() ? 0 : grid.front().size(); "
+                        "for (const auto& row : grid) if (row.size() != width) "
+                        "throw std::invalid_argument(\"prefix_sum2d: rows must have equal length\"); "
+                        "return ::prefix_sum2d(grid); }())")
+            return self.ordered([grid], grid.type, prefix2d_code, borrow=True)
+        if node.kind in ("call", "method") and name in ("find_idx", "rfind_idx"):
+            if len(args) != 2 or kwargs or node.extra.get("types"):
+                self.fail(f"{name}(配列または文字列, 値) と書いてください", node)
+            sequence = self.expr(args[0])
+            if sequence.type == STRING:
+                element = CHAR
+            elif sequence.type.name == "vec" and self.equality_owned_type_supported(sequence.type.args[0]):
+                element = sequence.type.args[0]
+            else:
+                self.fail(f"{name} は対応する所有値の配列または文字列に使ってください", node)
+            with self.protect(sequence.origins):
+                target = self.coerce(self.expr(args[1]), element, node)
+            return self.ordered([sequence, target], I32, lambda ns: f"::{name}({ns[0]}, {ns[1]})", borrow=True)
+        if node.kind in ("call", "method") and name == "range_sum" and len(args) == 5 and not node.extra.get("types"):
+            sequence = self.expr(args[0])
+            if sequence.type.name == "prefix2d":
+                with self.protect(sequence.origins):
+                    bounds = [self.expr(arg) for arg in args[1:]]
+                if any(bound.type not in INTEGER for bound in bounds):
+                    self.fail("range_sum の端点は整数にしてください", node)
+                seq = self.fresh("prefix2d")
+                result = self.ordered(bounds, sequence.type.args[0], lambda ns: f"{seq}.sum(" + ", ".join(ns) + ")")
+                return Value(f"([&]() {{ auto&& {seq} = {sequence.code}; return {result.code}; }}())", sequence.type.args[0])
+            if sequence.type.name != "vec" or sequence.type.args[0].name != "vec" or sequence.type.args[0].args[0] not in NUMBER:
+                self.fail("range_sum の矩形版は2次元の数値累積和に使ってください", node)
+            with self.protect(sequence.origins):
+                bounds = [self.expr(arg) for arg in args[1:]]
+            if any(bound.type not in INTEGER for bound in bounds):
+                self.fail("range_sum の端点は整数にしてください", node)
+            seq = self.fresh("prefix2d")
+            def rectangle_code(ns):
+                return ("([&]() { "
+                        f"if ({seq}.empty() || {seq}.front().empty()) "
+                        "throw std::invalid_argument(\"range_sum: empty prefix table\"); "
+                        f"const auto width = {seq}.front().size(); "
+                        f"for (const auto& row : {seq}) if (row.size() != width) "
+                        "throw std::invalid_argument(\"range_sum: rows must have equal length\"); "
+                        f"for (const auto& value : {seq}.front()) if (value != 0) "
+                        "throw std::invalid_argument(\"range_sum: prefix border must be zero\"); "
+                        f"for (const auto& row : {seq}) if (row.front() != 0) "
+                        "throw std::invalid_argument(\"range_sum: prefix border must be zero\"); "
+                        f"if ({ns[0]} < 0 || {ns[1]} < 0 || {ns[0]} > {ns[2]} || {ns[1]} > {ns[3]} || "
+                        f"static_cast<unsigned long long>({ns[2]}) >= {seq}.size() || "
+                        f"static_cast<unsigned long long>({ns[3]}) >= width) "
+                        "throw std::out_of_range(\"range_sum: invalid rectangle bounds\"); "
+                        f"return ::range_sum({seq}, {ns[0]}, {ns[1]}, {ns[2]}, {ns[3]}); }}())")
+            result = self.ordered(bounds, sequence.type.args[0].args[0], rectangle_code)
+            return Value(f"([&]() {{ auto&& {seq} = {sequence.code}; return {result.code}; }}())", sequence.type.args[0].args[0])
+        if node.kind in ("call", "method") and name == "range_sum":
+            if len(args) != 3 or node.extra.get("types"):
+                self.fail("range_sum(累積和, l, r) と書いてください", node)
+            sequence = self.expr(args[0])
+            if sequence.type.name != "vec" or sequence.type.args[0] not in NUMBER:
+                self.fail("range_sum は1次元の数値累積和に使ってください", node)
+            with self.protect(sequence.origins):
+                bounds = [self.expr(arg) for arg in args[1:]]
+            if any(bound.type not in INTEGER for bound in bounds):
+                self.fail("range_sum の端点は整数にしてください", node)
+            seq = self.fresh("prefix")
+            def range_sum_code(ns):
+                return ("([&]() { "
+                        f"if ({ns[0]} < 0 || {ns[0]} > {ns[1]} || "
+                        f"static_cast<unsigned long long>({ns[1]}) >= {seq}.size()) "
+                        "throw std::out_of_range(\"range_sum: require 0 <= l <= r < prefix size\"); "
+                        f"return ::range_sum({seq}, {ns[0]}, {ns[1]}); }}())")
+            result = self.ordered(bounds, sequence.type.args[0], range_sum_code)
+            return Value(f"([&]() {{ auto&& {seq} = {sequence.code}; return {result.code}; }}())", sequence.type.args[0])
+        if node.kind in ("call", "method") and name == "frequencies":
+            if kwargs or len(args) != 1 or node.extra.get("types"):
+                self.fail("frequencies(配列または文字列) または 対象.frequencies() と書いてください", node)
+            values = self.expr(args[0])
+            if values.type.name not in ("vec", "string"):
+                self.fail("frequencies は配列または文字列に使ってください", node)
+            key_type = CHAR if values.type == STRING else values.type.args[0]
+            if not self.ordered_owned_type_supported(key_type):
+                self.fail("frequencies の要素は所有できる順序付き値にしてください。配列などを含む型は未対応です", node)
+            result = Type("dict", (key_type, I64))
+            return self.ordered([values], result, lambda ns: f"::frequencies({ns[0]})", borrow=True)
+        if node.kind == "call" and name == "has_common":
+            if len(args) != 2 or node.extra.get("types"):
+                self.fail("has_common(a, b) と書いてください", node)
+            left = self.expr(args[0])
+            if left.type.name not in ("vec", "string"):
+                self.fail("has_common は配列または文字列に使ってください", node)
+            with self.protect(left.origins):
+                right = self.expr(args[1])
+            if right.type.name not in ("vec", "string"):
+                self.fail("has_common は配列または文字列に使ってください", node)
+            left_type = CHAR if left.type == STRING else left.type.args[0]
+            right_type = CHAR if right.type == STRING else right.type.args[0]
+            if not (left_type == right_type or left_type in INTEGER and right_type in INTEGER):
+                self.fail("has_common の要素型は同じ型か i32・i64 にしてください", node)
+            if not self.ordered_owned_type_supported(left_type) or not self.ordered_owned_type_supported(right_type):
+                self.fail("has_common は対応する順序付き所有値に使ってください", node)
+            if self.ordered_key_features(left_type)[1] or self.ordered_key_features(right_type)[1]:
+                self.fail("has_common の要素に f64 は使えません", node)
+            return self.ordered([left, right], BOOL, lambda ns: f"::has_common({ns[0]}, {ns[1]})", borrow=True)
+        if node.kind == "call" and name == "positions":
+            if len(args) not in (1, 2) or node.extra.get("types"):
+                self.fail("positions(配列または文字列[, 開始位置]) と書いてください", node)
+            values = self.expr(args[0])
+            if values.type.name not in ("vec", "string"):
+                self.fail("positions は配列または文字列に使ってください", node)
+            key_type = CHAR if values.type == STRING else values.type.args[0]
+            if not self.ordered_owned_type_supported(key_type):
+                self.fail("positions の要素は対応する順序付き所有値にしてください", node)
+            if self.ordered_key_features(key_type)[1]:
+                self.fail("positions の要素に f64 は使えません", node)
+            result_type = Type("dict", (key_type, Type("vec", (I64,))))
+            if len(args) == 1:
+                return self.ordered([values], result_type, lambda ns: f"::positions({ns[0]})", borrow=True)
+            with self.protect(values.origins):
+                start = self.expr(args[1])
+            if start.type not in INTEGER:
+                self.fail("positions の開始位置は i32 または i64 にしてください", node)
+            source = self.fresh("positions_source")
+            result = self.ordered([start], result_type, lambda ns: f"::positions({source}, {ns[0]})")
+            return Value(f"([&]() {{ auto&& {source} = {values.code}; return {result.code}; }}())", result_type)
+        if node.kind == "call" and name == "pow_mod":
+            if len(args) != 3 or node.extra.get("types"):
+                self.fail("pow_mod(x, n, m) と書いてください", node)
+            values = [self.expr(arg) for arg in args]
+            if any(value.type not in INTEGER for value in values):
+                self.fail("pow_mod の引数は i32 または i64 にしてください", node)
+            self.uses_math = True
+            def pow_mod_code(ns):
+                return ("([&]() { "
+                        f"if ({ns[1]} < 0) throw std::invalid_argument(\"pow_mod: exponent must be non-negative\"); "
+                        f"if ({ns[2]} <= 0 || {ns[2]} > std::numeric_limits<int>::max()) "
+                        "throw std::out_of_range(\"pow_mod: modulus must be 1..INT_MAX\"); "
+                        f"return ::pow_mod({ns[0]}, {ns[1]}, static_cast<int>({ns[2]})); }}())")
+            return self.ordered(values, I64, pow_mod_code)
+        if node.kind == "call" and name == "floor_div":
+            if len(args) != 2 or node.extra.get("types"):
+                self.fail("floor_div(a, b) と書いてください", node)
+            values = [self.expr(arg) for arg in args]
+            if any(value.type not in INTEGER for value in values):
+                self.fail("floor_div の引数は i32 または i64 にしてください", node)
+            return self.ordered(values, I64, lambda ns: f"::floor_div({ns[0]}, {ns[1]})")
+        if node.kind == "call" and name == "ceil_div":
+            if len(args) != 2 or node.extra.get("types"):
+                self.fail("ceil_div(a, b) と書いてください", node)
+            values = [self.expr(arg) for arg in args]
+            if any(value.type not in INTEGER for value in values):
+                self.fail("ceil_div の引数は i32 または i64 にしてください", node)
+            return self.ordered(values, I64, lambda ns: f"::ceil_div({ns[0]}, {ns[1]})")
+        if node.kind == "call" and name == "mex":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("mex(整数配列) と書いてください", node)
+            values = self.expr(args[0])
+            if values.type.name != "vec" or values.type.args[0] not in INTEGER:
+                self.fail("mex は i32 または i64 の配列に使ってください", node)
+            def mex_code(ns):
+                return ("([&]() { "
+                        f"if ({ns[0]}.size() >= static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::invalid_argument(\"mex: range is too large\"); "
+                        f"return ::mex({ns[0]}); }}())")
+            return self.ordered([values], I32, mex_code, borrow=True)
+        if node.kind == "call" and name == "is_unique":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("is_unique(配列または文字列) と書いてください", node)
+            values = self.expr(args[0])
+            if values.type.name not in ("vec", "string"):
+                self.fail("is_unique は配列または文字列に使ってください", node)
+            element = CHAR if values.type == STRING else values.type.args[0]
+            if not self.ordered_owned_type_supported(element):
+                self.fail("is_unique は対応する順序付き所有値に使ってください", node)
+            if element != F64 and self.ordered_key_features(element)[1]:
+                self.fail("is_unique の組・構造体の要素に f64 は使えません", node)
+            return self.ordered([values], BOOL, lambda ns: f"::is_unique({ns[0]})", borrow=True)
+        if node.kind == "call" and name == "prime_factorize":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("prime_factorize(n) と書いてください", node)
+            value = self.expr(args[0])
+            if value.type not in INTEGER:
+                self.fail("prime_factorize の引数は i32 または i64 にしてください", node)
+            self.uses_math = True
+            result_type = Type("vec", (Type("pair", (I64, I32)),))
+            def factor_code(ns):
+                return ("([&]() { "
+                        f"const auto factors = ::prime_factorize({ns[0]}); "
+                        "std::vector<std::pair<long long, int>> result; result.reserve(factors.size()); "
+                        "for (const auto& [prime, exponent] : factors) "
+                        "result.emplace_back(static_cast<long long>(prime), exponent); "
+                        "return result; }())")
+            return self.ordered([value], result_type, factor_code)
+        if node.kind == "call" and name == "divisors":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("divisors(n) と書いてください", node)
+            value = self.expr(args[0])
+            if value.type not in INTEGER:
+                self.fail("divisors の引数は i32 または i64 にしてください", node)
+            self.uses_math = True
+            def divisor_code(ns):
+                return ("([&]() { "
+                        f"const auto values = ::divisors({ns[0]}); "
+                        "return std::vector<long long>(values.begin(), values.end()); }())")
+            return self.ordered([value], Type("vec", (I64,)), divisor_code)
+        if node.kind == "call" and name == "is_prime":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("is_prime(n) と書いてください", node)
+            value = self.expr(args[0])
+            if value.type not in INTEGER:
+                self.fail("is_prime の引数は i32 または i64 にしてください", node)
+            self.uses_math = True
+            return self.ordered([value], BOOL, lambda ns: f"::is_prime({ns[0]})")
+        if node.kind == "call" and name in ("sliding_window_min", "sliding_window_max"):
+            if kwargs or len(args) != 2 or node.extra.get("types"):
+                self.fail(f"{name}(配列または文字列, 幅) と書いてください", node)
+            sequence = self.expr(args[0])
+            if sequence.type.name not in ("vec", "string"):
+                self.fail(f"{name} は配列または文字列に使ってください", node)
+            element = CHAR if sequence.type == STRING else sequence.type.args[0]
+            if not self.ordered_owned_type_supported(element) or self.ordered_key_features(element)[1]:
+                self.fail(f"{name} は f64 を含まない順序付き所有値に使ってください", node)
+            with self.protect(sequence.origins):
+                width = self.expr(args[1])
+            if width.type not in INTEGER:
+                self.fail(f"{name} の幅は整数にしてください", node)
+            self.uses_algo = True
+            output = Type("vec", (element,))
+            def sliding_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; auto width = {ns[1]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        f"throw std::out_of_range(\"{name}: too many elements\"); "
+                        f"if (width <= 0 || static_cast<unsigned long long>(width) > input.size()) return {output.cpp()}{{}}; "
+                        f"return ::{name}(input, static_cast<int>(width)); }}())")
+            return self.ordered([sequence, width], output, sliding_code, borrow=True)
+        if node.kind == "call" and name == "next_greater_indices":
+            if kwargs or len(args) != 1 or node.extra.get("types"):
+                self.fail("next_greater_indices(配列または文字列) と書いてください", node)
+            sequence = self.expr(args[0])
+            if sequence.type.name not in ("vec", "string"):
+                self.fail("next_greater_indices は配列または文字列に使ってください", node)
+            element = CHAR if sequence.type == STRING else sequence.type.args[0]
+            if not self.ordered_owned_type_supported(element) or self.ordered_key_features(element)[1]:
+                self.fail("next_greater_indices は f64 を含まない順序付き所有値に使ってください", node)
+            self.uses_algo = True
+            def next_greater_code(ns):
+                return ("([&]() { "
+                        f"const auto& input = {ns[0]}; "
+                        "if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"next_greater_indices: too many elements\"); "
+                        "return ::next_greater_indices(input); }())")
+            return self.ordered([sequence], Type("vec", (I32,)), next_greater_code, borrow=True)
+        if node.kind == "call" and name == "next_permutation":
+            if kwargs or len(args) != 1 or node.extra.get("types"):
+                self.fail("next_permutation(配列または文字列) と書いてください", node)
+            sequence = self.expr(args[0])
+            if sequence.type.name not in ("vec", "string"):
+                self.fail("next_permutation は配列または文字列に使ってください", node)
+            element = CHAR if sequence.type == STRING else sequence.type.args[0]
+            if not self.ordered_owned_type_supported(element):
+                self.fail("next_permutation は対応する順序付き所有値に使ってください", node)
+            if self.ordered_key_features(element)[1]:
+                self.fail("next_permutation の要素に f64 は使えません", node)
+            self.writable(sequence, node)
+            return self.ordered([sequence], BOOL, lambda ns: f"::next_permutation({ns[0]}).found", borrow=True)
+        if name == "unique_stable" and node.kind in ("call", "method"):
+            if kwargs or node.extra.get("types") or len(args) != 1:
+                self.fail("unique_stable(配列) または 配列.unique_stable() と書いてください", node)
+            sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if sequence.type.name == "vec":
+                if not self.ordered_owned_type_supported(sequence.type.args[0]):
+                    self.fail("unique_stable は対応する順序付き所有値の配列に使ってください", node)
+                return self.ordered([sequence], sequence.type, lambda ns: f"::unique_stable({ns[0]})", borrow=True)
+            if node.kind == "call":
+                self.fail("unique_stable は配列に使ってください", node)
+        if node.kind == "call" and name == "sort_unique":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("sort_unique(配列) と書いてください", node)
+            sequence = self.expr(args[0])
+            if sequence.type.name != "vec" or not self.ordered_owned_type_supported(sequence.type.args[0]):
+                self.fail("sort_unique は対応する順序付き所有値の配列に使ってください", node)
+            if self.ordered_key_features(sequence.type.args[0])[1]:
+                self.fail("sort_unique の要素に f64 は使えません", node)
+            self.writable(sequence, node)
+            return self.ordered([sequence], BOOL, lambda ns: f"::sort_unique({ns[0]})", borrow=True)
+        if node.kind == "call" and name == "lcm":
+            if len(args) != 2 or node.extra.get("types"):
+                self.fail("lcm(a, b) と書いてください", node)
+            values = [self.expr(arg) for arg in args]
+            if any(value.type not in INTEGER for value in values):
+                self.fail("lcm の引数は i32 または i64 にしてください", node)
+            result_type = I64 if any(value.type == I64 for value in values) else I32
+            def lcm_code(ns):
+                cpp_type = result_type.cpp()
+                return ("([&]() { "
+                        f"{cpp_type} a = static_cast<{cpp_type}>({ns[0]}); "
+                        f"{cpp_type} b = static_cast<{cpp_type}>({ns[1]}); "
+                        f"if (a == std::numeric_limits<{cpp_type}>::min() || b == std::numeric_limits<{cpp_type}>::min()) "
+                        "throw std::overflow_error(\"lcm: absolute value exceeds result type\"); "
+                        f"if (a == 0 || b == 0) return static_cast<{cpp_type}>(0); "
+                        f"{cpp_type} aa = a < 0 ? -a : a; {cpp_type} bb = b < 0 ? -b : b; "
+                        f"{cpp_type} factor = aa / std::gcd(aa, bb); "
+                        f"if (factor > std::numeric_limits<{cpp_type}>::max() / bb) "
+                        "throw std::overflow_error(\"lcm: result exceeds result type\"); "
+                        "return std::lcm(a, b); }())")
+            return self.ordered(values, result_type, lcm_code)
+        if node.kind == "call" and name == "gcd":
+            if len(args) != 2 or node.extra.get("types"):
+                self.fail("gcd(a, b) と書いてください", node)
+            values = [self.expr(arg) for arg in args]
+            if any(value.type not in INTEGER for value in values):
+                self.fail("gcd の引数は i32 または i64 にしてください", node)
+            result_type = I64 if any(value.type == I64 for value in values) else I32
+            def gcd_code(ns):
+                cpp_type = result_type.cpp()
+                return ("([&]() { "
+                        f"{cpp_type} a = static_cast<{cpp_type}>({ns[0]}); "
+                        f"{cpp_type} b = static_cast<{cpp_type}>({ns[1]}); "
+                        f"if (a == std::numeric_limits<{cpp_type}>::min() || b == std::numeric_limits<{cpp_type}>::min()) "
+                        "throw std::overflow_error(\"gcd: absolute value exceeds result type\"); "
+                        "return std::gcd(a, b); }())")
+            return self.ordered(values, result_type, gcd_code)
+        if node.kind == "call" and name == "run_length_encode":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("run_length_encode(配列または文字列) と書いてください", node)
+            values = self.expr(args[0])
+            if values.type.name not in ("vec", "string"):
+                self.fail("run_length_encode は配列または文字列に使ってください", node)
+            element = CHAR if values.type == STRING else values.type.args[0]
+            if element not in (I32, I64, F64, BOOL, CHAR, STRING):
+                self.fail("run_length_encode の要素は対応するスカラー型にしてください", node)
+            result = Type("vec", (Type("pair", (element, I32)),))
+            def encode_code(ns):
+                return ("([&]() { "
+                        f"if ({ns[0]}.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+                        "throw std::out_of_range(\"run_length_encode: input too large\"); "
+                        f"return ::run_length_encode({ns[0]}); }}())")
+            return self.ordered([values], result, encode_code, borrow=True)
+        if node.kind == "call" and name == "compress":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("compress(整数配列) と書いてください", node)
+            sequence = self.expr(args[0])
+            if sequence.type.name != "vec" or sequence.type.args[0] not in INTEGER:
+                self.fail("compress は i32 または i64 の配列に使ってください", node)
+            self.writable(sequence, node)
+            source = self.fresh("compress_source")
+            element = sequence.type.args[0].cpp()
+            return Value((f"([&]() {{ auto& {source} = {sequence.code}; "
+                          f"if (static_cast<unsigned long long>({source}.size()) > "
+                          f"static_cast<unsigned long long>(std::numeric_limits<{element}>::max()) + 1ULL) "
+                          "throw std::out_of_range(\"compress: array too large\"); "
+                          f"return ::compress({source}); }}())"), BOOL)
+        if node.kind == "call" and name == "transpose":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("transpose(グリッド) と書いてください", node)
+            grid = self.expr(args[0])
+            is_strings = grid.type.name == "vec" and grid.type.args[0] == STRING
+            is_matrix = (grid.type.name == "vec" and grid.type.args[0].name == "vec" and
+                         grid.type.args[0].args[0] in (I32, I64, F64, BOOL, CHAR, STRING))
+            if not (is_strings or is_matrix):
+                self.fail("transpose は文字列の配列またはスカラーの2次元配列に使ってください", node)
+            return self.ordered([grid], grid.type, lambda ns: f"::transpose({ns[0]})", borrow=True)
+        if node.kind == "call" and name == "rotate90":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("rotate90(グリッド) と書いてください", node)
+            grid = self.expr(args[0])
+            is_strings = grid.type.name == "vec" and grid.type.args[0] == STRING
+            is_matrix = (grid.type.name == "vec" and grid.type.args[0].name == "vec" and
+                         grid.type.args[0].args[0] in (I32, I64, F64, BOOL, CHAR, STRING))
+            if not (is_strings or is_matrix):
+                self.fail("rotate90 は文字列の配列またはスカラーの2次元配列に使ってください", node)
+            def rotate_code(ns):
+                return ("([&]() { "
+                        f"const auto& grid = {ns[0]}; "
+                        "const auto width = grid.empty() ? 0 : grid.front().size(); "
+                        "for (const auto& row : grid) if (row.size() != width) "
+                        "throw std::invalid_argument(\"rotate90: rows must have equal length\"); "
+                        "return ::rotate90(grid); }())")
+            return self.ordered([grid], grid.type, rotate_code, borrow=True)
+        if node.kind == "call" and name == "bit_ctz":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("bit_ctz(x) と書いてください", node)
+            value = self.expr(args[0])
+            if value.type not in INTEGER:
+                self.fail("bit_ctz の引数は i32 または i64 にしてください", node)
+            return self.ordered([value], I32, lambda ns: f"::bit_ctz({ns[0]})")
+        if node.kind == "call" and name == "bit_count":
+            if len(args) != 1 or node.extra.get("types"):
+                self.fail("bit_count(x) と書いてください", node)
+            value = self.expr(args[0])
+            if value.type not in INTEGER:
+                self.fail("bit_count の引数は i32 または i64 にしてください", node)
+            return self.ordered([value], I32, lambda ns: f"::bit_count({ns[0]})")
+        if node.kind == "call" and name == "has_bit":
+            if len(args) != 2 or node.extra.get("types"):
+                self.fail("has_bit(mask, i) と書いてください", node)
+            values = [self.expr(arg) for arg in args]
+            if any(value.type not in INTEGER for value in values):
+                self.fail("has_bit の引数は整数にしてください", node)
+            def has_bit_code(ns):
+                return (f"([&]() {{ if ({ns[1]} < 0 || {ns[1]} >= 64) "
+                        f"throw std::out_of_range(\"has_bit: bit position must be 0..63\"); "
+                        f"return ::has_bit(static_cast<unsigned long long>({ns[0]}), static_cast<int>({ns[1]})); }}())")
+            return self.ordered(values, BOOL, has_bit_code)
+        if node.kind == "call" and name in ("prefix_sum", "lower_bound_idx", "upper_bound_idx", "equal_range_idx"):
+            if len(args) != (1 if name == "prefix_sum" else 2) or node.extra.get("types"):
+                self.fail(f"{name} の引数を確認してください", node)
+            sequence = self.expr(args[0])
+            if sequence.type.name != "vec":
+                self.fail(f"{name} は配列に使ってください", node)
+            element = sequence.type.args[0]
+            if name == "prefix_sum":
+                def summable(t):
+                    return t in NUMBER or (t.name in ("tuple", "pair") and all(summable(x) for x in t.args))
+                if not summable(element):
+                    self.fail("prefix_sum は数値または数値の組の配列に対応しています", node)
+                return self.ordered([sequence], sequence.type, lambda ns: f"::prefix_sum({ns[0]})", borrow=True)
+            has_record, has_float = self.ordered_key_features(element)
+            if element not in (*NUMBER, BOOL, CHAR, STRING):
+                if not has_record or not self.ordered_owned_type_supported(element):
+                    self.fail(f"{name} はスカラーか、所有できる構造体を含む組の配列に対応しています", node)
+                if has_float:
+                    self.fail(f"{name} の構造体を含むキーに f64 は使えません", node)
+            with self.protect(sequence.origins):
+                target = self.coerce(self.expr(args[1]), element, node)
+            result_type = Type("pair", (I32, I32)) if name == "equal_range_idx" else I32
+            return self.ordered([sequence, target], result_type, lambda ns: f"::{name}({ns[0]}, {ns[1]})", borrow=True)
         values = [self.expr(a) for a in args]
+        if name == "sum" and len(values) == 1 and values[0].type.name == "range":
+            # Consume the finite range directly; do not relax ownership rules
+            # for storage, printing, or other collection operations.
+            return self.ordered(values, I64, lambda ns: f"kuma_rt::sum({ns[0]})")
         for value in values:
             if value.type == VOID and name in ("sum", "sort", "sorted", "reverse", "reversed", "len", "size"):
                 self.fail("値を返さない処理の結果には配列操作を続けられません", node,
@@ -1120,8 +2658,12 @@ class Compiler(DeclarationSupport):
                 self.fail(f"{name} は対象を1個指定してください", node)
             v = values[0]
             if name in ("len", "size"):
-                if v.type.name not in ("vec", "string", "set", "dict"):
-                    self.fail("len/size は配列または文字列に使ってください", node)
+                if v.type.name not in ("vec", "string", "set", "dict", "SortedList", "deque"):
+                    self.fail("len/size は配列・文字列・集合・辞書・SortedList・deque に使ってください", node)
+                if v.type.name == "deque":
+                    return self.ordered(values, I64, lambda ns:
+                        f'([&]() {{ if ({ns[0]}.size() > static_cast<size_t>(std::numeric_limits<long long>::max())) '
+                        f'throw std::length_error("deque: size too large"); return static_cast<long long>({ns[0]}.size()); }}())', borrow=True)
                 return self.ordered(values, I64, lambda ns: f"static_cast<long long>({ns[0]}.size())", borrow=True)
             if v.type.name != "vec":
                 self.fail(f"{name} は配列に使ってください", node)
@@ -1272,13 +2814,14 @@ class Compiler(DeclarationSupport):
                     limit = self.fresh("limit")
                     head = f"for (long long {sym.code} = 0, {limit} = kuma_rt::count({value.code}); {sym.code} < {limit}; ++{sym.code}) "
                 else:
-                    elem = self.iter_element(value.type, node)
+                    elem = value.type.args[0] if value.type.name in ("SortedList", "deque") else self.iter_element(value.type, node)
                     declared = self.parse_type(node.extra["type"], node.token) if node.extra.get("type") and node.extra["type"] != "auto" else elem
                     self.coerce(Value("kuma_gen_element", elem), declared, node)
                     item_name = self.fresh("item")
                     self.bind_pattern(node.extra["pattern"], declared, item_name)
-                    head = f"for ({declared.cpp()} {item_name} : {value.code}) "
-                with self.protect(value.origins if kind == "for" else frozenset()):
+                    source = f"({value.code}).snapshot()" if value.type.name == "SortedList" else value.code
+                    head = f"for ({declared.cpp()} {item_name} : {source}) "
+                with self.protect(value.origins if kind == "for" and value.type.name != "SortedList" else frozenset()):
                     body = "{\n" + "\n".join(self.stmt(s) for s in node.extra["body"]) + "\n}"
                 return prefix + head + body
             finally:
@@ -1315,8 +2858,11 @@ def transpile(source: str, filename: str = "input.kuma", *, optimize: bool = Tru
     body = "\n".join(compiler.stmt(node) for node in nodes)
     declarations = "\n".join(compiler.record_definitions + compiler.function_prototypes + compiler.function_definitions)
     power_runtime = CPP_POWER if compiler.uses_power else ""
+    graph_include = '#include "ac_graph.hpp"\n' if compiler.uses_graph else ""
+    math_include = '#include "ac_math.hpp"\n' if compiler.uses_math else ""
+    algo_include = '#include "ac_algo.hpp"\n' if compiler.uses_algo else ""
     return (archive + ("" if compact else "// Generated by Kuma M5. Edit the .kuma source, not this file.\n")
-            + CPP_RUNTIME + power_runtime + "\n" + declarations + "\nint main() {\ntry {\nkuma_rt::init();\n" + body
+            + CPP_RUNTIME + graph_include + math_include + algo_include + power_runtime + "\n" + declarations + "\nint main() {\ntry {\nkuma_rt::init();\n" + body
             + '\nreturn 0;\n} catch (const std::exception& kuma_gen_error) {\n'
             + 'std::cerr << "Kuma runtime error: " << kuma_gen_error.what() << "\\n";\n'
             + 'return 1;\n}\n}\n')

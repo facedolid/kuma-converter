@@ -9,7 +9,7 @@ _SCALARS = {
     "str", "string", "char", "void",
 }
 _CONSTRUCTORS = {"set", "dict", "map", "pair"}
-_TYPE_NAMES = _SCALARS | {"vec", "vector", "tuple", "auto", *_CONSTRUCTORS}
+_TYPE_NAMES = _SCALARS | {"vec", "vector", "tuple", "auto", "prefix2d", *_CONSTRUCTORS}
 _BARE_CALLS = {
     "input", "print", "debug", "sort", "reverse", "sum", "len", "size",
     "min", "max", "abs", "discard_line", "flush",
@@ -200,10 +200,26 @@ class Parser:
                 self.newlines()
                 value = self.rhs()
                 self.end_statement()
+                # A known scalar type in a zero-dimensional input applies to
+                # each name. Compound and unknown C++ types retain their
+                # existing structured-binding meaning.
+                if (len(names) > 1 and value.kind == "call" and value.value == "input"
+                        and not value.children and not value.extra.get("kwargs")):
+                    types = value.extra.get("types", [])
+                    if len(types) > 1 and len(types) != len(names):
+                        raise KumaError("inputの型の数と分割宣言の名前の数を揃えてください", value.token)
+                    if len(types) == 1 and types[0] in {"i32", "int", "i64", "ll", "long long", "f64", "double", "bool", "char", "string", "str", "std::string"}:
+                        value.extra["types"] = types * len(names)
                 return Node("declare", start, names, [value], {"type": None})
             self.position = position
 
-        if (self.current.text in _TYPE_NAMES | self.user_types and self.tokens[self.position + 1].text != "(") or self.current.text == "(":
+        if ((self.current.text in _TYPE_NAMES | self.user_types and self.tokens[self.position + 1].text != "(")
+                or (self.current.text in {"min_heap", "max_heap", "deque"} and self.current.text not in self.user_types
+                    and self.tokens[self.position + 1].text == "<"
+                    and (self.tokens[self.position + 2].text in _TYPE_NAMES | self.user_types or self.tokens[self.position + 2].text == "("))
+                or (self.current.text in {"max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"} and self.tokens[self.position + 1].kind == "IDENT"
+                    and self.tokens[self.position + 2].text in {"=", "{"})
+                or self.current.text == "("):
             position = self.position
             depth = self.group_depth
             split_mark = len(self.type_splits)
@@ -220,6 +236,14 @@ class Parser:
                     if self.current.text == "(":
                         params = self.parameters(typed=True)
                         return self.function_body(start, name, params, declared_type)
+                    if self.accept("{"):
+                        self.newlines()
+                        self.expect("}", "値初期化は空の {} を使ってください")
+                        if declared_type in {"auto", "void"}:
+                            raise KumaError("空の {} で初期化できる具体的な型が必要です", start)
+                        self.end_statement()
+                        value = Node("default_init", start, declared_type)
+                        return Node("declare", start, [name.text], [value], {"type": declared_type})
                     self.expect("=", "型付き宣言には初期値が必要です。例: i64 x = 0")
                     self.newlines()
                     value = self.rhs()
@@ -444,9 +468,15 @@ class Parser:
         if name.text == "long":
             self.expect("long", "64bit 整数には long long または ll を使ってください")
             return "long long"
-        if name.text in _SCALARS | {"auto"} | self.user_types:
+        if name.text in {"min_heap", "max_heap", "deque"} and name.text not in self.user_types and self.current.text == "<":
+            self.expect("<")
+            arguments = self.type_arguments_after_open()
+            if len(arguments) != 1:
+                raise KumaError("型引数は1個にしてください", name)
+            return name.text + "<" + arguments[0] + ">"
+        if name.text in _SCALARS | {"auto", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"} | self.user_types:
             return name.text
-        if name.text in {"vec", "vector", "tuple", *_CONSTRUCTORS}:
+        if name.text in {"vec", "vector", "tuple", "prefix2d", *_CONSTRUCTORS}:
             self.expect("<")
             arguments = self.type_arguments_after_open()
             arity = 2 if name.text in {"dict", "map", "pair"} else 1
@@ -692,7 +722,7 @@ class Parser:
         while self.current.text != ")":
             annotation = None
             const = bool(self.accept("const"))
-            if self.current.text in _TYPE_NAMES | self.user_types or self.current.text == "(":
+            if self.current.text in _TYPE_NAMES | self.user_types | {"deque", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"} or self.current.text == "(":
                 annotation = self.type_name()
                 if annotation == "auto":
                     annotation = None

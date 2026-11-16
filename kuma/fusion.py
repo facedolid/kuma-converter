@@ -146,6 +146,8 @@ def iteration_source(compiler, node, *, short_circuit=False):
         if len(args) not in (1, 2) or set(kwargs) - {'start'} or len(args) == 2 and kwargs:
             return compiler.expr(node)
         values = [compiler.expr(args[0])]
+        if values[0].type.name == 'deque':
+            return compiler.expr(node)
         element = compiler.iter_element(values[0].type, node)
         start = compiler.expr(args[1] if len(args) == 2 else kwargs['start']) if len(args) == 2 or kwargs else Value('0LL', I64)
         if start.type not in INTEGER:
@@ -157,6 +159,8 @@ def iteration_source(compiler, node, *, short_circuit=False):
         if len(args) < 2 or set(kwargs) - {'strict'}:
             return compiler.expr(node)
         values = [compiler.expr(a) for a in args]
+        if any(v.type.name == 'deque' for v in values):
+            return compiler.expr(node)
         item = Type('tuple', tuple(compiler.iter_element(v.type, node) for v in values))
         strict = compiler.expr(kwargs['strict']) if kwargs else Value('false', BOOL)
         if strict.type != BOOL:
@@ -210,6 +214,10 @@ def lower_sum(compiler, node):
     # Type-check the source normally for all fallback paths. No code is emitted
     # yet, and any allocated source temporary remains owned during consumption.
     source = compiler.expr(source_node)
+    # Deque comprehensions retain eager snapshot semantics; the general
+    # direct deque reduction adapter remains unsupported.
+    if comp and source.type.name == 'deque':
+        return None
     current_type = compiler.iter_element(source.type, node)
     if source.type.name.endswith('_view'):
         return None  # a later producer failure must precede any eager summation

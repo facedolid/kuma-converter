@@ -46,6 +46,9 @@ class DeclarationSupport:
             names = ', '.join('v.kuma_field_' + n for n, _, _ in fields)
             self.record_definitions.append(
                 f'struct {cpp} {{\n{body}\n'
+                f'using kuma_gen_owned_record = void;\n'
+                f'using kuma_gen_value_types = std::tuple<' + ', '.join('decltype(kuma_field_' + n + ')' for n, _, _ in fields) + '>;\n'
+                f'auto kuma_gen_value_fields() const {{ return std::tie(' + ', '.join('kuma_field_' + n for n, _, _ in fields) + '); }\n'
                 f'friend auto kuma_fields({cpp}& v) {{ return std::tie({names}); }}\n'
                 f'friend auto kuma_fields(const {cpp}& v) {{ return std::tie({names}); }}\n'
                 f'bool operator==(const {cpp}&) const = default;\n'
@@ -115,6 +118,12 @@ class DeclarationSupport:
     def member(self, node):
         from .compiler import Value
         owner = self.expr(node.children[0])
+        if owner.type.name == 'dfs_result':
+            if node.value not in {'preorder', 'postorder', 'parent', 'depth', 'root', 'component', 'entry_time', 'exit_time', 'roots'}:
+                self.fail('DFS結果のフィールドがありません: ' + node.value, node)
+            from .compiler import Type, I32
+            # Expose a copy: mutable fields must not invalidate result methods.
+            return Value(f'std::vector<int>(({owner.code}).{node.value})', Type('vec', (I32,)))
         # Only typed Kuma collections have implicit zero-argument methods.
         # Record members (including callable fields) remain ordinary fields.
         zero_arg = {

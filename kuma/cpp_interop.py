@@ -9,10 +9,22 @@ from __future__ import annotations
 import re
 from .lexer import lex
 from .cpp_bodies import NativeBodies
-from .model import KumaError, Node, Token
+from .model import KumaError, Node, Token, safe_sorted_key, sorted_key_captures, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
 from .parser import Parser, _BARE_CALLS
 from .power import CPP_POWER
 from .m10 import CPP_M10, safe_stages, simple_comprehension
+
+
+def function_macro_definition(text: str):
+    """Read a function-like directive header without changing its source text.
+
+    Preprocessing splices lines and treats comments between directive tokens
+    as whitespace. A space/comment before '(' makes it object-like instead.
+    """
+    text = text.replace("\\\n", "")
+    space = r'(?:\s|/\*.*?\*/)'
+    return re.match(r'#' + space + r'*define' + space +
+                    r'+([A-Za-z_]\w*)\(([^)]*)\)(.*)', text, re.S)
 
 
 def uses_cpp(source: str) -> bool:
@@ -56,7 +68,7 @@ class CppParser(InitializerSupport, Parser):
         self.macro_names = set()
         for tok in self.tokens:
             if tok.kind == 'CPP_DIRECTIVE':
-                match = re.match(r'#\s*define\s+([A-Za-z_]\w*)\(', tok.text)
+                match = function_macro_definition(tok.text)
                 if match:
                     self.macro_names.add(match[1])
         self.native_bodies = NativeBodies(self.tokens, self.macro_names)
@@ -761,12 +773,31 @@ class CppParser(InitializerSupport, Parser):
     def parenthesized_println_slice(self) -> Node | None:
         """Lower explicit slice arguments without taking ownership of C++ calls.
 
-        Ordinary println calls remain byte-for-byte native, including custom
+        Ordinary output calls remain byte-for-byte native, including custom
         overloads/macros. Only a successfully parsed Kuma slice opts in.
         """
         begin = self.position
-        if self.current.text != 'println' or self.tokens[begin + 1].text != '(':
+        if self.current.text not in {'print', 'println'} or self.tokens[begin + 1].text != '(':
             return None
+        # Do not reinterpret arguments to locally redefined print macros.
+        # They may stringify, paste, bind names, or evaluate more than once.
+        if self.current.text == 'print' and 'print' in self.macro_names:
+            return None
+        # Stringification/token pasting observes the original token spelling,
+        # not its value. Never lower slices inside such local output macros.
+        for token in self.tokens:
+            if token.kind == 'CPP_DIRECTIVE':
+                definition = function_macro_definition(token.text)
+                if definition and definition[1] == self.current.text and '#' in definition[3]:
+                    return None
+                # An object-like alias can forward to a stringifying/pasting
+                # macro. Its expansion is opaque; preserve the original call.
+                directive = token.text.replace("\\\n", "")
+                space = r'(?:\s|/\*.*?\*/)'
+                alias = re.match(r'#' + space + r'*define' + space +
+                                 r'+([A-Za-z_]\w*)\b', directive, re.S)
+                if alias and alias[1] == self.current.text and definition is None:
+                    return None
         start = self.take()
         self.take()
         saved_depth = self.group_depth
@@ -781,7 +812,7 @@ class CppParser(InitializerSupport, Parser):
             def contains_slice(node):
                 return node.kind == 'slice' or any(contains_slice(c) for c in node.children)
             if self.at_end() and any(contains_slice(arg) for arg in args):
-                return Node('cpp_bare_call', start, 'println', args)
+                return Node('cpp_bare_call', start, start.text, args)
         except KumaError:
             pass
         finally:
@@ -817,6 +848,11 @@ class CppParser(InitializerSupport, Parser):
         if not (qualified or recognized):
             return None
         follow = self.tokens[pos]
+        # A qualified spelling followed by name(...) may be a C++ direct
+        # initializer, not a bare function call. Preserve C++ in this ambiguous
+        # shape; explicit f(g(...)) remains available for the call spelling.
+        if qualified and follow.kind == 'IDENT' and self.tokens[pos + 1].text == '(':
+            return None
         if follow.text == '(':
             return None
         if follow.kind in {'NEWLINE', 'EOF'} or follow.text in {';', '}'}:
@@ -846,6 +882,24 @@ class CppParser(InitializerSupport, Parser):
         return Node('cpp_bare_call', start, callee, args)
 
     def rhs(self) -> Node:
+        # Only recognize unqualified C++ braces at the start of a := RHS.
+        # Elsewhere an identifier followed by { may introduce a Kuma block.
+        previous = self.position - 1
+        while previous >= 0 and self.tokens[previous].kind == 'NEWLINE':
+            previous -= 1
+        target = None
+        if previous >= 0 and self.tokens[previous].text == ':=':
+            target = self.position
+            while self.tokens[target].text == '(':
+                target += 1
+        saved = getattr(self, '_brace_rhs_position', None)
+        self._brace_rhs_position = target
+        try:
+            return self._cpp_rhs()
+        finally:
+            self._brace_rhs_position = saved
+
+    def _cpp_rhs(self) -> Node:
         if (self.current.kind == 'IDENT'
                 and (self.current.text in self.macro_names or self.current.text.isupper())
                 and self.tokens[self.position + 1].text == '('):
@@ -917,6 +971,8 @@ class CppParser(InitializerSupport, Parser):
         return Node('cpp_try', start, extra={'body': body, 'handlers': handlers})
 
     def statement(self) -> Node:
+        if self.record_depth:
+            return super().statement()
         start = self.current
         if start.text == 'try':
             return self.try_statement()
@@ -955,16 +1011,49 @@ class CppParser(InitializerSupport, Parser):
             return Node('cpp_directive', start, start.text)
         if start.text in {'template', 'namespace', 'class', 'using', 'typedef', 'enum'}:
             return self.raw_declaration()
+        # An elaborated local declaration has two identifiers, unlike a
+        # Kuma record definition. Preserve its explicitly terminated C++ form.
+        if (self.depth and start.text == 'struct'
+                and self.tokens[self.position + 1].kind == 'IDENT'
+                and self.tokens[self.position + 2].kind == 'IDENT'):
+            begin = self.position
+            self.take(); self.take(); self.take()
+            if self.current.text == '{':
+                self.group('{', '}')
+            if (self.current.text == ';'
+                    and not any(t.text in {':=', '=>', '..'} for t in self.tokens[begin:self.position])):
+                self.take()
+                return Node('cpp_stmt', start, self.source_range(start, self.tokens[self.position - 1]))
+            self.position = begin
         if start.text == 'struct':
             p = self.position + 2
-            if p < len(self.tokens) and self.tokens[p].text in {'{', ':'}:
+            while p < len(self.tokens) and self.tokens[p].kind == 'NEWLINE':
+                p += 1
+            if p < len(self.tokens) and self.tokens[p].text in {'{', ':', 'final'}:
                 return self.raw_declaration()
-        if not self.depth and start.text not in {'fn', 'if', 'while', 'for', 'rep'}:
+        kuma_record = (start.text == 'struct' and self.position + 3 < len(self.tokens)
+                       and self.tokens[self.position + 2].kind == 'NEWLINE'
+                       and self.tokens[self.position + 3].text not in {'{', ':', 'final'}
+                       and self.tokens[self.position + 3].indent > start.indent)
+        if not self.depth and not kuma_record and start.text not in {'fn', 'if', 'while', 'for', 'rep'}:
             definition = self.native_definition()
             if definition is not None:
                 return definition
-        # Template rep(...) is a C++ macro, not the two-argument Kuma rep sugar.
-        if start.text == 'rep' and self.tokens[self.position + 1].text == '(':
+        # Known template loop macros retain their native C++ macro arguments;
+        # only the controlled body is parsed for Kuma sugar.
+        template_macro_body = False
+        if start.text in {'rrep', 'repi', 'repl', 'repit', 'repeach'} and self.tokens[self.position + 1].text == '(':
+            opening = self.position + 1
+            closing = self.native_bodies.pairs.get(opening)
+            if closing is not None:
+                following = self.tokens[closing + 1]
+                template_macro_body = following.text == '{'
+                if following.kind == 'NEWLINE':
+                    look = closing + 1
+                    while self.tokens[look].kind == 'NEWLINE':
+                        look += 1
+                    template_macro_body = self.tokens[look].indent > start.indent
+        if (start.text == 'rep' or template_macro_body) and self.tokens[self.position + 1].text == '(':
             self.take()
             self.group('(', ')')
             header = self.source_range(start, self.tokens[self.position - 1])
@@ -1023,6 +1112,12 @@ class CppParser(InitializerSupport, Parser):
                         self.restore_type_trial(mark, saved_group_depth, split_mark)
                 except KumaError:
                     self.restore_type_trial(mark, saved_group_depth, split_mark)
+            if (position in (getattr(self, '_brace_rhs_position', None),
+                             getattr(self, '_brace_argument_position', None))
+                    and not qualified and self.position == position + 1
+                    and self.current.text == '{'):
+                self.group('{', '}')
+                return Node('cpp_expr', start, self.source_range(start, self.tokens[self.position - 1]))
             if qualified or self.position > position + 1:
                 if self.current.text == '{': self.group('{', '}')
                 return Node('name', start, self.source_range(start, self.tokens[self.position - 1]))
@@ -1041,7 +1136,33 @@ class CppParser(InitializerSupport, Parser):
             return result
         return super().primary()
 
+    def arguments(self):
+        # Only this explicit call's argument expressions have this depth.
+        saved = getattr(self, '_brace_argument_depth', None)
+        self._brace_argument_depth = self.group_depth + 1
+        try:
+            return super().arguments()
+        finally:
+            self._brace_argument_depth = saved
+
     def expression(self, minimum=0):
+        previous = self.position - 1
+        while previous >= 0 and self.tokens[previous].kind == 'NEWLINE':
+            previous -= 1
+        is_argument = (minimum == 0 and self.group_depth == getattr(self, '_brace_argument_depth', None)
+                       and previous >= 0 and self.tokens[previous].text in {'(', ',', '='})
+        saved = getattr(self, '_brace_argument_position', None)
+        if is_argument:
+            target = self.position
+            while self.tokens[target].text == '(':
+                target += 1
+            self._brace_argument_position = target
+        try:
+            return self._cpp_expression(minimum)
+        finally:
+            self._brace_argument_position = saved
+
+    def _cpp_expression(self, minimum=0):
         self.soft_newlines()
         t = self.current
         if t.text == '**':  # C++'s double pointer dereference in prefix position
@@ -1082,6 +1203,11 @@ class CppEmitter:
         self.implicit_marker = '/*kuma_implicit_assignment*/ '
         self.implicit_assignments = False
         self.in_implicit_main = False
+        self.sorted_key_functions = {}
+        self.sorted_key_ambiguous = set()
+        self.sorted_key_used = set()
+        self.pinned_key_definitions = []
+        self.pinned_key_names = set()
 
     def mark(self, text, token):
         """Hook for exact LSP source spans; normal compilation is unchanged."""
@@ -1093,6 +1219,41 @@ class CppEmitter:
 
     def fail(self, node, message):
         raise KumaError(message, node.token, code='KUMA_CPP')
+
+    def pinned_key_chain(self, chain, root):
+        """Re-emit the checked scalar expressions without altering the original functions."""
+        names = {name: self.fresh('pinned_key') for name in sorted(chain.functions)}
+        self.pinned_key_names.update(names.values())
+        for name in sorted(chain.functions, key=lambda item: self.sorted_key_functions[item].token.line):
+            fn = self.sorted_key_functions[name]
+            parameter, result = chain.signature_of(name)
+            param_name = self.fresh('pinned_arg')
+            self.pinned_key_names.add(param_name)
+            checked_body = chain.body_of(name)
+            expression, opaque = checked_body.expression, checked_body.opaque_cpp
+            original_param = fn.extra['params'][0][0]
+            def render(expr, native):
+                if expr.kind == 'name' and expr.value == original_param:
+                    return param_name
+                if expr.kind == 'literal':
+                    literal = Node('literal', expr.token, expr.value, extra={'type': expr.literal_type})
+                    return self.expr(literal, native=native)
+                if expr.kind == 'unary':
+                    return '(' + expr.value + '(' + render(expr.children[0], native) + '))'
+                if expr.kind == 'binary':
+                    return '(' + render(expr.children[0], native) + ' ' + expr.value + ' ' + render(expr.children[1], native) + ')'
+                if expr.kind == 'call' and expr.callee is not None:
+                    p, r = chain.signature_of(expr.callee)
+                    return ('(static_cast<' + r.cpp() + ' (*)(' + p.cpp() + ')>(&::'
+                            + names[expr.callee] + '))(' + render(expr.children[0], True) + ')')
+                if expr.kind == 'call' and expr.value in ('min', 'max') and not opaque:
+                    self.sorted_key_used.add(expr.value)
+                    return 'std::' + expr.value + '(' + ', '.join(render(c, False) for c in expr.children) + ')'
+                self.fail(expr, '検査済みkey関数の式を安全に生成できません')
+            body = render(expression, opaque)
+            self.pinned_key_definitions.append('static ' + result.cpp() + ' ' + names[name]
+                                               + '(' + parameter.cpp() + ' ' + param_name + ') { return ' + body + '; }')
+        return names[root]
 
     def pattern(self, pattern, item):
         if pattern.kind == 'bind_name':
@@ -1150,7 +1311,7 @@ class CppEmitter:
         try:
             for clause in node.extra['clauses']:
                 if clause.kind != 'comp_for': continue
-                source = self.expr(clause.children[0])
+                source = 'kuma_rt::mixed_iteration_range(' + self.expr(clause.children[0]) + ')'
                 item = ('std::declval<const kuma_rt::cpp_item<'
                         'std::remove_cvref_t<decltype(' + source + ')>>&>()')
                 bind(clause.extra['pattern'], item)
@@ -1176,7 +1337,7 @@ class CppEmitter:
             predicate = '[&](const auto& ' + item + ') { ' + bind + ' return ' + (' && '.join(f'({p})' for p in predicates) or 'true') + '; }'
             mapper = '[&](const auto& ' + item + ') { ' + bind + ' return ' + (lower(next_) if next_ < len(clauses) else self.expr(node.children[0])) + '; }'
             function = 'cpp_flat_collect' if next_ < len(clauses) else 'cpp_collect'
-            return f'kuma_rt::{function}({self.expr(clause.children[0])}, {mapper}, {predicate})'
+            return f'kuma_rt::{function}(kuma_rt::mixed_iteration_range({self.expr(clause.children[0])}), {mapper}, {predicate})'
         if fused_sum:
             # Single `for` with optional `if` clauses is the only proved case.
             clause = clauses[0]
@@ -1185,7 +1346,7 @@ class CppEmitter:
             predicates = [self.expr(c.children[0]) for c in clauses[1:]]
             predicate = '[&](const auto& ' + item + ') { ' + bind + ' return ' + (' && '.join(f'({p})' for p in predicates) or 'true') + '; }'
             mapper = '[&](const auto& ' + item + ') { ' + bind + ' return ' + self.expr(node.children[0]) + '; }'
-            return f'kuma_rt::cpp_m10_collect_sum({self.expr(clause.children[0])}, {mapper}, {predicate})'
+            return f'kuma_rt::cpp_m10_collect_sum(kuma_rt::mixed_iteration_range({self.expr(clause.children[0])}), {mapper}, {predicate})'
         return lower(0)
 
     def fused_sum(self, node):
@@ -1275,6 +1436,87 @@ class CppEmitter:
                 self.options(node, kw)
                 return f'({self.expr(node.children[0])})(' + ', '.join(self.expr(c, native=True) for c in node.children[1:]) + ')'
             if kind == 'call' and value == 'input': return self.input(node, expected)
+            if kind == 'call' and value == 'SortedList' and not native:
+                self.options(node, kw, {'key'})
+                if node.extra.get('types') or len(node.children) > 1:
+                    self.fail(node, 'SortedList([配列], key=関数) と書いてください')
+                args = [self.expr(c) for c in node.children]
+                if 'key' in kw:
+                    key = kw['key']
+                    if not args: args = ['std::vector<long long>{}']
+                    if key.kind == 'name':
+                        fn = self.sorted_key_functions.get(key.value)
+                        if fn is None or key.value in self.sorted_key_ambiguous:
+                            self.fail(key, 'keyの通常関数は一意なKuma fn宣言である必要があります。C++関数・隠蔽・オーバーロードは未対応です')
+                        if fn.token.line >= key.token.line:
+                            self.fail(key, '混在モードのkey関数は使用前に定義してください')
+                        if len(fn.extra['params']) != 1:
+                            self.fail(key, 'key関数の引数は1個にしてください')
+                        annotation = fn.extra['params'][0][1]
+                        result_type = fn.extra['result']
+                        reference = bool(annotation and '&' in annotation)
+                        if (not annotation or (reference and (not annotation.startswith('const ')
+                                or annotation.count('&') != 1 or not annotation.endswith('&')))
+                                or '*' in annotation or '&' in result_type or '*' in result_type):
+                            self.fail(key, 'key関数は値またはconst参照を受け、所有する値を返してください')
+                        from .compiler import BOOL, parse_type
+                        parameter_base = annotation.removeprefix('const ').removesuffix('&').strip()
+                        record_names = {name: [] for name in self.sorted_key_record_types}
+                        def supported(text):
+                            try:
+                                type_ = parse_type(text, key.token, records=record_names)
+                            except KumaError:
+                                return False
+                            def valid(t):
+                                if t.name in {'i32', 'i64', 'f64', 'bool', 'char', 'string'}:
+                                    return True
+                                if t.name.startswith('record:'):
+                                    return t.name.removeprefix('record:') in record_names
+                                return t.name in {'tuple', 'pair'} and all(valid(part) for part in t.args)
+                            return valid(type_)
+                        if not supported(parameter_base) or not supported(result_type):
+                            self.fail(key, 'key関数の引数と戻り値は検査可能な所有値型にしてください')
+                        def chain_signature(function):
+                            params = function.extra.get('params', ())
+                            if len(params) != 1 or not params[0][1]: return None
+                            parameter = params[0][1]
+                            # Direct scalar forwarding uses value parameters only.
+                            # This prevents an unseen C++ reference overload from
+                            # being selected more strongly than the checked function.
+                            if '*' in parameter or '&' in parameter:
+                                return None
+                            parameter = parameter.removeprefix('const ').removesuffix('&').strip()
+                            result = function.extra.get('result', '')
+                            if any(c in result for c in '*&'): return None
+                            try:
+                                p = parse_type(parameter, key.token, records=record_names)
+                                r = parse_type(result, key.token, records=record_names)
+                            except KumaError:
+                                return None
+                            return (p, r) if safe_value_call_signature(p, r, 'value') else None
+                        chain = safe_sorted_function_chain(key.value, self.sorted_key_functions, chain_signature, BOOL)
+                        if chain is None or chain.functions & self.sorted_key_ambiguous:
+                            self.fail(key, 'key関数は安全な単一return式と一意な非再帰の検査済み呼び出しにしてください')
+                        self.sorted_key_used.update(chain.functions)
+                        verified = chain.signature_of(key.value)
+                        parameter_cpp, result_cpp = ((verified[0].cpp(), verified[1].cpp()) if verified
+                                                     else (cpp_type(annotation), cpp_type(result_type)))
+                        selected = self.pinned_key_chain(chain, key.value) if chain.edges else key.value
+                        args.append('static_cast<' + result_cpp + ' (*)(' + parameter_cpp + ')>(&::' + self.mark(selected, key.token) + ')')
+                    else:
+                        if not safe_sorted_key(key):
+                            self.fail(key, 'keyは安全な1引数の式にしてください')
+                        captures = sorted_key_captures(key)
+                        capture = '[' + ', '.join(name + '=kuma_rt::sorted_key_capture(' + name + ')' for name in captures) + ']'
+                        args.append(self.expr(key).replace('[&]', capture, 1))
+                helper = 'sorted_named_key' if 'key' in kw and kw['key'].kind == 'name' else 'SortedList'
+                return 'kuma_rt::' + helper + '(' + ', '.join(args) + ')'
+            if kind == 'call' and value == 'range' and not native:
+                self.options(node, kw)
+                if node.extra.get('types') or not 1 <= len(node.children) <= 3:
+                    self.fail(node, 'range(stop)、range(start, stop[, step]) の形で使用してください')
+                return 'kuma_rt::range_args({' + ', '.join('kuma_rt::range_bound(' + self.expr(c) + ')' for c in node.children) + '})'
+
             member_helpers = {'map': 'cpp_map', 'filter': 'cpp_filter', 'sum': 'cpp_sum',
                               'sort': 'cpp_sort', 'sorted': 'cpp_sorted', 'reduce': 'cpp_reduce',
                               'reverse': 'reverse', 'reversed': 'reversed', 'len': 'cpp_len',
@@ -1497,7 +1739,7 @@ class CppEmitter:
         if kind == 'for':
             item = self.fresh('item')
             pattern = node.extra['pattern']
-            return prefix + f'for (auto {item} : {self.expr(node.children[0])}) {{\n' + self.pattern(pattern, item) + '\n' + self.statements(node.extra['body']) + '\n}'
+            return prefix + f'for (auto {item} : kuma_rt::mixed_iteration_range({self.expr(node.children[0])})) {{\n' + self.pattern(pattern, item) + '\n' + self.statements(node.extra['body']) + '\n}'
         if kind == 'rep':
             limit = self.fresh('limit'); name = node.value
             return prefix + f'for (long long {name}=0, {limit}=kuma_rt::count({self.expr(node.children[0])}); {name}<{limit}; ++{name}) {{\n' + self.statements(node.extra['body']) + '\n}'
@@ -1506,7 +1748,13 @@ class CppEmitter:
             return prefix + cpp_type(node.extra['result']) + ' ' + node.value + '(' + params + ') {\n' + self.statements(node.extra['body']) + '\n}'
         if kind == 'record':
             fields = '\n'.join(cpp_type(f.extra['type']) + ' ' + ', '.join(f.value) + ';' for f in node.extra['fields'])
-            return prefix + 'struct ' + node.value + ' {\n' + fields + '\n};'
+            names = ', '.join(name for field in node.extra['fields'] for name in field.value)
+            return (prefix + 'struct ' + node.value + ' {\n' + fields
+                    + '\nusing kuma_gen_owned_record = void;\nusing kuma_gen_value_types = std::tuple<'
+                    + ', '.join('decltype(' + name + ')' for field in node.extra['fields'] for name in field.value) + '>;'
+                    + '\nauto kuma_gen_value_fields() const { return std::tie(' + names + '); }'
+                    + '\nbool operator==(const ' + node.value + '&) const = default;'
+                    + '\nauto operator<=>(const ' + node.value + '&) const = default;\n};')
         self.fail(node, '混在モードで未対応の文です: ' + kind)
 
 
@@ -1576,6 +1824,62 @@ def mark_optional_collection_calls(nodes, known=None):
                                            known if node.kind in {'if', 'while'} else None)
 
 
+def checked_tuple_key_functions(nodes, tokens, source, filename):
+    """Lower only type-checked Kuma tuple returns used by named key functions."""
+    from .compiler import Compiler
+    records = [node for node in nodes if node.kind == 'record']
+    lines = source.splitlines()
+    for node in nodes:
+        if node.kind != 'function' or not node.extra.get('result', '').startswith('tuple<'):
+            continue
+        used = any(t.kind == 'IDENT' and t.text == node.value and i >= 2
+                   and tokens[i - 1].text == '=' and tokens[i - 2].text == 'key'
+                   for i, t in enumerate(tokens))
+        body = node.extra.get('body', [])
+        if not used or len(body) != 1 or body[0].kind != 'cpp_stmt':
+            continue
+        line = body[0].token.line
+        if line < 2 or line > len(lines):
+            continue
+        # Explicit semicolons retain native C++ comma-expression semantics.
+        same_line = [t for t in tokens if t.line == line and t.column >= body[0].token.column]
+        if any(t.text in (';', '{', '}') for t in same_line):
+            continue
+        try:
+            wrapper = ('fn kuma_key_probe(i64 x) -> i64 {\n' + '\n' * (line - 2)
+                       + lines[line - 1] + '\n}\n')
+            parsed = Parser(wrapper).program()
+            if len(parsed) != 1 or parsed[0].kind != 'function':
+                continue
+            parsed_body = parsed[0].extra['body']
+            if (len(parsed_body) != 1 or parsed_body[0].kind != 'return'
+                    or len(parsed_body[0].children) != 1 or parsed_body[0].children[0].kind != 'tuple'):
+                continue
+            trial = Node(node.kind, node.token, node.value, node.children,
+                         {**node.extra, 'body': parsed_body})
+            if not safe_sorted_function(trial):
+                continue
+            # The pure frontend verifies exact owned return type and record fields.
+            # A native comma can be overloaded when either operand is a class.
+            # Restrict tuple leaves to arithmetic values so that the previous C++
+            # comma expression cannot invoke an unknown overloaded operator.
+            verifier = Compiler(filename)
+            verifier.prepare(records + [trial])
+            verifier.scopes = [dict(verifier.named_functions), {}]
+            for name, annotation in trial.extra['params']:
+                type_, _ = verifier.parameter(annotation, None, trial)
+                verifier.bind(name, type_, trial)
+            def arithmetic_leaves(expr):
+                if expr.kind == 'tuple':
+                    return all(arithmetic_leaves(child) for child in expr.children)
+                return verifier.expr(expr).type.name in {'i32', 'i64', 'f64', 'bool', 'char'}
+            if not arithmetic_leaves(parsed_body[0].children[0]):
+                continue
+        except KumaError:
+            continue
+        node.extra['body'] = parsed_body
+
+
 def transpile_cpp(source: str, filename: str, *, emitter=None,
                   native_checked: bool = False) -> str:
     from .native_cpp import native_cpp
@@ -1586,8 +1890,26 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
         if t.kind == 'IDENT' and t.text.startswith('kuma_gen_'):
             raise KumaError('kuma_gen_ は生成コード用の予約名です', t, code='KUMA_CPP')
     nodes = parser.program()
+    checked_tuple_key_functions(nodes, parser.tokens, source, filename)
     mark_optional_collection_calls(nodes)
     emitter = emitter or CppEmitter(filename)
+    functions = [node for node in nodes if node.kind == 'function']
+    emitter.sorted_key_record_types = {node.value for node in nodes if node.kind == 'record'}
+    emitter.sorted_key_functions = {node.value: node for node in functions}
+    return_lines = {node.extra['body'][0].token.line for node in functions
+                    if len(node.extra.get('body', ())) == 1 and node.extra['body'][0].kind in ('return', 'cpp_stmt')}
+    for name in emitter.sorted_key_functions:
+        occurrences = [i for i, token in enumerate(parser.tokens) if token.kind == 'IDENT' and token.text == name]
+        definitions = sum(1 for node in functions if node.value == name)
+        for i in occurrences:
+            before = parser.tokens[i - 1].text if i else ''
+            key_use = before == '=' and i >= 2 and parser.tokens[i - 2].text == 'key'
+            call_use = (parser.tokens[i].line in return_lines and i + 1 < len(parser.tokens)
+                        and parser.tokens[i + 1].text == '(' and before not in ('.', '->', '::'))
+            if before != 'fn' and not key_use and not call_use:
+                emitter.sorted_key_ambiguous.add(name)
+        if definitions != 1 or any(token.kind == 'CPP_DIRECTIVE' and re.search(r'\b' + re.escape(name) + r'\b', token.text) for token in parser.tokens):
+            emitter.sorted_key_ambiguous.add(name)
     # Dependent bases, class members and preprocessing can hide declarations.
     # Keep their native assignment semantics; := remains explicit everywhere.
     if any(t.text in {'class', 'struct', 'template'} or
@@ -1639,9 +1961,12 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
         runtime += '#ifndef KUMA_CPP_INTEROP_ABI\n#error Kuma M6 needs a published M6 runtime header\n#endif\n'
     header = (('' if emitter.compact else '// Generated by Kuma M7 C++ interop.\n')
               + '\n'.join(directives) + '\n' + runtime
+              + ''.join('#ifdef ' + name + '\n#error Kuma key function name is a macro: ' + name + '\n#endif\n' for name in sorted(emitter.sorted_key_used))
               + (CPP_POWER if emitter.uses_power else '')
               + (CPP_M10 if emitter.uses_m10 else '')
-              + '\n'.join(definition for _, definition in aliases) + '\n')
+              + '\n'.join(definition for _, definition in aliases) + '\n'
+              + ''.join('#ifdef ' + name + '\n#error Kuma generated key name is a macro: ' + name + '\n#endif\n' for name in sorted(emitter.pinned_key_names))
+              + '\n'.join(emitter.pinned_key_definitions) + '\n')
     prefix = header + '\n'.join(preamble) + '\n'
     if has_main: return prefix
     return prefix + 'int main() {\ntry {\nkuma_rt::init();\n' + emitted_body + '\nreturn 0;\n} catch (const std::exception& kuma_gen_error) {\nstd::cerr << "Kuma runtime error: " << kuma_gen_error.what() << "\\n";\nreturn 1;\n}\n}\n'
