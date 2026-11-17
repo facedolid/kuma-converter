@@ -78,7 +78,7 @@ RESERVED = {
     "template", "abs", "flush", "reduce", "any", "all", "count", "some", "every",
 }
 BUILTINS = {
-    "range", "SortedList", "deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "prefix_sum", "prefix_sum2d", "prefix2d", "range_sum", "lower_bound_idx", "upper_bound_idx", "equal_range_idx", "has_bit", "bit_count", "bit_ctz", "rotate90", "transpose", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices", "frequencies", "read_graph", "read_weighted_graph", "bfs_dist", "dijkstra_dist", "bfs_path", "dijkstra_path",
+    "range", "SortedList", "deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "prefix_sum", "prefix_sum2d", "prefix2d", "range_sum", "lower_bound_idx", "upper_bound_idx", "equal_range_idx", "has_bit", "bit_count", "bit_ctz", "rotate90", "transpose", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices", "frequencies", "read_graph", "read_weighted_graph", "bfs_dist", "dijkstra_dist", "bfs_path", "dijkstra_path",
     "input", "print", "len", "size", "sum", "sort", "sorted", "reverse",
     "reversed", "min", "max", "discard_line", "map", "filter",
     "i32", "int", "i64", "ll", "f64", "double", "zip", "enumerate", "lazy", "zip_view", "enumerate_view",
@@ -452,7 +452,11 @@ class Compiler(DeclarationSupport):
             numeric = left.type in NUMBER and right.type in NUMBER
             comparison = op in ("==", "!=", "<", "<=", ">", ">=")
             if not numeric and not (left.type == right.type and (comparison or (left.type == STRING and op == "+"))):
-                self.fail(f"演算 {op} に {left.type} と {right.type} は使えません", node)
+                hint = None
+                lhs = node.children[0]
+                if left.type == VOID and lhs.kind == "call" and lhs.value == "print":
+                    hint = "演算結果を出力する場合は、式全体を print((...)) の括弧に入れてください。"
+                self.fail(f"演算 {op} に {left.type} と {right.type} は使えません", node, hint=hint)
             if left.type in (VOID, FUNCTION, Type("range")):
                 self.fail(f"{left.type} に演算は使えません", node)
             if op in ("%", "&", "|", "^", "<<", ">>") and (left.type not in INTEGER or right.type not in INTEGER):
@@ -595,7 +599,7 @@ class Compiler(DeclarationSupport):
                 self.parameter(annotation, None, node)
 
         def use(name: str, at: Node, local: set[str], *, callee=False) -> None:
-            if name in local or (callee and (name in BUILTINS or name in self.records) and not (name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices") and name in available)):
+            if name in local or (callee and (name in BUILTINS or name in self.records) and not (name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices") and name in available)):
                 return
             if name not in available:
                 self.fail(f"定義位置から参照できない名前です: {name}。後方参照・再帰は未対応です", at)
@@ -1140,6 +1144,17 @@ class Compiler(DeclarationSupport):
             arguments.extend((names.get("start", "0LL"), names.get("end", "std::nullopt")))
             operation += "_range"
         if code is not None: arguments.append(code)
+        # Native '<' with NaN is not a strict weak order. Check only the
+        # selected range, before sorting, and leave explicit comparators alone.
+        if sorting and code is None and sequence.type.args[0] == F64:
+            first = self.fresh("sort_first")
+            last = self.fresh("sort_last")
+            current = self.fresh("sort_item")
+            start = names.get("start", "0LL") if bounds else "0LL"
+            end = names.get("end", "std::nullopt") if bounds else "std::nullopt"
+            body += (f"auto [{first}, {last}] = kuma_rt::algorithm_bounds({source}, {start}, {end}); "
+                     f"for (auto {current} = {first}; {current} != {last}; ++{current}) "
+                     f"if (std::isnan(*{current})) throw std::invalid_argument(\"sort: NaN in range\"); ")
         body += f"kuma_rt::{operation}(" + ", ".join(arguments) + ");"
         if not inplace:
             body += f" return {source};"
@@ -1541,13 +1556,13 @@ class Compiler(DeclarationSupport):
             return self.construct_collection(node, expected)
         if node.extra.get("types"):
             self.fail("この呼び出しの明示型引数は未対応です", node)
-        if node.kind == "call" and (name not in BUILTINS or name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")):
+        if node.kind == "call" and (name not in BUILTINS or name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")):
             symbol = next((scope[name] for scope in reversed(self.scopes) if name in scope), None)
             if symbol and symbol.function:
                 if kwargs:
                     self.fail("アロー関数は位置引数だけに対応しています", node)
                 return self.invoke(Value("", FUNCTION, function=symbol.function), args, node)
-            if symbol and name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices"):
+            if symbol and name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices"):
                 self.fail(name + " は関数として呼び出せません", node)
         if node.kind == "call" and name == "segment_tree":
             if kwargs or node.extra.get("types") or len(args) != 3:
@@ -1687,12 +1702,13 @@ class Compiler(DeclarationSupport):
             result = Type("range_fenwick", (I64,))
             if value.type in INTEGER:
                 return self.ordered([value], result, lambda ns: f"::RangeFenwick<long long>(kuma_rt::dimension({ns[0]}))")
-            if value.type == Type("vec", (I64,)):
+            if value.type in (Type("vec", (I32,)), Type("vec", (I64,))):
                 def from_array(ns):
+                    source = ns[0] if value.type.args[0] == I64 else f"std::vector<long long>({ns[0]}.begin(), {ns[0]}.end())"
                     return (f'([&]() {{ if ({ns[0]}.size() >= static_cast<size_t>(std::numeric_limits<int>::max())) '
-                            f'throw std::length_error("range_fenwick: size too large"); return ::RangeFenwick<long long>({ns[0]}); }}())')
+                            f'throw std::length_error("range_fenwick: size too large"); return ::RangeFenwick<long long>({source}); }}())')
                 return self.ordered([value], result, from_array, borrow=True)
-            self.fail("range_fenwick の引数は整数の要素数か vec<i64> にしてください", node)
+            self.fail("range_fenwick の引数は整数の要素数か vec<i32> / vec<i64> にしてください", node)
         if node.kind == "call" and name == "fenwick":
             if kwargs or node.extra.get("types") or len(args) != 1:
                 self.fail("fenwick(n) または fenwick(配列) と書いてください", node)
@@ -1701,12 +1717,13 @@ class Compiler(DeclarationSupport):
             result = Type("fenwick", (I64,))
             if value.type in INTEGER:
                 return self.ordered([value], result, lambda ns: f"::Fenwick<long long>(kuma_rt::dimension({ns[0]}))")
-            if value.type == Type("vec", (I64,)):
+            if value.type in (Type("vec", (I32,)), Type("vec", (I64,))):
                 def from_array(ns):
+                    source = ns[0] if value.type.args[0] == I64 else f"std::vector<long long>({ns[0]}.begin(), {ns[0]}.end())"
                     return (f'([&]() {{ if ({ns[0]}.size() >= static_cast<size_t>(std::numeric_limits<int>::max())) '
-                            f'throw std::length_error("fenwick: size too large"); return ::Fenwick<long long>({ns[0]}); }}())')
+                            f'throw std::length_error("fenwick: size too large"); return ::Fenwick<long long>({source}); }}())')
                 return self.ordered([value], result, from_array, borrow=True)
-            self.fail("fenwick の引数は整数の要素数か vec<i64> にしてください", node)
+            self.fail("fenwick の引数は整数の要素数か vec<i32> / vec<i64> にしてください", node)
         if node.kind == "call" and name == "union_find":
             if kwargs or node.extra.get("types") or len(args) != 1:
                 self.fail("union_find(n) と書いてください", node)
@@ -2538,8 +2555,39 @@ class Compiler(DeclarationSupport):
                         "throw std::overflow_error(\"gcd: absolute value exceeds result type\"); "
                         "return std::gcd(a, b); }())")
             return self.ordered(values, result_type, gcd_code)
-        if node.kind == "call" and name == "run_length_encode":
-            if len(args) != 1 or node.extra.get("types"):
+        if node.kind in ("call", "method") and name == "run_length_decode":
+            if len(args) != 1 or kwargs or node.extra.get("types"):
+                self.fail("run_length_decode(圧縮された配列) と書いてください", node)
+            values = self.expr(args[0])
+            if (values.type.name != "vec" or values.type.args[0].name != "pair" or
+                    values.type.args[0].args[1] not in INTEGER or
+                    values.type.args[0].args[0] not in (I32, I64, F64, BOOL, CHAR, STRING)):
+                self.fail("run_length_decode は pair<対応するスカラー型,i32 または i64> の配列に使ってください", node)
+            element = values.type.args[0].args[0]
+            result = Type("vec", (element,))
+            def decode_code(ns):
+                limit_count = ("if (item.second > std::numeric_limits<int>::max()) "
+                               "throw std::out_of_range(\"run_length_decode: count exceeds i32\"); "
+                               if values.type.args[0].args[1] == I64 else "")
+                source = ns[0]
+                convert = ""
+                if values.type.args[0].args[1] == I64:
+                    source = self.fresh("decoded_runs")
+                    convert = (f"std::vector<std::pair<{element.cpp()}, int>> {source}; "
+                               f"{source}.reserve({ns[0]}.size()); "
+                               f"for (const auto& item : {ns[0]}) {source}.emplace_back(item.first, static_cast<int>(item.second)); ")
+                return ("([&]() { "
+                        f"std::size_t total = 0; const auto limit = std::vector<{element.cpp()}>{{}}.max_size(); "
+                        f"for (const auto& item : {ns[0]}) {{ "
+                        "if (item.second < 0) throw std::invalid_argument(\"run_length_decode: negative count\"); "
+                        + limit_count +
+                        "const auto count = static_cast<std::size_t>(item.second); "
+                        "if (count > limit - total) throw std::length_error(\"run_length_decode: output too large\"); "
+                        "total += count; } " + convert +
+                        f"return ::run_length_decode({source}); }}())")
+            return self.ordered([values], result, decode_code, borrow=True)
+        if node.kind in ("call", "method") and name == "run_length_encode":
+            if len(args) != 1 or kwargs or node.extra.get("types"):
                 self.fail("run_length_encode(配列または文字列) と書いてください", node)
             values = self.expr(args[0])
             if values.type.name not in ("vec", "string"):
@@ -2568,8 +2616,8 @@ class Compiler(DeclarationSupport):
                           f"static_cast<unsigned long long>(std::numeric_limits<{element}>::max()) + 1ULL) "
                           "throw std::out_of_range(\"compress: array too large\"); "
                           f"return ::compress({source}); }}())"), BOOL)
-        if node.kind == "call" and name == "transpose":
-            if len(args) != 1 or node.extra.get("types"):
+        if node.kind in ("call", "method") and name == "transpose":
+            if len(args) != 1 or kwargs or node.extra.get("types"):
                 self.fail("transpose(グリッド) と書いてください", node)
             grid = self.expr(args[0])
             is_strings = grid.type.name == "vec" and grid.type.args[0] == STRING
@@ -2578,8 +2626,8 @@ class Compiler(DeclarationSupport):
             if not (is_strings or is_matrix):
                 self.fail("transpose は文字列の配列またはスカラーの2次元配列に使ってください", node)
             return self.ordered([grid], grid.type, lambda ns: f"::transpose({ns[0]})", borrow=True)
-        if node.kind == "call" and name == "rotate90":
-            if len(args) != 1 or node.extra.get("types"):
+        if node.kind in ("call", "method") and name == "rotate90":
+            if len(args) != 1 or kwargs or node.extra.get("types"):
                 self.fail("rotate90(グリッド) と書いてください", node)
             grid = self.expr(args[0])
             is_strings = grid.type.name == "vec" and grid.type.args[0] == STRING
@@ -2665,6 +2713,13 @@ class Compiler(DeclarationSupport):
                         f'([&]() {{ if ({ns[0]}.size() > static_cast<size_t>(std::numeric_limits<long long>::max())) '
                         f'throw std::length_error("deque: size too large"); return static_cast<long long>({ns[0]}.size()); }}())', borrow=True)
                 return self.ordered(values, I64, lambda ns: f"static_cast<long long>({ns[0]}.size())", borrow=True)
+            if name == "sum" and v.type.name == "deque":
+                if v.type.args[0] not in NUMBER:
+                    self.fail("sum は1次元の数値配列または deque だけに対応しています", node)
+                result = F64 if v.type.args[0] == F64 else I64
+                init = "0.0" if result == F64 else "0LL"
+                return self.ordered(values, result, lambda ns:
+                    f"std::accumulate({ns[0]}.begin(), {ns[0]}.end(), {init})", borrow=True)
             if v.type.name != "vec":
                 self.fail(f"{name} は配列に使ってください", node)
             if name == "sum":
@@ -2778,7 +2833,15 @@ class Compiler(DeclarationSupport):
             target, source = self.fresh(), self.fresh()
             return prefix + f"{{ auto&& {target} = {left.code}; {right.type.cpp()} {source} = {right.code}; {target} {node.value} {source}; }}"
         if kind == "exprstmt":
-            value = self.expr(node.children[0])
+            expression = node.children[0]
+            if (expression.kind == "name" and not expression.value.startswith("kuma_gen_")
+                    and expression.value not in RESERVED
+                    and expression.value not in self.records
+                    and expression.value not in self.named_functions
+                    and not any(expression.value in scope for scope in self.scopes)):
+                symbol = self.bind(expression.value, I64, expression)
+                return prefix + f"long long {symbol.code} = 0LL;"
+            value = self.expr(expression)
             self.owned(value, node, allow_void=True)
             return prefix + value.code + ";"
         if kind == "return":

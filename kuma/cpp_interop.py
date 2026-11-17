@@ -65,6 +65,11 @@ class CppParser(InitializerSupport, Parser):
             self.offsets.append(self.offsets[-1] + len(line))
         self.depth = 0
         self.layout_headers = []
+        self.local_input_scopes = []
+        # Conditional preprocessing or input macros can change binding visibility.
+        self.local_input_tracking_safe = not any(
+            tok.kind == 'CPP_DIRECTIVE' and re.match(r'#\s*(?:if|ifdef|ifndef|elif|else|endif)\b|#\s*(?:define|undef)\s+input\b', tok.text)
+            for tok in self.tokens)
         self.macro_names = set()
         for tok in self.tokens:
             if tok.kind == 'CPP_DIRECTIVE':
@@ -184,6 +189,7 @@ class CppParser(InitializerSupport, Parser):
 
     def block(self, header):
         self.depth += 1
+        self.local_input_scopes.append(False)
         look = self.position
         while self.tokens[look].kind == 'NEWLINE':
             look += 1
@@ -198,6 +204,7 @@ class CppParser(InitializerSupport, Parser):
             if layout:
                 self.layout_headers.pop()
             self.depth -= 1
+            self.local_input_scopes.pop()
 
     def ordering_call_needs_lowering(self, tokens: list[Token]) -> bool:
         for index, token in enumerate(tokens[:-1]):
@@ -385,12 +392,14 @@ class CppParser(InitializerSupport, Parser):
         # Native declarations with no initializer, braced construction, arrays,
         # or several declarators keep C++'s initialization rules unchanged.
         if self.current.text in {'{', '[', ',', ';'} or self.at_end():
+            simple_input = name.text == 'input' and self.current.text != ','
             while not self.at_end():
                 if self.current.text in {'{', '[', '('}:
                     op = self.current.text
                     self.group(op, {'{': '}', '[': ']', '(': ')'}[op])
                 else: self.take()
-            return Node('cpp_stmt', start, self.source_range(start, self.tokens[self.position - 1]) + ';')
+            return Node('cpp_stmt', start, self.source_range(start, self.tokens[self.position - 1]) + ';',
+                        extra={'local_input_declaration': simple_input})
         self.restore_type_trial(position, original_depth, type_mark)
         return None
 
@@ -882,6 +891,7 @@ class CppParser(InitializerSupport, Parser):
         return Node('cpp_bare_call', start, callee, args)
 
     def rhs(self) -> Node:
+        self.reject_ambiguous_local_input()
         # Only recognize unqualified C++ braces at the start of a := RHS.
         # Elsewhere an identifier followed by { may introduce a Kuma block.
         previous = self.position - 1
@@ -971,6 +981,21 @@ class CppParser(InitializerSupport, Parser):
         return Node('cpp_try', start, extra={'body': body, 'handlers': handlers})
 
     def statement(self) -> Node:
+        result = self._statement()
+        if (self.local_input_tracking_safe and self.local_input_scopes
+                and ((result.kind == 'declare' and 'input' in result.value)
+                     or result.extra.get('local_input_declaration'))):
+            self.local_input_scopes[-1] = True
+        return result
+
+    def reject_ambiguous_local_input(self):
+        if (self.local_input_tracking_safe and any(self.local_input_scopes)
+                and self.current.text == 'input'
+                and self.tokens[self.position + 1].text != '<'):
+            raise KumaError('見える範囲に input という変数があり入力呼び出しと区別できません。変数名を変更してください',
+                            self.current, code='KUMA_CPP')
+
+    def _statement(self) -> Node:
         if self.record_depth:
             return super().statement()
         start = self.current
@@ -1073,8 +1098,14 @@ class CppParser(InitializerSupport, Parser):
             shorthand = self.cpp_range_for()
             if shorthand is not None:
                 return shorthand
-        # Keep native for headers intact; the body may still contain Kuma sugar.
+        # A parenthesized Kuma binding is followed by `in`; native C++ for
+        # headers contain a semicolon or a colon, even when their body is named in.
         if start.text == 'for' and self.tokens[self.position + 1].text == '(':
+            opening = self.position + 1
+            closing = self.native_bodies.pairs.get(opening)
+            if (closing is not None and self.tokens[closing + 1].text == 'in'
+                    and not any(token.text in {';', ':'} for token in self.tokens[opening + 1:closing])):
+                return super().statement()
             self.take()
             header = self.group('(', ')')
             return Node('cpp_for', start, header, extra={'body': self.block(start)})
@@ -1086,6 +1117,7 @@ class CppParser(InitializerSupport, Parser):
         return super().statement()
 
     def primary(self) -> Node:
+        self.reject_ambiguous_local_input()
         start, position = self.current, self.position
         if (start.kind == 'IDENT' and (start.text.isupper() or start.text in self.macro_names)
                 and self.tokens[position + 1].text == '('):
@@ -1257,12 +1289,16 @@ class CppEmitter:
 
     def pattern(self, pattern, item):
         if pattern.kind == 'bind_name':
-            return f'const auto& {pattern.value} = {item};'
+            return f'const auto& {self.mark(pattern.value, pattern.token)} = {item};'
         return '\n'.join(self.pattern(child, f'std::get<{i}>({item})') for i, child in enumerate(pattern.children))
 
     def callback(self, params, body, expression=True):
         args = ', '.join(f'{cpp_type(type_) if type_ else "auto"} {name}' for name, type_ in params)
-        return f'[&]({args}) {{ ' + (f'return {body};' if expression else body) + ' }'
+        if expression:
+            return f'[&]({args}) {{ return {body}; }}'
+        # Statement bodies may start with a #line directive, which must begin
+        # on its own line in generated C++.
+        return f'[&]({args}) {{\n' + body + '\n}'
 
     def input(self, node, expected):
         types = node.extra.get('types', [])

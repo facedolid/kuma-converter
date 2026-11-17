@@ -509,6 +509,10 @@ class Parser:
         if start.kind != "IDENT" or start.text not in _BARE_CALLS | self.bare_functions:
             return self.expression()
         following = self.tokens[self.position + 1]
+        # A bare-call name can also begin an assignment or comparison.
+        if (following.text in _ASSIGNMENTS
+                or (start.text != "input" and following.text in {"==", "!=", "<", ">", "<=", ">="})):
+            return self.expression()
         if start.text in self.bare_functions and (following.kind in {"NEWLINE", "EOF"} or following.text in {";", "}"}):
             return self.expression()  # Preserve function values; zero-argument calls use ().
         self.take()
