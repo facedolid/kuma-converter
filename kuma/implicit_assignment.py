@@ -18,15 +18,30 @@ import time
 from .model import KumaError
 
 MARKER = '/*kuma_implicit_assignment*/ '
+VECTOR_INPUT_MARKER = '/*kuma_vector_input:'
 MAX_SECONDS = 15.0
 MAX_DECLARATIONS = 32
 
 
-def resolve_assignments(cpp: str, filename: str, *, compile_commands=None, edits=None, marker=MARKER, config=None, runtime_include=None) -> str:
-    if marker not in cpp:
+def _probe_dependencies():
+    # Keep the standalone converter's reviewed dependency adaptation shared.
+    from .toolchain import compiler_command, macos_sdk_flags
+    from .process import stop_process_group
+    return compiler_command, macos_sdk_flags, stop_process_group, Path(__file__).resolve().parents[1]
+
+
+def resolve_assignments(cpp: str, filename: str, *, compile_commands=None, edits=None, marker=MARKER,
+                        vector_marker=VECTOR_INPUT_MARKER, config=None, runtime_include=None) -> str:
+    if marker not in cpp and vector_marker not in cpp:
         return cpp
-    declared = _resolve(cpp, filename, compile_commands, marker, config, runtime_include)
-    changes = []
+    declared = (_resolve(cpp, filename, compile_commands, marker, config, runtime_include)
+                if marker in cpp else {})
+    # Keep every edit in the coordinates of the original projection.  In
+    # particular, a vector type replacement may be longer than ``long long``;
+    # applying it before recording the implicit-declaration edits would make
+    # the source map drift for later lines.
+    changes = _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marker,
+                                     config, runtime_include, declared)
     for match in re.finditer(re.escape(marker), cpp):
         row = cpp.count('\n', 0, match.start()) + 1
         kind = declared.get(row)
@@ -38,6 +53,7 @@ def resolve_assignments(cpp: str, filename: str, *, compile_commands=None, edits
                 raise AssertionError('missing validated bare identifier')
             at = match.end() + name.end()
             changes.append((at, at, ' = 0LL'))
+    changes.sort(key=lambda change: change[0])
     if edits is not None:
         edits.extend(changes)
     for start, end, replacement in reversed(changes):
@@ -45,16 +61,100 @@ def resolve_assignments(cpp: str, filename: str, *, compile_commands=None, edits
     return cpp
 
 
-def _resolve(cpp, filename, compile_commands, marker, config, runtime_include):
-    from .toolchain import compiler_command, macos_sdk_flags
-    from .process import stop_process_group
+def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marker, config,
+                           runtime_include, declared):
+    """Use a syntax-only C++ probe for direct-name vector input assignments.
+
+    An unrecognized target stays ``long long``.  All eligible targets are
+    probed together and applied together: a compiler failure, timeout, or
+    termination therefore cannot partially change the generated program.
+    This deliberately avoids guessing members, arbitrary containers, and
+    user-defined conversions.
+    """
     from .compile_config import compile_config
+    compiler_command, macos_sdk_flags, stop_process_group, root = _probe_dependencies()
+    pattern = re.compile(re.escape(vector_marker) + r'([A-Za-z_]\w*)\*/long long')
+    matches = list(pattern.finditer(cpp))
+    if not matches:
+        return []
+
+    def fallback(match):
+        return (match.start(), match.end(), 'long long')
+
+    # Generated ``auto name = input(n)`` has no pre-existing C++ target.  It
+    # must retain input's scalar default rather than feeding its own generated
+    # type back into the probe.
+    eligible = set()
+    for index, match in enumerate(matches):
+        line = cpp[cpp.rfind('\n', 0, match.start()) + 1:match.start()]
+        if re.search(re.escape(marker) + r'\s*' + re.escape(match[1]) + r'\s*=\s*$', line):
+            continue
+        eligible.add(index)
+    if not eligible:
+        return [fallback(match) for match in matches]
+
+    compiler = compiler_command()
+    if not compiler:
+        return [fallback(match) for match in matches]
+    config = config or compile_config(filename, compile_commands)
+    command = [*compiler, '-std=c++23', *macos_sdk_flags(), '-fsyntax-only',
+               '-fdiagnostics-color=never', '-iquote', str(Path(filename).resolve().parent),
+               '-I', str(runtime_include or root / 'include'), *config.flags, '-x', 'c++', '-']
+    replacement = lambda match: ('typename kuma_rt::vector_input_element<'
+                                 'std::remove_cvref_t<decltype(' + match[1] + ')>>::type')
+    # A preceding implicit declaration can be necessary for the target's
+    # scope to compile. Materialize it only in this probe; returned edits
+    # remain in the original projection's coordinates.
+    trial_base = _materialize_declarations(cpp, marker, declared)
+    trial_matches = list(pattern.finditer(trial_base))
+    if [match[1] for match in trial_matches] != [match[1] for match in matches]:
+        return [fallback(match) for match in matches]
+    pieces, last = [], 0
+    for index, match in enumerate(trial_matches):
+        pieces.append(trial_base[last:match.start()])
+        pieces.append(replacement(match) if index in eligible else 'long long')
+        last = match.end()
+    pieces.append(trial_base[last:])
+    trial = ''.join(pieces)
+    try:
+        with tempfile.TemporaryFile() as source:
+            source.write(trial.encode()); source.seek(0)
+            process = subprocess.Popen(command, stdin=source, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, cwd=config.directory,
+                                       env=dict(os.environ, LC_ALL='C', LANG='C'),
+                                       start_new_session=os.name != 'nt')
+            try:
+                status = process.wait(timeout=MAX_SECONDS)
+            except BaseException:
+                stop_process_group(process); process.wait()
+                raise
+    except (OSError, subprocess.TimeoutExpired):
+        return [fallback(match) for match in matches]
+    if status != 0:
+        return [fallback(match) for match in matches]
+    return [(match.start(), match.end(), replacement(match)
+             if index in eligible else 'long long') for index, match in enumerate(matches)]
+
+
+def _materialize_declarations(cpp, marker, declared):
+    """Return a probe-only copy with already-proven declarations applied."""
+    lines = cpp.splitlines(keepends=True)
+    for row, kind in declared.items():
+        if kind == 'bare':
+            lines[row - 1] = lines[row - 1].replace(marker, 'long long ', 1).replace(';', ' = 0LL;', 1)
+        else:
+            lines[row - 1] = lines[row - 1].replace(marker, 'auto ', 1)
+    return ''.join(lines)
+
+
+def _resolve(cpp, filename, compile_commands, marker, config, runtime_include):
+    from .compile_config import compile_config
+    compiler_command, macos_sdk_flags, stop_process_group, root = _probe_dependencies()
     compiler = compiler_command()
     if not compiler:
         raise KumaError('初回代入の名前確認にはC++コンパイラが必要です。明示宣言 := を使ってください',
                         code='KUMA_ASSIGN_PROBE')
     config = config or compile_config(filename, compile_commands)
-    root = Path(__file__).resolve().parents[1]
     command = [*compiler, '-std=c++23', *macos_sdk_flags(), '-fsyntax-only',
                '-fdiagnostics-color=never', '-iquote', str(Path(filename).resolve().parent),
                '-I', str(runtime_include or root / 'include'), *config.flags, '-x', 'c++', '-']

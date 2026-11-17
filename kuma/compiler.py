@@ -2914,7 +2914,9 @@ def transpile(source: str, filename: str = "input.kuma", *, optimize: bool = Tru
         emitter.implicit_bare_names = True
         cpp = transpile_cpp(source, filename, emitter=emitter, native_checked=True)
         from .implicit_assignment import resolve_assignments
-        return archive + resolve_assignments(cpp, filename, compile_commands=compile_commands, marker=emitter.implicit_marker)
+        return archive + resolve_assignments(cpp, filename, compile_commands=compile_commands,
+                                             marker=emitter.implicit_marker,
+                                             vector_marker=emitter.vector_input_marker)
     compiler = Compiler(Path(filename).name if compact else filename, optimize=optimize)
     compiler.line_directives = not compact
     nodes = parse(source)

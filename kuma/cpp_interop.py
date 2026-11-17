@@ -1234,6 +1234,7 @@ class CppEmitter:
         self.type_probe = False
         self.type_bindings = {}
         self.implicit_marker = '/*kuma_implicit_assignment*/ '
+        self.vector_input_marker = '/*kuma_vector_input:'
         self.implicit_assignments = False
         self.implicit_bare_names = False
         self.in_implicit_main = False
@@ -1762,7 +1763,22 @@ class CppEmitter:
             if (self.implicit_assignments and self.in_implicit_main and node.value == '='
                     and node.children[0].kind == 'name'):
                 marker = self.implicit_marker
-            return prefix + marker + self.expr(node.children[0]) + ' ' + node.value + ' ' + self.expr(node.children[1]) + ';'
+            target = self.expr(node.children[0])
+            value = self.expr(node.children[1])
+            # C++ resolves the target name, including aliases and local shadowing.
+            # Keep a probe-only marker so implicit_assignment can replace the
+            # default vector element type only after that resolution proves the
+            # target is an ordinary std::vector.
+            if (self.implicit_assignments and node.value == '=' and node.children[0].kind == 'name'
+                    and node.children[1].kind == 'call'
+                    and node.children[1].value == 'input'
+                    and not node.children[1].extra.get('types')
+                    and len(node.children[1].children) == 1
+                    and not node.children[1].extra.get('kwargs')):
+                value = value.replace('kuma_rt::read_vec<long long>',
+                                      'kuma_rt::read_vec<' + self.vector_input_marker
+                                      + node.children[0].value + '*/long long>', 1)
+            return prefix + marker + target + ' ' + node.value + ' ' + value + ';'
         if kind == 'exprstmt': return prefix + self.expr(node.children[0]) + ';'
         if kind in {'return', 'break', 'continue'}:
             return prefix + kind + (' ' + self.expr(node.children[0]) if node.children else '') + ';'
@@ -1963,6 +1979,11 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
         emitter.implicit_bare_names = False
     while emitter.implicit_marker in source:
         emitter.implicit_marker = emitter.implicit_marker.replace('*/', '_*/')
+    # This marker is consumed after emission, so it must not match a comment,
+    # string, or raw string copied from the user's source.  Keep a single
+    # emitter-owned prefix and pass it to every post-processing entry point.
+    while emitter.vector_input_marker in source:
+        emitter.vector_input_marker = emitter.vector_input_marker[:-1] + '_:'
     # Keep user configuration/includes before the runtime's first ac.hpp include.
     directives = []
     while nodes and nodes[0].kind == 'cpp_directive':
