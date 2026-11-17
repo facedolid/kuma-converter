@@ -26,13 +26,23 @@ def resolve_assignments(cpp: str, filename: str, *, compile_commands=None, edits
     if marker not in cpp:
         return cpp
     declared = _resolve(cpp, filename, compile_commands, marker, config, runtime_include)
-    def replace(match):
+    changes = []
+    for match in re.finditer(re.escape(marker), cpp):
         row = cpp.count('\n', 0, match.start()) + 1
-        replacement = 'auto ' if row in declared else ''
-        if edits is not None:
-            edits.append((match.start(), match.end(), replacement))
-        return replacement
-    return re.sub(re.escape(marker), replace, cpp)
+        kind = declared.get(row)
+        replacement = 'long long ' if kind == 'bare' else 'auto ' if kind == 'assign' else ''
+        changes.append((match.start(), match.end(), replacement))
+        if kind == 'bare':
+            name = re.match(r'[A-Za-z_]\w*', cpp[match.end():])
+            if name is None:
+                raise AssertionError('missing validated bare identifier')
+            at = match.end() + name.end()
+            changes.append((at, at, ' = 0LL'))
+    if edits is not None:
+        edits.extend(changes)
+    for start, end, replacement in reversed(changes):
+        cpp = cpp[:start] + replacement + cpp[end:]
+    return cpp
 
 
 def _resolve(cpp, filename, compile_commands, marker, config, runtime_include):
@@ -48,7 +58,7 @@ def _resolve(cpp, filename, compile_commands, marker, config, runtime_include):
     command = [*compiler, '-std=c++23', *macos_sdk_flags(), '-fsyntax-only',
                '-fdiagnostics-color=never', '-iquote', str(Path(filename).resolve().parent),
                '-I', str(runtime_include or root / 'include'), *config.flags, '-x', 'c++', '-']
-    declared = set()
+    declared = {}
     deadline = time.monotonic() + MAX_SECONDS
     env = dict(os.environ, LC_ALL='C', LANG='C')
     for _ in range(MAX_DECLARATIONS + 1):
@@ -104,7 +114,7 @@ def _resolve(cpp, filename, compile_commands, marker, config, runtime_include):
             column, message = int(error[3]), error[4]
             if row is None or row > len(lines):
                 break
-            candidate = re.fullmatch(re.escape(marker) + r'([A-Za-z_]\w*)\s*=\s*.+;',
+            candidate = re.fullmatch(re.escape(marker) + r'([A-Za-z_]\w*)(\s*=\s*.+)?;',
                                      lines[row - 1])
             if not candidate or column != len(marker) + 1:
                 break
@@ -116,7 +126,7 @@ def _resolve(cpp, filename, compile_commands, marker, config, runtime_include):
             if not absent:
                 break
             if name not in names:
-                pending.append(row)
+                pending.append((row, 'assign' if candidate[2] else 'bare'))
                 names.add(name)
         if not pending:
             break
@@ -124,8 +134,11 @@ def _resolve(cpp, filename, compile_commands, marker, config, runtime_include):
             raise KumaError('初回代入の自動宣言が多すぎます。明示宣言 := を使ってください',
                             code='KUMA_ASSIGN_PROBE')
         original = cpp.splitlines(keepends=True)
-        for row in pending:
-            original[row - 1] = original[row - 1].replace(marker, 'auto ', 1)
-            declared.add(row)
+        for row, kind in pending:
+            if kind == 'bare':
+                original[row - 1] = original[row - 1].replace(marker, 'long long ', 1).replace(';', ' = 0LL;', 1)
+            else:
+                original[row - 1] = original[row - 1].replace(marker, 'auto ', 1)
+            declared[row] = kind
         cpp = ''.join(original)
     return declared

@@ -713,7 +713,8 @@ class CppParser(InitializerSupport, Parser):
         if not (terminated or complete_call or partial_member or complete_line):
             return None
         self.position = end
-        return Node('cpp_stmt', start, self.source_range(start, part[-1]) + ';')
+        return Node('cpp_stmt', start, self.source_range(start, part[-1]) + ';',
+                    extra={'bare_identifier': not terminated and len(part) == 1 and start.kind == 'IDENT'})
 
     def cpp_range_for(self) -> Node | None:
         """Allow `for auto& x : values { ... }` without changing C++ for headers.
@@ -1235,6 +1236,7 @@ class CppEmitter:
         self.implicit_marker = '/*kuma_implicit_assignment*/ '
         self.implicit_assignments = False
         self.in_implicit_main = False
+        self.skip_bare_line = None
         self.sorted_key_functions = {}
         self.sorted_key_ambiguous = set()
         self.sorted_key_used = set()
@@ -1705,7 +1707,9 @@ class CppEmitter:
         if kind in {'cpp_global', 'cpp_directive', 'cpp_stmt'}:
             marker = ''
             if (kind == 'cpp_stmt' and self.implicit_assignments and self.in_implicit_main
-                    and re.fullmatch(r'[A-Za-z_]\w*\s*=\s*[^=,;{}][^,;{}]*;', node.value)):
+                    and (node.extra.get('bare_identifier') and node.token.line != self.skip_bare_line
+                         and not node.value.startswith('kuma_gen_')
+                         or re.fullmatch(r'[A-Za-z_]\w*\s*=\s*[^=,;{}][^,;{}]*;', node.value))):
                 marker = self.implicit_marker
             return prefix + marker + self.mark(node.value, node.token)
         if kind == 'cpp_bare_call':
