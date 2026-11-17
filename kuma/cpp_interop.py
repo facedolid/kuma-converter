@@ -1235,6 +1235,7 @@ class CppEmitter:
         self.type_bindings = {}
         self.implicit_marker = '/*kuma_implicit_assignment*/ '
         self.implicit_assignments = False
+        self.implicit_bare_names = False
         self.in_implicit_main = False
         self.skip_bare_line = None
         self.sorted_key_functions = {}
@@ -1706,10 +1707,10 @@ class CppEmitter:
         kind = node.kind
         if kind in {'cpp_global', 'cpp_directive', 'cpp_stmt'}:
             marker = ''
-            if (kind == 'cpp_stmt' and self.implicit_assignments and self.in_implicit_main
-                    and (node.extra.get('bare_identifier') and node.token.line != self.skip_bare_line
-                         and not node.value.startswith('kuma_gen_')
-                         or re.fullmatch(r'[A-Za-z_]\w*\s*=\s*[^=,;{}][^,;{}]*;', node.value))):
+            if (kind == 'cpp_stmt' and self.in_implicit_main
+                    and (self.implicit_bare_names and node.extra.get('bare_identifier')
+                         and node.token.line != self.skip_bare_line and not node.value.startswith('kuma_gen_')
+                         or self.implicit_assignments and re.fullmatch(r'[A-Za-z_]\w*\s*=\s*[^=,;{}][^,;{}]*;', node.value))):
                 marker = self.implicit_marker
             return prefix + marker + self.mark(node.value, node.token)
         if kind == 'cpp_bare_call':
@@ -1956,6 +1957,10 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
            (t.kind == 'CPP_DIRECTIVE' and re.match(r'#\s*(if|ifdef|ifndef|define)\b', t.text))
            for t in parser.tokens):
         emitter.implicit_assignments = False
+    if any(t.text in {'class', 'template'} or
+           (t.kind == 'CPP_DIRECTIVE' and re.match(r'#\s*(if|ifdef|ifndef|define)\b', t.text))
+           for t in parser.tokens):
+        emitter.implicit_bare_names = False
     while emitter.implicit_marker in source:
         emitter.implicit_marker = emitter.implicit_marker.replace('*/', '_*/')
     # Keep user configuration/includes before the runtime's first ac.hpp include.

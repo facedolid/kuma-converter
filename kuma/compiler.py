@@ -2911,6 +2911,7 @@ def transpile(source: str, filename: str = "input.kuma", *, optimize: bool = Tru
         emitter.line_directives = not compact
         emitter.compact = compact
         emitter.implicit_assignments = True
+        emitter.implicit_bare_names = True
         cpp = transpile_cpp(source, filename, emitter=emitter, native_checked=True)
         from .implicit_assignment import resolve_assignments
         return archive + resolve_assignments(cpp, filename, compile_commands=compile_commands, marker=emitter.implicit_marker)
