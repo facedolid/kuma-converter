@@ -68,9 +68,9 @@ def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marke
 
     An unrecognized target stays ``long long``. A full candidate translation
     unit must pass before any type is changed. If the first trial fails, a
-    bounded set of trials may leave one target at its original default. This
-    deliberately avoids guessing complex expressions, arbitrary containers,
-    and user-defined conversions.
+    bounded set of trials may leave one target at its original default; a
+    final trial can keep all non-vector targets at that default. This avoids
+    guessing complex expressions, arbitrary containers and conversions.
     """
     from .compile_config import compile_config
     compiler_command, macos_sdk_flags, stop_process_group, root = _probe_dependencies()
@@ -113,15 +113,25 @@ def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marke
     # First try the original all-target probe. If it fails, try leaving one
     # target at its existing default; accept only a complete successful C++
     # translation unit. Bound retries and wall time for interactive use.
-    candidates = [eligible]
+    candidates = [(eligible, False)]
     if len(eligible) > 1:
-        candidates.extend(eligible - {i} for i in sorted(eligible)[:MAX_VECTOR_ALTERNATIVES])
+        candidates.extend((eligible - {i}, False)
+                          for i in sorted(eligible)[:MAX_VECTOR_ALTERNATIVES])
+        # One final bounded probe keeps non-vector targets at their existing
+        # long long default, even when more than one target is not a vector.
+        candidates.append((eligible, True))
+    def replacement_or_default(match):
+        target = 'std::remove_cvref_t<decltype(' + match[1] + ')>'
+        return ('typename std::conditional_t<kuma_rt::is_vector<' + target + '>::value, '
+                'kuma_rt::vector_input_element<' + target + '>, '
+                'std::type_identity<long long>>::type')
     deadline = time.monotonic() + MAX_SECONDS
-    for selected in candidates:
+    for selected, adaptive in candidates:
+        choose = replacement_or_default if adaptive else replacement
         pieces, last = [], 0
         for index, match in enumerate(trial_matches):
             pieces.append(trial_base[last:match.start()])
-            pieces.append(replacement(match) if index in selected else 'long long')
+            pieces.append(choose(match) if index in selected else 'long long')
             last = match.end()
         pieces.append(trial_base[last:])
         remaining = deadline - time.monotonic()
@@ -142,7 +152,7 @@ def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marke
         except (OSError, subprocess.TimeoutExpired):
             break
         if status == 0:
-            return [(match.start(), match.end(), replacement(match)
+            return [(match.start(), match.end(), choose(match)
                      if index in selected else 'long long') for index, match in enumerate(matches)]
     return [fallback(match) for match in matches]
 
