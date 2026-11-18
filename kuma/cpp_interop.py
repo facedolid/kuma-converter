@@ -2157,12 +2157,22 @@ def _cpp_stmt_masked_members(tokens):
     return frozenset(masked)
 
 
-def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, *, masked_members=frozenset()):
+def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None,
+                                   string_scalars=None, *, masked_members=frozenset()):
     """Conservative lexical proof for mixed-mode zero-argument calls.
 
     Only auto-bound Kuma vector/string values qualify. Opaque C++ discards
     knowledge rather than guessing declarations or shadowing. Unrelated native
     fields (including bit-fields) are never routed through a value helper.
+
+    ``known`` covers every proven container (``input`` vectors, literals, and
+    also string scalars for ``optional_receiver``). String vectors and string
+    scalars therefore share ``known`` even though only scalars may use ``+`` to
+    build another string. ``string_scalars`` records names proven to be a single
+    ``std::string`` (tuple ``input<string>``, unit ``input<string>`` / line
+    input, string literals). ``+`` and copy bindings consult only
+    ``string_scalars``, never plain ``known``, so a name like ``lines`` that is
+    in ``known`` as a vector is never treated as a string operand.
 
     cpp_stmt rewrites insert ``()`` after the matched member name only; the
     lexer does not preprocess ``#define``, so macro-expanded statements never
@@ -2171,6 +2181,25 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
     known = set(known or ())
     nested = set(nested or ())
     ranges = set(ranges or ())
+    string_scalars = set(string_scalars or ())
+
+    def string_scalar_expr(value):
+        if value.kind == 'literal' and value.extra.get('type') == 'string':
+            return True
+        return value.kind == 'name' and value.value in string_scalars
+
+    def input_binds_string_scalar(init):
+        if init is None or init.kind != 'call' or init.value != 'input' or init.children:
+            return False
+        types = init.extra.get('types', [])
+        kwargs = init.extra.get('kwargs', {})
+        if 'until' in kwargs:
+            return False
+        if not kwargs:
+            return len(types) == 1 and cpp_type(types[0]) == 'std::string'
+        if set(kwargs) == {'mode'} and kwargs['mode'].value == '"line"':
+            return line_eof_input_allowed(types)
+        return False
 
     def nested_collection(value):
         if value.kind == 'name':
@@ -2353,6 +2382,7 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
             known.clear()
             nested.clear()
             ranges.clear()
+            string_scalars.clear()
             if node.kind == 'cpp_opaque_sections':
                 for section in node.extra.get('sections', []):
                     if section[0] not in {'raw', 'expression', 'field'}:
@@ -2376,7 +2406,7 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
                 body_nested = nested - {loop}
                 mark_optional_collection_calls(
                     node.extra.get('body', []), body_known, body_nested,
-                    ranges - {loop},
+                    ranges - {loop}, string_scalars - {loop},
                     masked_members=masked_members)
                 expression(iterable, known)
                 continue
@@ -2390,6 +2420,7 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
             known.difference_update(node.value)
             nested.difference_update(node.value)
             ranges.difference_update(node.value)
+            string_scalars.difference_update(node.value)
             init = node.children[0] if node.children else None
             if init is not None and len(node.value) == 1 and not node.extra.get('type'):
                 if init.kind == 'binary' and init.value == '..':
@@ -2416,8 +2447,23 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
                     for name, type_ in zip(node.value, per_name):
                         if cpp_type(type_) == 'std::string':
                             known.add(name)
+                            string_scalars.add(name)
+            if init is not None and len(node.value) == 1 and not node.extra.get('type'):
+                if (init.kind == 'binary' and init.value == '+'
+                        and len(init.children) == 2
+                        and string_scalar_expr(init.children[0])
+                        and string_scalar_expr(init.children[1])):
+                    string_scalars.add(node.value[0])
+                    known.add(node.value[0])
+                elif init.kind == 'name' and init.value in string_scalars:
+                    string_scalars.add(node.value[0])
+                    known.add(node.value[0])
             if inferred:
                 known.add(node.value[0])
+                if init is not None and (
+                        input_binds_string_scalar(init)
+                        or (init.kind == 'literal' and init.extra.get('type') == 'string')):
+                    string_scalars.add(node.value[0])
             if nested_inferred:
                 nested.add(node.value[0])
         for key in ('body', 'else'):
@@ -2428,6 +2474,7 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
                                            known if scoped else None,
                                            nested if scoped else None,
                                            ranges if scoped else None,
+                                           string_scalars if scoped else None,
                                            masked_members=masked_members)
 
 
