@@ -1849,13 +1849,33 @@ class CppEmitter:
             if value in {'zip', 'enumerate'}:
                 allowed = {'strict'} if value == 'zip' else {'start'}
                 self.options(node, kw, allowed)
+                force_helper = bool(kw)
                 if value == 'enumerate':
-                    if len(args) != 1: self.fail(node, 'enumerate(a, start=0) の形で使用してください')
-                    args.append(self.expr(kw['start']) if 'start' in kw else '0LL')
+                    if kind == 'call':
+                        if len(args) != 1:
+                            self.fail(node, 'enumerate(a, start=0) の形で使用してください')
+                        args.append(self.expr(kw['start']) if 'start' in kw else '0LL')
+                        helper = 'cpp_enumerate'
+                    else:
+                        if len(args) < 1:
+                            self.fail(node, 'enumerate(a, start=0) の形で使用してください')
+                        if force_helper:
+                            if len(args) != 1:
+                                self.fail(node, 'enumerate の start は受け手1つだけに指定してください')
+                            args.append(self.expr(kw['start']))
+                            helper = 'cpp_enumerate'
+                        else:
+                            helper = 'cpp_member_enumerate'
                 else:
                     if len(args) < 2: self.fail(node, 'zipは2個以上の列が必要です')
-                    args.insert(0, self.expr(kw['strict']) if 'strict' in kw else 'false')
-                return f'kuma_rt::cpp_{value}(' + ', '.join(args) + ')'
+                    strict = self.expr(kw['strict']) if 'strict' in kw else 'false'
+                    if force_helper or kind == 'call':
+                        args.insert(0, strict)
+                        helper = 'cpp_zip'
+                    else:
+                        args.insert(0, strict)
+                        helper = 'cpp_member_zip'
+                return f'kuma_rt::{helper}(' + ', '.join(args) + ')'
             self.options(node, kw)
             helpers = {'sum': 'cpp_sum', 'map': 'cpp_map', 'filter': 'cpp_filter',
                        'sort': 'cpp_sort', 'sorted': 'cpp_sorted', 'reverse': 'reverse',
