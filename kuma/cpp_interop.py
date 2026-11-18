@@ -2219,12 +2219,16 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_mem
         # Both cpp_collect and cpp_flat_collect always return std::vector.
         if value.kind == 'comprehension':
             return True
-        if (value.kind == 'method' and value.value in {'map', 'filter'}
-                and value.children):
+        if value.kind == 'method' and value.children:
             receiver = value.children[0]
-            if receiver.kind == 'binary' and receiver.value == '..':
-                return True
-            return collection(receiver)
+            if value.value == 'enumerate':
+                return collection(receiver)
+            if value.value == 'zip' and len(value.children) >= 2:
+                return all(collection(child) for child in value.children)
+            if value.value in {'map', 'filter'}:
+                if receiver.kind == 'binary' and receiver.value == '..':
+                    return True
+                return collection(receiver)
         # Unqualified Kuma calls always lower to eager vector helpers.
         # Method chains count only when the receiver is already proven; other
         # member spellings are left to native C++ (e.g. a custom View::map).
