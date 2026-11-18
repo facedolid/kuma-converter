@@ -312,11 +312,11 @@ class CppParser(InitializerSupport, Parser):
                     first, last = line[0].text, line[-1]
                     next_text = following_text[index]
                     continued_end = {';', '{', ',', '.', '->', '::', ':', '=', '+=', '-=',
-                                     '*=', '/=', '+', '-', '*', '/', '%', '&&', '||',
+                                     '*=', '/=', '**=', '+', '-', '*', '/', '%', '&&', '||',
                                      '<<', '>>', '&', '|', '^', '!', '<', '>', '?', 'return',
                                      'co_return', 'throw', 'else'}
                     continued_start = {';', '.', '->', '::', ',', ':', '=', '+=', '-=',
-                                       '*=', '/=', '+', '-', '*', '/', '%', '&&', '||',
+                                       '*=', '/=', '**=', '+', '-', '*', '/', '%', '&&', '||',
                                        '<<', '>>', '&', '|', '^', '?', '(', '[', '{'}
                     # A C++ control header with a newline before its body is
                     # complete even when the line ends in ')'.
@@ -399,7 +399,7 @@ class CppParser(InitializerSupport, Parser):
                 opening = self.position
                 self.group('{', '}')
                 content = self.tokens[opening:self.position]
-                sugar = any(t.text in {':=', '=>', '..', '**', 'input'} for t in content)
+                sugar = any(t.text in {':=', '=>', '..', '**', '**=', 'input'} for t in content)
                 sugar |= any(t.text in {'map', 'filter', 'sum', 'sort', 'sorted', 'reverse', 'reversed'} and i and content[i-1].text == '.'
                              for i, t in enumerate(content))
                 square = 0
@@ -475,7 +475,7 @@ class CppParser(InitializerSupport, Parser):
     def native_body_needs_lowering(self, tokens: list[Token]) -> bool:
         tokens = [t for t in tokens if t not in self.native_opaque_tokens]
         text = [t.text for t in tokens]
-        if any(t in {':=', '=>', '..'} for t in text):
+        if any(t in {':=', '=>', '..', '**='} for t in text):
             return True
         if self.ordering_call_needs_lowering(tokens):
             return True
@@ -722,7 +722,7 @@ class CppParser(InitializerSupport, Parser):
                                if t.kind != 'NEWLINE'), '')
                 after = next((t.text for t in self.tokens[index + 1:]
                               if t.kind != 'NEWLINE'), '')
-                if (before in {'=', '+=', '-=', '*=', '/=', '%=', '+', '-', '*', '/',
+                if (before in {'=', '+=', '-=', '*=', '/=', '%=', '**=', '+', '-', '*', '/',
                                '%', '<<', '>>', '&&', '||', '&', '|', '^', ',', '.',
                                '->', '::', '?', ':'}
                         or after in {'<<', '>>', '&&', '||', '.', '->', '::', '+',
@@ -751,7 +751,7 @@ class CppParser(InitializerSupport, Parser):
                 island.extra['sections'].append(('raw', ';', self.tokens[end]))
                 self.position = end
                 return island
-        if any(t in {':=', '=>', '..', '**', 'input'} for t in texts):
+        if any(t in {':=', '=>', '..', '**', '**=', 'input'} for t in texts):
             return None
         # Array comprehensions/literals and Kuma's member extensions need lowering.
         if any(t == '[' and (i == 0 or texts[i-1] in {'=', '(', ',', 'return'})
@@ -2023,6 +2023,15 @@ class CppEmitter:
                 return target.kind == 'slice' or any(has_slice(child) for child in target.children)
             if has_slice(node.children[0]):
                 self.fail(node, '混在モードのスライス代入は未対応です。スライスはコピーを返します')
+            if node.value == '**=':
+                if node.children[0].kind != 'name':
+                    self.fail(node, '**= の左辺は単純な変数に限定しています')
+                self.uses_power = True
+                lhs = self.expr(node.children[0])
+                rhs = self.expr(node.children[1])
+                base, exponent = self.fresh('power_base'), self.fresh('power_exponent')
+                return (prefix + f'{{ auto {base} = {lhs}; auto {exponent} = {rhs}; '
+                        f'{lhs} = kuma_rt::power_m8({base}, {exponent}); }}')
             marker = ''
             if (self.implicit_assignments and self.in_implicit_main and node.value == '='
                     and node.children[0].kind == 'name'):

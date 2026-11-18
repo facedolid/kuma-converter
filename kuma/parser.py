@@ -15,7 +15,7 @@ _BARE_CALLS = {
     "min", "max", "abs", "discard_line", "flush",
 }
 _LATER_CALLS: set[str] = set()
-_ASSIGNMENTS = {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="}
+_ASSIGNMENTS = {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "**="}
 _BINDING_POWER = {
     "..": 2,
     "||": 3,
