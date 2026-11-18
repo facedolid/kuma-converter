@@ -1380,9 +1380,16 @@ class CppEmitter:
         self.options(node, kw, {'until', 'mode'})
         # Placeholder declarations acquire their type from the generated input
         # expression; they are not concrete types usable inside decltype helpers.
-        placeholder = bool(expected and re.fullmatch(
+        expected_tokens = expected.strip() if expected else ''
+        if '/*' in expected_tokens:
+            try:
+                expected_tokens = ' '.join(t.text for t in lex(expected_tokens, cpp=True)
+                                           if t.kind not in {'NEWLINE', 'EOF'})
+            except KumaError:
+                pass  # Preserve the previous conservative treatment of unknown types.
+        placeholder = bool(expected_tokens and re.fullmatch(
             r'(?:(?:const|volatile)\s+)*auto(?:\s+(?:const|volatile))*\s*(?:&&?)?',
-            expected.strip()))
+            expected_tokens))
         concrete_expected = bool(expected and not placeholder)
         if types:
             type_ = cpp_type(types[0]) if len(types) == 1 else 'std::tuple<' + ', '.join(map(cpp_type, types)) + '>'
