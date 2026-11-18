@@ -238,7 +238,18 @@ class Parser:
                         return self.function_body(start, name, params, declared_type)
                     if self.accept("{"):
                         self.newlines()
-                        self.expect("}", "値初期化は空の {} を使ってください")
+                        if self.current.text != "}" and not self.cpp and declared_type in {
+                                "i32", "int", "i64", "ll", "long long", "f64", "double", "bool", "char", "string", "str"}:
+                            self.group_depth += 1
+                            try:
+                                value = self.rhs()
+                                self.newlines()
+                                self.expect("}", "波括弧の初期値は1つだけ指定してください")
+                            finally:
+                                self.group_depth -= 1
+                            self.end_statement()
+                            return Node("declare", start, [name.text], [value], {"type": declared_type})
+                        self.expect("}", "この型の値初期化は空の {} を使ってください")
                         if declared_type in {"auto", "void"}:
                             raise KumaError("空の {} で初期化できる具体的な型が必要です", start)
                         self.end_statement()
