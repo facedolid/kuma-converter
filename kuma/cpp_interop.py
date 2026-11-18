@@ -1434,9 +1434,10 @@ class CppEmitter:
                 return self.type_bindings[value]
             return self.mark(value, node.token)
         if kind == 'literal':
-            if not native and node.extra['type'] == 'i64' and re.fullmatch(r"[0-9][0-9']*", value): return value + 'LL'
-            if not native and node.extra['type'] == 'string': return f'std::string({value})'
-            return value
+            literal = self.mark(value, node.token)
+            if not native and node.extra['type'] == 'i64' and re.fullmatch(r"[0-9][0-9']*", value): return literal + 'LL'
+            if not native and node.extra['type'] == 'string': return f'std::string({literal})'
+            return literal
         if kind == 'array':
             if not node.children:
                 if expected and expected != 'auto': return cpp_type(expected) + '{}'
