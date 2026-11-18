@@ -1218,10 +1218,15 @@ class CppParser(InitializerSupport, Parser):
         previous = self.position - 1
         while previous >= 0 and self.tokens[previous].kind == 'NEWLINE':
             previous -= 1
-        is_argument = (minimum == 0 and self.group_depth == getattr(self, '_brace_argument_depth', None)
-                       and previous >= 0 and self.tokens[previous].text in {'(', ',', '='})
+        in_arguments = self.group_depth == getattr(self, '_brace_argument_depth', None)
+        is_argument = (minimum == 0 and in_arguments and previous >= 0
+                       and self.tokens[previous].text in {'(', ',', '='})
+        # In an explicit call's parentheses, the operands of ?: cannot be
+        # statement blocks. Do not infer braces after a standalone if/while.
+        is_conditional_arm = (in_arguments and previous >= 0
+                              and self.tokens[previous].text in {'?', ':'})
         saved = getattr(self, '_brace_argument_position', None)
-        if is_argument:
+        if is_argument or is_conditional_arm:
             target = self.position
             while self.tokens[target].text == '(':
                 target += 1
