@@ -990,7 +990,18 @@ class Compiler(DeclarationSupport):
         explicit = Type("tuple", tuple(types)) if len(types) > 1 else types[0] if types else None
         kwargs = node.extra.get("kwargs", {})
         if "until" in kwargs and "mode" in kwargs:
-            self.fail('行単位のEOF入力は混在モードの input<string>(mode="line", until=EOF) に限ります', node)
+            if set(kwargs) != {"until", "mode"} or node.children:
+                self.fail('行EOF入力は input<string>(mode="line", until=EOF) と書いてください', node)
+            end, mode = kwargs["until"], kwargs["mode"]
+            if end.kind != "name" or end.value != "EOF":
+                self.fail("until は EOF を指定してください", node)
+            if mode.kind != "literal" or mode.extra.get("type") != "string" or ast.literal_eval(mode.value) != "line":
+                self.fail('mode は文字列リテラル "line" にしてください', node)
+            if explicit and explicit != STRING:
+                self.fail('行EOF入力は input<string>(mode="line", until=EOF) と書いてください', node)
+            if expected and expected != Type("vec", (STRING,)):
+                self.fail("行EOF入力の結果は string の配列です", node)
+            return Value(self.input_guard("kuma_rt::read_all_lines()", node), Type("vec", (STRING,)))
         if "until" in kwargs:
             end = kwargs["until"]
             if set(kwargs) != {"until"} or node.children or end.kind != "name" or end.value != "EOF":
