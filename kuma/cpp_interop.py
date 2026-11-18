@@ -1391,7 +1391,7 @@ class CppEmitter:
             return f'kuma_rt::read_all<{type_}>()'
         if 'mode' in kw:
             if args or kw['mode'].value != '"line"': self.fail(node, '混在モードのmodeは mode="line" の単一行入力です')
-            return 'kuma_rt::read_line()'
+            return f'kuma_rt::read_line_as<{type_}>()' if types else 'kuma_rt::read_line()'
         function = {0: 'read', 1: 'read_vec', 2: 'read_mat'}.get(len(args))
         if function is None: self.fail(node, '入力の形状は2次元まで対応しています')
         return f'kuma_rt::{function}<{type_}>({", ".join(args)})'
