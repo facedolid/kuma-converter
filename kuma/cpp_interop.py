@@ -1928,6 +1928,9 @@ def mark_optional_collection_calls(nodes, known=None):
             return value.value in known
         if value.kind == 'array':
             return bool(value.children)
+        # Both cpp_collect and cpp_flat_collect always return std::vector.
+        if value.kind == 'comprehension':
+            return True
         if value.kind == 'literal':
             return value.extra.get('type') == 'string'
         if value.kind == 'call' and value.value == 'input':
