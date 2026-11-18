@@ -15,6 +15,25 @@ from .power import CPP_POWER
 from .m10 import CPP_M10, safe_stages, simple_comprehension
 
 
+def _rep_paren_multiline_count_token(tokens, open_index: int, close_index: int):
+    """rep( name , count) only: count token when it starts on a line after the comma."""
+    index = open_index + 1
+    if index >= close_index or tokens[index].kind != 'IDENT':
+        return None
+    index += 1
+    while index < close_index and tokens[index].kind == 'NEWLINE':
+        index += 1
+    if index >= close_index or tokens[index].text != ',':
+        return None
+    comma = tokens[index]
+    index += 1
+    while index < close_index and tokens[index].kind == 'NEWLINE':
+        index += 1
+    if index >= close_index or tokens[index].line <= comma.line:
+        return None
+    return tokens[index]
+
+
 def function_macro_definition(text: str):
     """Read a function-like directive header without changing its source text.
 
@@ -1152,9 +1171,35 @@ class CppParser(InitializerSupport, Parser):
                     template_macro_body = self.tokens[look].indent > start.indent
         if (start.text == 'rep' or template_macro_body) and self.tokens[self.position + 1].text == '(':
             self.take()
+            open_index = self.position
             self.group('(', ')')
-            header = self.source_range(start, self.tokens[self.position - 1])
-            return Node('cpp_loop', start, header, extra={'body': self.block(start)})
+            close_index = self.position - 1
+            header = self.source_range(start, self.tokens[close_index])
+            count_token = (_rep_paren_multiline_count_token(self.tokens, open_index, close_index)
+                           if start.text == 'rep' else None)
+            body_position = self.position
+            while body_position < len(self.tokens) and self.tokens[body_position].kind == 'NEWLINE':
+                body_position += 1
+            first_body = (self.tokens[body_position] if body_position < len(self.tokens)
+                          else self.tokens[-1])
+            missing_body = (first_body.text != '{'
+                            and (first_body.kind == 'EOF' or first_body.text == '}'
+                                 or first_body.indent <= start.indent))
+            try:
+                body = self.block(start)
+            except KumaError as error:
+                if count_token is not None and missing_body and error.code == 'KUMA_LAYOUT':
+                    note = ("rep のカンマの後には回数の式が必要です。"
+                            "次の行を回数として読んでいるため、回数の書き忘れも確認してください。")
+                    hint = (error.hint + "\n" if error.hint else "") + note
+                    raise KumaError(
+                        "本体には { ... } または改行と字下げが必要です",
+                        count_token,
+                        code="KUMA_SYNTAX",
+                        hint=hint,
+                    ) from error
+                raise
+            return Node('cpp_loop', start, header, extra={'body': body})
         if self.depth:
             parenthesized = self.parenthesized_println_slice()
             if parenthesized is not None:
