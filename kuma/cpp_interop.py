@@ -2106,6 +2106,12 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
                     or (len(types) == 1 and cpp_type(types[0]) == 'std::string'))
         return False
 
+    def optional_receiver(receiver, names):
+        if receiver.kind == 'name' and receiver.value in names:
+            return True
+        return (receiver.kind == 'index' and receiver.children[0].kind == 'name'
+                and receiver.children[0].value in nested)
+
     def expression(value, names):
         # Lambda parameters and native fragments may shadow every outer name.
         if value.kind in {'lambda', 'comprehension', 'cpp_opaque_sections'}:
@@ -2113,8 +2119,12 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
         for child in value.children:
             expression(child, names)
         if (value.kind == 'member' and value.value in {'size', 'empty', 'clear', 'pop_back'}
-                and not value.extra.get('pointer') and value.children[0].kind == 'name'
-                and value.children[0].value in names):
+                and not value.extra.get('pointer')):
+            receiver = value.children[0]
+            if not optional_receiver(receiver, names):
+                return
+            if receiver.kind == 'index' and value.value not in {'size', 'empty'}:
+                return
             value.extra['optional_collection_call'] = True
 
     for node in nodes:
