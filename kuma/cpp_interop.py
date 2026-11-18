@@ -2010,12 +2010,16 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
     def nested_collection(value):
         if value.kind == 'name':
             return value.value in nested
-        if value.kind != 'call' or value.value != 'input' or value.extra.get('kwargs'):
+        if value.kind != 'call' or value.value != 'input':
             return False
         types = value.extra.get('types', [])
-        return (len(value.children) == 2
-                or (len(value.children) == 1 and len(types) == 1
-                    and cpp_type(types[0]) == 'std::string'))
+        options = value.extra.get('kwargs', {})
+        string_element = len(types) == 1 and cpp_type(types[0]) == 'std::string'
+        if not value.children and set(options) == {'until'}:
+            return (string_element and options['until'].kind == 'name'
+                    and options['until'].value == 'EOF')
+        return (not options and (len(value.children) == 2
+                or (len(value.children) == 1 and string_element)))
 
     def collection(value):
         if value.kind == 'name':
