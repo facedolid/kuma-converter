@@ -1313,6 +1313,25 @@ _TYPES = {'i64': 'long long', 'll': 'long long', 'i32': 'int', 'f64': 'double',
           'set': 'std::set', 'pair': 'std::pair', 'tuple': 'std::tuple'}
 
 
+_LINE_EOF_SCALAR_TYPES = {'i64', 'i32', 'll', 'int', 'long', 'f64', 'double', 'bool', 'char', 'void'}
+_LINE_EOF_STRING_SPELLINGS = {'string', 'str', 'std::string'}
+
+
+def line_eof_input_allowed(type_names):
+    if not type_names:
+        return True
+    if len(type_names) != 1:
+        return False
+    name = type_names[0]
+    if name in _LINE_EOF_STRING_SPELLINGS or cpp_type(name) == 'std::string':
+        return True
+    if name in _LINE_EOF_SCALAR_TYPES:
+        return False
+    if cpp_type(name) in {'long long', 'int', 'double', 'bool', 'char', 'void'}:
+        return False
+    return True
+
+
 def cpp_type(text):
     # Keep the common type-only path cheap. Literals, comments and whitespace
     # after :: need token-aware handling to preserve C++ meaning.
@@ -1491,12 +1510,11 @@ class CppEmitter:
         if 'until' in kw and 'mode' in kw:
             if (args or set(kw) != {'until', 'mode'} or kw['until'].value != 'EOF'
                     or kw['mode'].value != '"line"'):
-                self.fail(node, '行のEOF入力は input<string>(mode="line", until=EOF) のみ対応しています')
-            string_type = ((len(types) == 1 and cpp_type(types[0]) == 'std::string')
-                           or (not types and concrete_expected
-                               and re.fullmatch(r'std::vector\s*<\s*std::string\s*>', cpp_type(expected))))
-            if not string_type:
-                self.fail(node, '行のEOF入力は input<string> / input<std::string> / input<str> に限ります')
+                self.fail(node, '行EOF入力は input(mode="line", until=EOF) または明示 string 型です')
+            if not line_eof_input_allowed(types):
+                self.fail(node, '行EOF入力は文字列型に限ります。数値型は input<T>(until=EOF) を使ってください')
+            if types:
+                return f'kuma_rt::read_all_lines_as<{cpp_type(types[0])}>()'
             return 'kuma_rt::read_all_lines()'
         if 'until' in kw:
             if args or len(kw) != 1 or kw['until'].value != 'EOF': self.fail(node, 'until=EOF は固定個数や他のオプションと併用できません')
@@ -2082,9 +2100,9 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
         options = value.extra.get('kwargs', {})
         string_element = len(types) == 1 and cpp_type(types[0]) == 'std::string'
         if not value.children and set(options) == {'until', 'mode'}:
-            return (string_element and options['until'].kind == 'name'
-                    and options['until'].value == 'EOF'
-                    and options['mode'].value == '"line"')
+            return (options['until'].kind == 'name' and options['until'].value == 'EOF'
+                    and options['mode'].value == '"line"'
+                    and line_eof_input_allowed(types))
         if not value.children and set(options) == {'until'}:
             return (string_element and options['until'].kind == 'name'
                     and options['until'].value == 'EOF')
@@ -2121,7 +2139,7 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
             if not value.children and set(options) == {'until', 'mode'}:
                 return (options['until'].kind == 'name' and options['until'].value == 'EOF'
                         and options['mode'].value == '"line"'
-                        and len(types) == 1 and cpp_type(types[0]) == 'std::string')
+                        and line_eof_input_allowed(types))
             if not value.children and set(options) == {'mode'}:
                 return options['mode'].value == '"line"'
             if not value.children and set(options) == {'until'}:
