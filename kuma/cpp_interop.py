@@ -2312,7 +2312,7 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
             receiver = value.children[0]
             tracked = optional_receiver(receiver, names)
             if (not tracked and value.value in {'size', 'empty'}
-                    and receiver.kind in {'method', 'call'}
+                    and receiver.kind in {'method', 'call', 'slice'}
                     and collection(receiver)):
                 tracked = True
             if not tracked:
