@@ -2263,6 +2263,17 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
                 for _, body in node.extra.get('handlers', []):
                     mark_optional_collection_calls(body)
             continue
+        if node.kind == 'for':
+            pattern = node.extra.get('pattern')
+            iterable = node.children[0] if node.children else None
+            if (pattern and pattern.kind == 'bind_name' and iterable is not None
+                    and nested_collection(iterable)):
+                loop = pattern.value
+                body_known = (known - {loop}) | {loop}
+                body_nested = nested - {loop}
+                mark_optional_collection_calls(node.extra.get('body', []), body_known, body_nested)
+                expression(iterable, known)
+                continue
         candidate = (node.kind == 'declare' and len(node.value) == 1
                      and not node.extra.get('type'))
         inferred = candidate and collection(node.children[0])
