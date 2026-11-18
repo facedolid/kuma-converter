@@ -1475,7 +1475,7 @@ class CppEmitter:
             return ('kuma_rt::cpp_slice(kuma_rt::CppSliceRequest{' +
                     ', '.join([self.expr(node.children[0]), *bounds]) + '})')
         if kind == 'member':
-            access = f'({self.expr(node.children[0])})' + ('->' if node.extra.get('pointer') else '.') + value
+            access = f'({self.expr(node.children[0])})' + ('->' if node.extra.get('pointer') else '.') + self.mark(value, node.token)
             return access + ('()' if node.extra.get('optional_collection_call') else '')
         if kind == 'lambda':
             return self.callback(node.extra['params'], self.expr(node.children[0]) if node.extra.get('expression') else self.statements(node.extra['body']), bool(node.extra.get('expression')))
