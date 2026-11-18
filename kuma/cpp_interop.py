@@ -1237,6 +1237,7 @@ class CppEmitter:
         self.vector_input_marker = '/*kuma_vector_input:'
         self.implicit_assignments = False
         self.vector_input_inference = False
+        self.vector_input_main_only = False
         self.implicit_bare_names = False
         self.in_implicit_main = False
         self.skip_bare_line = None
@@ -1770,7 +1771,8 @@ class CppEmitter:
             # Keep a probe-only marker so implicit_assignment can replace the
             # default vector element type only after that resolution proves the
             # target is an ordinary std::vector.
-            if (self.vector_input_inference and node.value == '=' and node.children[0].kind == 'name'
+            if (self.vector_input_inference and (not self.vector_input_main_only or self.in_implicit_main)
+                    and node.value == '=' and node.children[0].kind == 'name'
                     and node.children[1].kind == 'call'
                     and node.children[1].value == 'input'
                     and not node.children[1].extra.get('types')
@@ -1968,10 +1970,11 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
                 emitter.sorted_key_ambiguous.add(name)
         if definitions != 1 or any(token.kind == 'CPP_DIRECTIVE' and re.search(r'\b' + re.escape(name) + r'\b', token.text) for token in parser.tokens):
             emitter.sorted_key_ambiguous.add(name)
-    # Vector inputs are separately compiler-probed, without inferring missing names.
-    # Opaque preprocessing and dependent class/template contexts remain excluded.
+    # Class bodies remain opaque; only probe simple targets in main when a
+    # class is present. Templates and preprocessing still disable the probe.
+    emitter.vector_input_main_only = any(t.text == 'class' for t in parser.tokens)
     emitter.vector_input_inference = emitter.implicit_assignments and not any(
-        t.text in {'class', 'template'} or
+        t.text == 'template' or
         (t.kind == 'CPP_DIRECTIVE' and re.match(r'#\s*(if|ifdef|ifndef|define)\b', t.text))
         for t in parser.tokens)
     # Dependent bases, class members and preprocessing can hide declarations.
