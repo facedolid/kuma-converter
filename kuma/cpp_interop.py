@@ -761,6 +761,9 @@ class CppParser(InitializerSupport, Parser):
                    'some', 'every', 'reversed'}
         if any(texts[i] in {'.', '->'} and texts[i+1] in helpers for i in range(len(texts)-1)):
             return None
+        if any(texts[i] == '.' and texts[i + 1] in {'enumerate', 'zip'} and texts[i + 2] == '('
+               for i in range(len(texts) - 2)):
+            return None
         if self.ordering_call_needs_lowering(part):
             return None
         if start.text in _BARE_CALLS and (len(texts) < 2 or texts[1] != '('):
