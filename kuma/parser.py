@@ -387,7 +387,15 @@ class Parser:
             if count.token.line > start.line and (missing_body_start or missing_indented_body):
                 note = ("rep のカンマの後には回数の式が必要です。"
                         "次の行を回数として読んでいるため、回数の書き忘れも確認してください。")
-                error.hint = (error.hint + "\n" if error.hint else "") + note
+                hint = (error.hint + "\n" if error.hint else "") + note
+                if error.code == "KUMA_LAYOUT":
+                    raise KumaError(
+                        "本体には { ... } または改行と字下げが必要です",
+                        count.token,
+                        code="KUMA_SYNTAX",
+                        hint=hint,
+                    ) from error
+                error.hint = hint
             raise
         return Node("rep", start, name.text, [count], {"body": body})
 
