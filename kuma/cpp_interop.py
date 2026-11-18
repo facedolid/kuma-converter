@@ -1785,13 +1785,17 @@ class CppEmitter:
                 marker = self.implicit_marker
             target = self.expr(node.children[0])
             value = self.expr(node.children[1])
-            # Only a name or a direct field of a named object is safe to put
-            # into decltype without introducing another runtime evaluation.
+            # A name and ordinary field chain are unevaluated in decltype.
+            # Do not reconstruct calls, subscripts, pointers, or rewritten
+            # collection members as if they were plain C++ field access.
             lhs = node.children[0]
-            probe_target = lhs.value if lhs.kind == 'name' else None
-            if (lhs.kind == 'member' and not lhs.extra.get('pointer') and
-                    lhs.children[0].kind == 'name'):
-                probe_target = lhs.children[0].value + '.' + lhs.value
+            fields = []
+            while (lhs.kind == 'member' and not lhs.extra.get('pointer')
+                   and not lhs.extra.get('optional_collection_call')):
+                fields.append(lhs.value)
+                lhs = lhs.children[0]
+            probe_target = ('.'.join([lhs.value, *reversed(fields)])
+                            if lhs.kind == 'name' else None)
             if (self.vector_input_inference and (not self.vector_input_restrict_scope or self.in_implicit_main
                                                     or self.in_vector_input_function)
                     and node.value == '=' and probe_target is not None
