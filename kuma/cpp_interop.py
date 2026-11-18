@@ -2032,6 +2032,8 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
             if body is None or body.kind != 'name' or body.value != var:
                 return False
             return nested_collection(clauses[0].children[0])
+        if value.kind == 'call' and value.value == 'filter' and value.children:
+            return nested_collection(value.children[0])
         if value.kind != 'call' or value.value != 'input':
             return False
         types = value.extra.get('types', [])
