@@ -2254,6 +2254,10 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
                     return True
                 return collection(receiver)
             if value.value in {'sorted', 'reversed'}:
+                if receiver.kind == 'binary' and receiver.value == '..':
+                    return True
+                if receiver.kind == 'name' and receiver.value in ranges:
+                    return True
                 return collection(receiver)
         # Unqualified Kuma calls always lower to eager vector helpers.
         # Method chains count only when the receiver is already proven; other
@@ -2262,7 +2266,12 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
             return True
         if (value.kind == 'call' and value.value in {'sorted', 'reversed'}
                 and value.children):
-            return collection(value.children[0])
+            child = value.children[0]
+            if child.kind == 'binary' and child.value == '..':
+                return True
+            if child.kind == 'name' and child.value in ranges:
+                return True
+            return collection(child)
         if value.kind == 'slice' and value.children:
             return collection(value.children[0])
         if value.kind == 'literal':
@@ -2376,9 +2385,11 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
             nested.difference_update(node.value)
             ranges.difference_update(node.value)
             init = node.children[0] if node.children else None
-            if (init is not None and len(node.value) == 1 and not node.extra.get('type')
-                    and init.kind == 'binary' and init.value == '..'):
-                ranges.add(node.value[0])
+            if init is not None and len(node.value) == 1 and not node.extra.get('type'):
+                if init.kind == 'binary' and init.value == '..':
+                    ranges.add(node.value[0])
+                elif init.kind == 'call' and init.value == 'range':
+                    ranges.add(node.value[0])
             if init is not None and len(node.value) > 1 and split_shaped_input_init(init, len(node.value)):
                 known.update(node.value)
                 types = init.extra.get('types', [])
