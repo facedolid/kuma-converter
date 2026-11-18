@@ -2310,7 +2310,12 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
         if (value.kind == 'member' and value.value in {'size', 'empty', 'clear', 'pop_back'}
                 and not value.extra.get('pointer')):
             receiver = value.children[0]
-            if not optional_receiver(receiver, names):
+            tracked = optional_receiver(receiver, names)
+            if (not tracked and value.value in {'size', 'empty'}
+                    and receiver.kind in {'method', 'call'}
+                    and collection(receiver)):
+                tracked = True
+            if not tracked:
                 return
             if receiver.kind == 'index' and value.value not in {'size', 'empty'}:
                 return
