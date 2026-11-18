@@ -1866,10 +1866,11 @@ class CppEmitter:
                     and node.children[1].kind == 'call'
                     and node.children[1].value == 'input'
                     and not node.children[1].extra.get('types')
-                    and len(node.children[1].children) == 1
+                    and len(node.children[1].children) in {1, 2}
                     and not node.children[1].extra.get('kwargs')):
-                value = value.replace('kuma_rt::read_vec<long long>',
-                                      'kuma_rt::read_vec<' + self.vector_input_marker
+                reader = 'read_vec' if len(node.children[1].children) == 1 else 'read_mat'
+                value = value.replace('kuma_rt::' + reader + '<long long>',
+                                      'kuma_rt::' + reader + '<' + self.vector_input_marker
                                       + probe_target + '*/long long>', 1)
             return prefix + marker + target + ' ' + node.value + ' ' + value + ';'
         if kind == 'exprstmt': return prefix + self.expr(node.children[0]) + ';'

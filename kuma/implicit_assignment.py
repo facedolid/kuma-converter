@@ -101,8 +101,19 @@ def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marke
     command = [*compiler, '-std=c++23', *macos_sdk_flags(), '-fsyntax-only',
                '-fdiagnostics-color=never', '-iquote', str(Path(filename).resolve().parent),
                '-I', str(runtime_include or root / 'include'), *config.flags, '-x', 'c++', '-']
-    replacement = lambda match: ('typename kuma_rt::vector_input_element<'
-                                 'std::remove_cvref_t<decltype(' + match[1] + ')>>::type')
+    def outer_type(match):
+        return 'std::remove_cvref_t<decltype(' + match[1] + ')>'
+
+    def is_matrix(match):
+        prefix = 'kuma_rt::read_mat<'
+        return match.string[max(0, match.start() - len(prefix)):match.start()] == prefix
+
+    def replacement(match):
+        target = outer_type(match)
+        if is_matrix(match):
+            target = ('std::remove_cvref_t<typename kuma_rt::vector_input_element<'
+                      + target + '>::type>')
+        return 'typename kuma_rt::vector_input_element<' + target + '>::type'
     # A preceding implicit declaration can be necessary for the target's
     # scope to compile. Materialize it only in this probe; returned edits
     # remain in the original projection's coordinates.
@@ -121,7 +132,13 @@ def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marke
         # long long default, even when more than one target is not a vector.
         candidates.append((eligible, True))
     def replacement_or_default(match):
-        target = 'std::remove_cvref_t<decltype(' + match[1] + ')>'
+        target = outer_type(match)
+        if is_matrix(match):
+            # If the outer target is not a vector, use void as a sentinel;
+            # never instantiate a missing vector_input_element::type.
+            target = ('std::remove_cvref_t<typename std::conditional_t<kuma_rt::is_vector<'
+                      + target + '>::value, kuma_rt::vector_input_element<' + target
+                      + '>, std::type_identity<void>>::type>')
         return ('typename std::conditional_t<kuma_rt::is_vector<' + target + '>::value, '
                 'kuma_rt::vector_input_element<' + target + '>, '
                 'std::type_identity<long long>>::type')
