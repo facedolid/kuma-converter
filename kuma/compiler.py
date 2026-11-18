@@ -2830,15 +2830,15 @@ class Compiler(DeclarationSupport):
                 if init.kind == "call" and init.value == "input":
                     kwargs = init.extra.get("kwargs", {})
                     if init.children:
-                        self.fail("分割宣言では個数・次元付きの input は使えません", node)
+                        self.fail("分割宣言では個数・次元付きの input は使えません", init)
                     if kwargs:
                         if set(kwargs) == {"until", "mode"}:
-                            self.fail('分割宣言では行EOF入力は使えません。rows := input(mode="line", until=EOF) のように1つの変数に束縛してください', node)
+                            self.fail('分割宣言では行EOF入力は使えません。rows := input(mode="line", until=EOF) のように1つの変数に束縛してください', init)
                         if set(kwargs) == {"until"}:
-                            self.fail("分割宣言では until=EOF 入力は使えません。1つの変数に配列として束縛してください", node)
+                            self.fail("分割宣言では until=EOF 入力は使えません。1つの変数に配列として束縛してください", init)
                         if set(kwargs) == {"mode"}:
-                            self.fail("分割宣言では行入力は使えません。文字列を1つずつ読むか、行EOF入力を1つの変数に束縛してください", node)
-                        self.fail("分割宣言ではこの input オプションは使えません", node)
+                            self.fail("分割宣言では行入力は使えません。文字列を1つずつ読むか、行EOF入力を1つの変数に束縛してください", init)
+                        self.fail("分割宣言ではこの input オプションは使えません", init)
                 expected = Type("tuple", (I64,) * len(names)) if init.kind == "call" and init.value == "input" else None
             value = self.expr(node.children[0], expected)
             if value.function:

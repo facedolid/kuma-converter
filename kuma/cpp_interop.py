@@ -1966,15 +1966,15 @@ class CppEmitter:
                 if init.kind == 'call' and init.value == 'input':
                     kwargs = init.extra.get('kwargs', {})
                     if init.children:
-                        self.fail(node, '分割宣言では個数・次元付きの input は使えません')
+                        self.fail(init, '分割宣言では個数・次元付きの input は使えません')
                     if kwargs:
                         if set(kwargs) == {'until', 'mode'}:
-                            self.fail(node, '分割宣言では行EOF入力は使えません。rows := input(mode="line", until=EOF) のように1つの変数に束縛してください')
+                            self.fail(init, '分割宣言では行EOF入力は使えません。rows := input(mode="line", until=EOF) のように1つの変数に束縛してください')
                         if set(kwargs) == {'until'}:
-                            self.fail(node, '分割宣言では until=EOF 入力は使えません。1つの変数に配列として束縛してください')
+                            self.fail(init, '分割宣言では until=EOF 入力は使えません。1つの変数に配列として束縛してください')
                         if set(kwargs) == {'mode'}:
-                            self.fail(node, '分割宣言では行入力は使えません。文字列を1つずつ読むか、行EOF入力を1つの変数に束縛してください')
-                        self.fail(node, '分割宣言ではこの input オプションは使えません')
+                            self.fail(init, '分割宣言では行入力は使えません。文字列を1つずつ読むか、行EOF入力を1つの変数に束縛してください')
+                        self.fail(init, '分割宣言ではこの input オプションは使えません')
                 expected = 'std::tuple<' + ', '.join('long long' for _ in names) + '>'
                 return prefix + 'auto [' + ', '.join(names) + '] = ' + self.expr(node.children[0], expected) + ';'
             return prefix + target + ' ' + self.mark(names[0], node.token) + ' = ' + self.expr(node.children[0], annotation) + ';'
