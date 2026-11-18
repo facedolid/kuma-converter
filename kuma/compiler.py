@@ -2406,8 +2406,6 @@ class Compiler(DeclarationSupport):
             element = CHAR if values.type == STRING else values.type.args[0]
             if not self.ordered_owned_type_supported(element):
                 self.fail("is_unique は対応する順序付き所有値に使ってください", node)
-            if element != F64 and self.ordered_key_features(element)[1]:
-                self.fail("is_unique の組・構造体の要素に f64 は使えません", node)
             return self.ordered([values], BOOL, lambda ns: f"::is_unique({ns[0]})", borrow=True)
         if node.kind == "call" and name == "prime_factorize":
             if len(args) != 1 or node.extra.get("types"):
