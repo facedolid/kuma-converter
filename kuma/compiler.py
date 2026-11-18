@@ -2067,33 +2067,56 @@ class Compiler(DeclarationSupport):
                         "return std::pair<bool, std::vector<int>>{result.has_value(), result.value_or(std::vector<int>{})}; }())")
             return self.ordered([graph], Type("pair", (BOOL, Type("vec", (I32,)))), topo_code, borrow=True)
         if node.kind == "call" and name == "grid_bfs_dist":
-            if kwargs or not 3 <= len(args) <= 4 or node.extra.get("types"):
-                self.fail("grid_bfs_dist(盤面, 行, 列[, 壁文字]) と書いてください", node)
+            if kwargs or not 2 <= len(args) <= 4 or node.extra.get("types"):
+                self.fail("grid_bfs_dist(盤面, 行, 列[, 壁]) または (盤面, 始点配列[, 壁]) と書いてください", node)
             grid = self.expr(args[0])
             if grid.type != Type("vec", (STRING,)):
                 self.fail("grid_bfs_dist の盤面は文字列の配列にしてください", node)
             with self.protect(grid.origins):
-                rest = [self.expr(arg) for arg in args[1:]]
-            if any(value.type not in INTEGER for value in rest[:2]):
-                self.fail("grid_bfs_dist の始点は整数にしてください", node)
-            if len(rest) == 3 and rest[2].type != CHAR:
-                self.fail("grid_bfs_dist の壁は char にしてください", node)
-            if len(rest) == 2:
-                rest.append(Value("'#'", CHAR))
+                # Empty literals have no element type of their own.
+                empty_points = (len(args) <= 3 and args[1].kind == "array" and not args[1].children)
+                point_type = Type("vec", (Type("tuple", (I64, I64)),))
+                rest = [self.expr(args[1], point_type if empty_points else None)]
+                rest += [self.expr(arg) for arg in args[2:]]
+            multiple = len(args) <= 3 and (len(args) == 2 or rest[0].type.name == "vec")
+            if multiple:
+                starts = rest[0].type
+                if (starts.name != "vec" or starts.args[0].name not in ("pair", "tuple")
+                        or len(starts.args[0].args) != 2 or any(t not in INTEGER for t in starts.args[0].args)):
+                    self.fail("grid_bfs_dist の始点配列は整数の組を要素にしてください", node)
+                if len(rest) == 2 and rest[1].type != CHAR:
+                    self.fail("grid_bfs_dist の壁は char にしてください", node)
+                if len(rest) == 1:
+                    rest.append(Value("'#'", CHAR))
+            else:
+                if len(rest) < 2 or any(value.type not in INTEGER for value in rest[:2]):
+                    self.fail("grid_bfs_dist の始点は整数にしてください", node)
+                if len(rest) == 3 and rest[2].type != CHAR:
+                    self.fail("grid_bfs_dist の壁は char にしてください", node)
+                if len(rest) == 2:
+                    rest.append(Value("'#'", CHAR))
             self.uses_graph = True
             def grid_code(ns):
+                setup = (f"const auto& points = {ns[1]}; auto wall = {ns[2]}; " if multiple else
+                         f"auto row = {ns[1]}; auto col = {ns[2]}; auto wall = {ns[3]}; ")
+                source_code = ("std::vector<int> ids; ids.reserve(points.size()); "
+                               "for (const auto& [row, col] : points) { "
+                               "if (row < 0 || static_cast<std::size_t>(row) >= input.size() || col < 0 || static_cast<std::size_t>(col) >= width) "
+                               "throw std::out_of_range(\"grid_bfs_dist: invalid source\"); "
+                               "ids.push_back(static_cast<int>(static_cast<std::size_t>(row) * width + static_cast<std::size_t>(col))); } "
+                               "auto result = ::grid_bfs(input, ids, wall); " if multiple else
+                               "if (row < 0 || static_cast<std::size_t>(row) >= input.size() || col < 0 || static_cast<std::size_t>(col) >= width) "
+                               "throw std::out_of_range(\"grid_bfs_dist: invalid source\"); "
+                               "auto result = ::grid_bfs(input, static_cast<int>(row), static_cast<int>(col), wall); ")
                 return ("([&]() { "
-                        f"const auto& input = {ns[0]}; auto row = {ns[1]}; auto col = {ns[2]}; auto wall = {ns[3]}; "
+                        f"const auto& input = {ns[0]}; " + setup +
                         "if (input.empty() || input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
                         "throw std::out_of_range(\"grid_bfs_dist: invalid height\"); "
                         "std::size_t width = input[0].size(); "
                         "if (width == 0 || width > static_cast<std::size_t>(std::numeric_limits<int>::max()) / input.size()) "
                         "throw std::out_of_range(\"grid_bfs_dist: invalid width or too many cells\"); "
                         "for (const auto& line : input) if (line.size() != width) "
-                        "throw std::invalid_argument(\"grid_bfs_dist: rows must have equal length\"); "
-                        "if (row < 0 || static_cast<std::size_t>(row) >= input.size() || col < 0 || static_cast<std::size_t>(col) >= width) "
-                        "throw std::out_of_range(\"grid_bfs_dist: invalid source\"); "
-                        "auto result = ::grid_bfs(input, static_cast<int>(row), static_cast<int>(col), wall); "
+                        "throw std::invalid_argument(\"grid_bfs_dist: rows must have equal length\"); " + source_code +
                         "std::vector<std::vector<long long>> out(input.size(), std::vector<long long>(width)); "
                         "for (std::size_t r = 0; r < input.size(); ++r) for (std::size_t c = 0; c < width; ++c) { "
                         "auto d = result.dist[r * width + c]; out[r][c] = d == result.inf ? -1 : d; } "
