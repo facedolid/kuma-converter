@@ -77,6 +77,32 @@ class CppParser(InitializerSupport, Parser):
                 if match:
                     self.macro_names.add(match[1])
         self.native_bodies = NativeBodies(self.tokens, self.macro_names)
+        self.input_parameter_bodies = set()
+        # Do not interpret macro-dependent declarations as C++ parameter names.
+        if self.local_input_tracking_safe and not any(
+                t.kind == 'CPP_DIRECTIVE' and re.match(r'#\s*define\b', t.text)
+                for t in self.tokens):
+            types = {'bool', 'char', 'short', 'int', 'long', 'float', 'double',
+                     'signed', 'unsigned', 'const', 'volatile', '*', '&', '&&'}
+            bases = {'bool', 'char', 'short', 'int', 'long', 'float', 'double', 'signed', 'unsigned'}
+            for opening, body in self.native_bodies.functions.items():
+                closing = self.native_bodies.pairs[opening]
+                tokens = [t.text for t in self.tokens[opening + 1:closing] if t.kind != 'NEWLINE']
+                parameters = []
+                current = []
+                for token in tokens + [',']:
+                    if token == ',':
+                        parameters.append(current)
+                        current = []
+                    else:
+                        current.append(token)
+                # Accept only wholly simple declarators, not templates, defaults,
+                # function pointers, attributes or expressions containing commas.
+                simple = all(len(p) >= 2 and self._identifier_text(p[-1])
+                             and set(p[:-1]) <= types and bool(set(p[:-1]) & bases)
+                             for p in parameters)
+                if simple and any(p[-1] == 'input' for p in parameters):
+                    self.input_parameter_bodies.add(body)
         self.native_fields = member_ranges(self.native_bodies)
         self.native_token_indices = {token: index for index, token in enumerate(self.tokens)}
         self.has_native_main = any(self.native_bodies.text(
@@ -97,6 +123,10 @@ class CppParser(InitializerSupport, Parser):
                     and self.native_bodies.text(self.native_bodies.previous.get(name, -1)) != 'operator'):
                 self.native_bare_functions.add(self.tokens[name].text)
         self.bare_functions.update(self.native_bare_functions)
+
+    @staticmethod
+    def _identifier_text(text: str) -> bool:
+        return re.fullmatch(r'[A-Za-z_]\w*', text) is not None
 
     def source_range(self, start: Token, end: Token) -> str:
         a = self.offsets[start.line - 1] + start.column - 1
@@ -189,10 +219,10 @@ class CppParser(InitializerSupport, Parser):
 
     def block(self, header):
         self.depth += 1
-        self.local_input_scopes.append(False)
         look = self.position
         while self.tokens[look].kind == 'NEWLINE':
             look += 1
+        self.local_input_scopes.append(look in self.input_parameter_bodies)
         layout = self.current.kind == 'NEWLINE' and self.tokens[look].text != '{'
         if layout:
             self.layout_headers.append(header.indent)
