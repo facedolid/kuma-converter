@@ -1785,14 +1785,21 @@ class CppEmitter:
                 marker = self.implicit_marker
             target = self.expr(node.children[0])
             value = self.expr(node.children[1])
-            # Field access in decltype is unevaluated, including operator->.
-            # Calls, subscripts and rewritten collection members remain opaque.
+            # These field and variable-index expressions are unevaluated in
+            # decltype, including overloaded operators. Keep calls, complex
+            # indices and rewritten collection members opaque.
             lhs = node.children[0]
-            fields = []
-            while lhs.kind == 'member' and not lhs.extra.get('optional_collection_call'):
-                fields.append(('->' if lhs.extra.get('pointer') else '.') + lhs.value)
-                lhs = lhs.children[0]
-            probe_target = (lhs.value + ''.join(reversed(fields))
+            parts = []
+            while True:
+                if lhs.kind == 'member' and not lhs.extra.get('optional_collection_call'):
+                    parts.append(('->' if lhs.extra.get('pointer') else '.') + lhs.value)
+                    lhs = lhs.children[0]
+                elif lhs.kind == 'index' and lhs.children[1].kind == 'name':
+                    parts.append('[' + lhs.children[1].value + ']')
+                    lhs = lhs.children[0]
+                else:
+                    break
+            probe_target = (lhs.value + ''.join(reversed(parts))
                             if lhs.kind == 'name' else None)
             if (self.vector_input_inference and (not self.vector_input_restrict_scope or self.in_implicit_main
                                                     or self.in_vector_input_function)

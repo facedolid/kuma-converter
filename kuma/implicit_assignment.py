@@ -64,7 +64,7 @@ def resolve_assignments(cpp: str, filename: str, *, compile_commands=None, edits
 
 def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marker, config,
                            runtime_include, declared):
-    """Use a syntax-only C++ probe for vector input names and field chains.
+    """Use a syntax-only C++ probe for eligible vector input targets.
 
     An unrecognized target stays ``long long``. A full candidate translation
     unit must pass before any type is changed. If the first trial fails, a
@@ -74,7 +74,7 @@ def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marke
     """
     from .compile_config import compile_config
     compiler_command, macos_sdk_flags, stop_process_group, root = _probe_dependencies()
-    pattern = re.compile(re.escape(vector_marker) + r'([A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*)*)\*/long long')
+    pattern = re.compile(re.escape(vector_marker) + r'([A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*|\[[A-Za-z_]\w*\])*)\*/long long')
     matches = list(pattern.finditer(cpp))
     if not matches:
         return []
