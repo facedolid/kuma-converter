@@ -1427,6 +1427,14 @@ class CppEmitter:
         """Hook for exact LSP source spans; normal compilation is unchanged."""
         return text
 
+    def mark_declare_name(self, name, node, index):
+        tokens = node.extra.get('name_tokens')
+        if tokens and index < len(tokens) and tokens[index].text == name:
+            return self.mark(name, tokens[index])
+        if index == 0 and node.token.text == name:
+            return self.mark(name, node.token)
+        return name
+
     def fresh(self, hint='value'):
         self.sequence += 1
         return f'kuma_gen_cpp_{self.sequence}_{hint}'
@@ -1481,6 +1489,32 @@ class CppEmitter:
         # Statement bodies may start with a #line directive, which must begin
         # on its own line in generated C++.
         return f'[&]({args}) {{\n' + body + '\n}'
+
+    def split_shaped_input(self, init, names, node):
+        types = init.extra.get('types', [])
+        if len(types) != len(names):
+            self.fail(init, '分割宣言で個数付き input を使うには、変数の数と input<> の型の数を一致させてください')
+        count = self.expr(init.children[0])
+        count_var = self.fresh('input_count')
+        marked = [self.mark_declare_name(name, node, index) for index, name in enumerate(names)]
+        tuple_cpp = 'std::tuple<' + ', '.join('std::vector<' + cpp_type(type_) + '>' for type_ in types) + '>'
+        columns = [self.fresh(f'input_col_{index}') for index in range(len(names))]
+        body = [f'const int kuma_gen_limit = kuma_rt::dimension({count_var});']
+        for column, type_ in zip(columns, types):
+            body.append(f'std::vector<{cpp_type(type_)}> {column}; {column}.reserve(kuma_gen_limit);')
+        body.append('for (int kuma_gen_i = 0; kuma_gen_i < kuma_gen_limit; ++kuma_gen_i) {')
+        for column, type_ in zip(columns, types):
+            body.append(f'{column}.push_back(kuma_rt::read<{cpp_type(type_)}>());')
+        body.append('}')
+        body.append('return std::make_tuple(' + ', '.join(f'std::move({column})' for column in columns) + ');')
+        location = f"{self.filename}:{init.token.line}:{init.token.column}: input: "
+        guarded = ('([&]() { try { return [&]() -> ' + tuple_cpp + ' { ' + ' '.join(body)
+                   + ' }(); } catch (const std::exception& kuma_gen_error) { throw std::runtime_error("'
+                   + location.replace('\\', '\\\\').replace('"', '\\"')
+                   + '" + std::string(kuma_gen_error.what())); } }())')
+        declarations = [f'std::vector<{cpp_type(type_)}> {name};' for name, type_ in zip(marked, types)]
+        return (f'long long {count_var} = {count}; ' + ' '.join(declarations) + ' std::tie('
+                + ', '.join(marked) + ') = ' + guarded + ';')
 
     def input(self, node, expected):
         types = node.extra.get('types', [])
@@ -1966,6 +2000,12 @@ class CppEmitter:
                 if init.kind == 'call' and init.value == 'input':
                     kwargs = init.extra.get('kwargs', {})
                     if init.children:
+                        if not kwargs and len(init.children) == 1 and len(names) > 1:
+                            types = init.extra.get('types', [])
+                            if len(types) != len(names):
+                                self.fail(init, '分割宣言で個数付き input を使うには、変数の数と input<> の型の数を一致させてください')
+                            if len(types) >= 2:
+                                return prefix + self.split_shaped_input(init, names, node)
                         self.fail(init, '分割宣言では個数・次元付きの input は使えません')
                     if kwargs:
                         if set(kwargs) == {'until', 'mode'}:
@@ -2065,6 +2105,12 @@ class CppEmitter:
                     + '\nbool operator==(const ' + node.value + '&) const = default;'
                     + '\nauto operator<=>(const ' + node.value + '&) const = default;\n};')
         self.fail(node, '混在モードで未対応の文です: ' + kind)
+
+
+def split_shaped_input_init(init, name_count: int) -> bool:
+    types = init.extra.get('types', []) if init.extra else []
+    return (init.kind == 'call' and init.value == 'input' and not init.extra.get('kwargs')
+            and len(init.children) == 1 and name_count >= 2 and len(types) == name_count)
 
 
 def mark_optional_collection_calls(nodes, known=None, nested=None):
@@ -2213,6 +2259,9 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
         if node.kind == 'declare':
             known.difference_update(node.value)
             nested.difference_update(node.value)
+            init = node.children[0] if node.children else None
+            if init is not None and len(node.value) > 1 and split_shaped_input_init(init, len(node.value)):
+                known.update(node.value)
             if inferred:
                 known.add(node.value[0])
             if nested_inferred:

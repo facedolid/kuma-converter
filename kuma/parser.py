@@ -192,10 +192,14 @@ class Parser:
         # A short declaration can bind several names, but is never an assignment.
         position = self.position
         if start.kind == "IDENT":
-            names = [self.take().text]
+            first = self.take()
+            names = [first.text]
+            name_tokens = [first]
             while self.accept(","):
                 self.newlines()
-                names.append(self.identifier().text)
+                token = self.identifier()
+                names.append(token.text)
+                name_tokens.append(token)
             if self.accept(":="):
                 self.newlines()
                 value = self.rhs()
@@ -210,7 +214,10 @@ class Parser:
                         raise KumaError("inputの型の数と分割宣言の名前の数を揃えてください", value.token)
                     if len(types) == 1 and types[0] in {"i32", "int", "i64", "ll", "long long", "f64", "double", "bool", "char", "string", "str", "std::string"}:
                         value.extra["types"] = types * len(names)
-                return Node("declare", start, names, [value], {"type": None})
+                extra = {"type": None}
+                if len(names) > 1:
+                    extra["name_tokens"] = name_tokens
+                return Node("declare", start, names, [value], extra)
             self.position = position
 
         if ((self.current.text in _TYPE_NAMES | self.user_types and self.tokens[self.position + 1].text != "(")

@@ -1062,6 +1062,36 @@ class Compiler(DeclarationSupport):
         return ("([&]() { try { return " + code + "; } catch (const std::exception& kuma_gen_error) { "
                 "throw std::runtime_error(" + quote(location) + " + std::string(kuma_gen_error.what())); } }())")
 
+    def split_shaped_input(self, init: Node, names: list[str], node: Node, prefix: str) -> str:
+        types = [self.parse_type(name, init.token) for name in init.extra.get("types", [])]
+        if len(types) != len(names):
+            self.fail("分割宣言で個数付き input を使うには、変数の数と input<> の型の数を一致させてください", init)
+        for type_ in types:
+            if not self.input_type(type_):
+                self.fail("input の長さ指定または基底型を確認してください", init, code="KUMA_SHAPE")
+        count = self.expr(init.children[0])
+        if count.type not in INTEGER:
+            self.fail("input の次元は整数で指定してください", init)
+        count_var = self.fresh("input_count")
+        symbols = [self.bind(name, Type("vec", (type_,)), node) for name, type_ in zip(names, types)]
+        tuple_cpp = "std::tuple<" + ", ".join(f"std::vector<{type_.cpp()}>" for type_ in types) + ">"
+        columns = [self.fresh(f"input_col_{index}") for index in range(len(names))]
+        body = [
+            f"const int kuma_gen_limit = kuma_rt::dimension({count_var});",
+        ]
+        for column, type_ in zip(columns, types):
+            body.append(f"std::vector<{type_.cpp()}> {column}; {column}.reserve(kuma_gen_limit);")
+        body.append("for (int kuma_gen_i = 0; kuma_gen_i < kuma_gen_limit; ++kuma_gen_i) {")
+        for column, type_ in zip(columns, types):
+            body.append(f"{column}.push_back(kuma_rt::read<{type_.cpp()}>());")
+        body.append("}")
+        body.append("return std::make_tuple(" + ", ".join(f"std::move({column})" for column in columns) + ");")
+        tie = ", ".join(symbol.code for symbol in symbols)
+        statements = [f"long long {count_var} = {count.code};"]
+        statements.extend(f"{symbol.type.cpp()} {symbol.code};" for symbol in symbols)
+        statements.append(f"std::tie({tie}) = {self.input_guard('[&]() -> ' + tuple_cpp + ' { ' + ' '.join(body) + ' }()', init)};")
+        return prefix + " ".join(statements)
+
     def aggregate_call(self, node: Node) -> Value:
         name = {"some": "any", "every": "all"}.get(node.value, node.value)
         args = node.children
@@ -2830,6 +2860,12 @@ class Compiler(DeclarationSupport):
                 if init.kind == "call" and init.value == "input":
                     kwargs = init.extra.get("kwargs", {})
                     if init.children:
+                        if not kwargs and len(init.children) == 1 and len(names) > 1:
+                            types = init.extra.get("types", [])
+                            if len(types) != len(names):
+                                self.fail("分割宣言で個数付き input を使うには、変数の数と input<> の型の数を一致させてください", init)
+                            if len(types) >= 2:
+                                return self.split_shaped_input(init, names, node, prefix)
                         self.fail("分割宣言では個数・次元付きの input は使えません", init)
                     if kwargs:
                         if set(kwargs) == {"until", "mode"}:
