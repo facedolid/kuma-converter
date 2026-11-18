@@ -21,6 +21,7 @@ MARKER = '/*kuma_implicit_assignment*/ '
 VECTOR_INPUT_MARKER = '/*kuma_vector_input:'
 MAX_SECONDS = 15.0
 MAX_DECLARATIONS = 32
+MAX_VECTOR_ALTERNATIVES = 4
 
 
 def _probe_dependencies():
@@ -65,11 +66,11 @@ def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marke
                            runtime_include, declared):
     """Use a syntax-only C++ probe for direct-name vector input assignments.
 
-    An unrecognized target stays ``long long``.  All eligible targets are
-    probed together and applied together: a compiler failure, timeout, or
-    termination therefore cannot partially change the generated program.
-    This deliberately avoids guessing members, arbitrary containers, and
-    user-defined conversions.
+    An unrecognized target stays ``long long``. A full candidate translation
+    unit must pass before any type is changed. If the first trial fails, a
+    bounded set of trials may leave one target at its original default. This
+    deliberately avoids guessing members, arbitrary containers, and user-defined
+    conversions.
     """
     from .compile_config import compile_config
     compiler_command, macos_sdk_flags, stop_process_group, root = _probe_dependencies()
@@ -109,31 +110,41 @@ def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marke
     trial_matches = list(pattern.finditer(trial_base))
     if [match[1] for match in trial_matches] != [match[1] for match in matches]:
         return [fallback(match) for match in matches]
-    pieces, last = [], 0
-    for index, match in enumerate(trial_matches):
-        pieces.append(trial_base[last:match.start()])
-        pieces.append(replacement(match) if index in eligible else 'long long')
-        last = match.end()
-    pieces.append(trial_base[last:])
-    trial = ''.join(pieces)
-    try:
-        with tempfile.TemporaryFile() as source:
-            source.write(trial.encode()); source.seek(0)
-            process = subprocess.Popen(command, stdin=source, stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL, cwd=config.directory,
-                                       env=dict(os.environ, LC_ALL='C', LANG='C'),
-                                       start_new_session=os.name != 'nt')
-            try:
-                status = process.wait(timeout=MAX_SECONDS)
-            except BaseException:
-                stop_process_group(process); process.wait()
-                raise
-    except (OSError, subprocess.TimeoutExpired):
-        return [fallback(match) for match in matches]
-    if status != 0:
-        return [fallback(match) for match in matches]
-    return [(match.start(), match.end(), replacement(match)
-             if index in eligible else 'long long') for index, match in enumerate(matches)]
+    # First try the original all-target probe. If it fails, try leaving one
+    # target at its existing default; accept only a complete successful C++
+    # translation unit. Bound retries and wall time for interactive use.
+    candidates = [eligible]
+    if len(eligible) > 1:
+        candidates.extend(eligible - {i} for i in sorted(eligible)[:MAX_VECTOR_ALTERNATIVES])
+    deadline = time.monotonic() + MAX_SECONDS
+    for selected in candidates:
+        pieces, last = [], 0
+        for index, match in enumerate(trial_matches):
+            pieces.append(trial_base[last:match.start()])
+            pieces.append(replacement(match) if index in selected else 'long long')
+            last = match.end()
+        pieces.append(trial_base[last:])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            with tempfile.TemporaryFile() as source:
+                source.write(''.join(pieces).encode()); source.seek(0)
+                process = subprocess.Popen(command, stdin=source, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL, cwd=config.directory,
+                                           env=dict(os.environ, LC_ALL='C', LANG='C'),
+                                           start_new_session=os.name != 'nt')
+                try:
+                    status = process.wait(timeout=remaining)
+                except BaseException:
+                    stop_process_group(process); process.wait()
+                    raise
+        except (OSError, subprocess.TimeoutExpired):
+            break
+        if status == 0:
+            return [(match.start(), match.end(), replacement(match)
+                     if index in selected else 'long long') for index, match in enumerate(matches)]
+    return [fallback(match) for match in matches]
 
 
 def _materialize_declarations(cpp, marker, declared):
