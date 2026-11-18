@@ -2275,6 +2275,10 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
             init = node.children[0] if node.children else None
             if init is not None and len(node.value) > 1 and split_shaped_input_init(init, len(node.value)):
                 known.update(node.value)
+                types = init.extra.get('types', [])
+                for name, type_ in zip(node.value, types):
+                    if cpp_type(type_) == 'std::string':
+                        nested.add(name)
             if inferred:
                 known.add(node.value[0])
             if nested_inferred:
