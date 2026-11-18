@@ -1931,6 +1931,10 @@ def mark_optional_collection_calls(nodes, known=None):
         # Both cpp_collect and cpp_flat_collect always return std::vector.
         if value.kind == 'comprehension':
             return True
+        # These unqualified Kuma calls always lower to eager vector helpers.
+        # Member calls are excluded: a native C++ method takes precedence.
+        if value.kind == 'call' and value.value in {'map', 'filter', 'zip', 'enumerate'}:
+            return True
         if value.kind == 'literal':
             return value.extra.get('type') == 'string'
         if value.kind == 'call' and value.value == 'input':
