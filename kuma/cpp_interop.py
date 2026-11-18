@@ -1938,6 +1938,13 @@ def mark_optional_collection_calls(nodes, known=None):
         if value.kind == 'literal':
             return value.extra.get('type') == 'string'
         if value.kind == 'call' and value.value == 'input':
+            options = value.extra.get('kwargs', {})
+            # These modes return std::string and std::vector respectively,
+            # even without an explicit input element type.
+            if not value.children and set(options) == {'mode'}:
+                return options['mode'].value == '"line"'
+            if not value.children and set(options) == {'until'}:
+                return options['until'].kind == 'name' and options['until'].value == 'EOF'
             return (value.extra.get('types') == ['string']
                     or (bool(value.children) and not value.extra.get('types')))
         return False
