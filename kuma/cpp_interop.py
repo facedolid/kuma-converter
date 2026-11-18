@@ -778,6 +778,8 @@ class CppParser(InitializerSupport, Parser):
                          texts[-1] not in {'return', 'co_return', 'throw', 'else'})
         if not (terminated or complete_call or partial_member or complete_line):
             return None
+        if compound_assign_kuma_slice_member_pattern(visible):
+            return None
         self.position = end
         return Node('cpp_stmt', start, self.source_range(start, part[-1]) + ';',
                     extra={'bare_identifier': not terminated and len(part) == 1 and start.kind == 'IDENT'})
@@ -1315,6 +1317,57 @@ _TYPES = {'i64': 'long long', 'll': 'long long', 'i32': 'int', 'f64': 'double',
 
 _LINE_EOF_SCALAR_TYPES = {'i64', 'i32', 'll', 'int', 'long', 'f64', 'double', 'bool', 'char', 'void'}
 _LINE_EOF_STRING_SPELLINGS = {'string', 'str', 'std::string'}
+
+
+_DECIMAL_SLICE_INTEGER = re.compile(r"^[0-9]+(?:'[0-9]+)*[uUlL]*$")
+
+
+def _integer_number_token(token) -> bool:
+    """Slice bounds accept decimal integer tokens only (not hex/binary/float)."""
+    if token.kind != 'NUMBER':
+        return False
+    return _DECIMAL_SLICE_INTEGER.fullmatch(token.text) is not None
+
+
+def _simple_slice_bound(segment) -> bool:
+    if not segment:
+        return True
+    if len(segment) == 1:
+        return (segment[0].kind == 'IDENT'
+                or (segment[0].kind == 'NUMBER' and _integer_number_token(segment[0])))
+    if len(segment) == 2 and segment[0].text in {'+', '-'}:
+        return segment[1].kind == 'NUMBER' and _integer_number_token(segment[1])
+    return False
+
+
+def compound_assign_kuma_slice_member_pattern(tokens) -> bool:
+    """``lhs +=|-= recv[bounds].size|empty``; bounds are empty, ident, or signed decimal int."""
+    compact = [t for t in tokens if t.kind not in {'NEWLINE', 'EOF'}]
+    if len(compact) < 7:
+        return False
+    if (compact[0].kind != 'IDENT' or compact[1].text not in {'+=', '-='}
+            or compact[2].kind != 'IDENT' or compact[3].text != '['):
+        return False
+    close = next((i for i in range(4, len(compact)) if compact[i].text == ']'), None)
+    if close is None:
+        return False
+    if (close + 2 >= len(compact) or compact[close + 1].text != '.'
+            or compact[close + 2].text not in {'size', 'empty'}):
+        return False
+    tail = compact[close + 3:]
+    if tail and not (len(tail) == 1 and tail[0].text == ';'):
+        return False
+    segments, current = [], []
+    for token in compact[4:close]:
+        if token.text == ':':
+            segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    segments.append(current)
+    if not (2 <= len(segments) <= 3):
+        return False
+    return all(_simple_slice_bound(part) for part in segments)
 
 
 def line_eof_input_allowed(type_names):
