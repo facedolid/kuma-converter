@@ -2408,7 +2408,7 @@ class Compiler(DeclarationSupport):
             if any(value.type not in INTEGER for value in values):
                 self.fail("ceil_div の引数は i32 または i64 にしてください", node)
             return self.ordered(values, I64, lambda ns: f"::ceil_div({ns[0]}, {ns[1]})")
-        if node.kind == "call" and name == "mex":
+        if node.kind in ("call", "method") and name == "mex":
             if len(args) != 1 or node.extra.get("types"):
                 self.fail("mex(整数配列) と書いてください", node)
             values = self.expr(args[0])
