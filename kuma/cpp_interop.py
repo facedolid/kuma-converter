@@ -83,9 +83,6 @@ class CppParser(InitializerSupport, Parser):
             t.kind == 'CPP_DIRECTIVE' and re.match(r'#\s*define\b', t.text)
             for t in self.tokens)
         if self.simple_input_binding_safe:
-            types = {'bool', 'char', 'short', 'int', 'long', 'float', 'double',
-                     'signed', 'unsigned', 'const', 'volatile', '*', '&', '&&'}
-            bases = {'bool', 'char', 'short', 'int', 'long', 'float', 'double', 'signed', 'unsigned'}
             for opening, body in self.native_bodies.functions.items():
                 closing = self.native_bodies.pairs[opening]
                 tokens = [t.text for t in self.tokens[opening + 1:closing] if t.kind != 'NEWLINE']
@@ -97,12 +94,9 @@ class CppParser(InitializerSupport, Parser):
                         current = []
                     else:
                         current.append(token)
-                # Accept only wholly simple declarators, not templates, defaults,
-                # function pointers, attributes or expressions containing commas.
-                simple = all(len(p) >= 2 and self._identifier_text(p[-1])
-                             and set(p[:-1]) <= types and bool(set(p[:-1]) & bases)
-                             for p in parameters)
-                if simple and any(p[-1] == 'input' for p in parameters):
+                tracked = [p for p in parameters if p]
+                if (tracked and all(CppParser._cpp_parameter_trackable(p) for p in tracked)
+                        and any(CppParser._cpp_parameter_binds_input(p) for p in tracked)):
                     self.input_parameter_bodies.add(body)
         self.native_fields = member_ranges(self.native_bodies)
         self.native_token_indices = {token: index for index, token in enumerate(self.tokens)}
@@ -128,6 +122,41 @@ class CppParser(InitializerSupport, Parser):
     @staticmethod
     def _identifier_text(text: str) -> bool:
         return re.fullmatch(r'[A-Za-z_]\w*', text) is not None
+
+    @staticmethod
+    def _cpp_parameter_type_shape(head: list[str]) -> bool:
+        if not head:
+            return False
+        types = {'bool', 'char', 'short', 'int', 'long', 'float', 'double',
+                 'signed', 'unsigned', 'const', 'volatile', '*', '&', '&&'}
+        bases = {'bool', 'char', 'short', 'int', 'long', 'float', 'double', 'signed', 'unsigned'}
+        if set(head) <= types and bool(set(head) & bases):
+            return True
+        i = 0
+        while i < len(head) and head[i] in {'const', 'volatile'}:
+            i += 1
+        if i >= len(head) or not CppParser._identifier_text(head[i]):
+            return False
+        i += 1
+        while i < len(head) and head[i] == '::':
+            if i + 1 >= len(head) or not CppParser._identifier_text(head[i + 1]):
+                return False
+            i += 2
+        while i < len(head) and head[i] in {'*', '&', '&&'}:
+            i += 1
+        return i == len(head)
+
+    @staticmethod
+    def _cpp_parameter_trackable(param: list[str]) -> bool:
+        if '=' in param or '(' in param or '<' in param:
+            return False
+        if len(param) < 2 or not CppParser._identifier_text(param[-1]):
+            return False
+        return CppParser._cpp_parameter_type_shape(param[:-1])
+
+    @staticmethod
+    def _cpp_parameter_binds_input(param: list[str]) -> bool:
+        return (CppParser._cpp_parameter_trackable(param) and param[-1] == 'input')
 
     def source_range(self, start: Token, end: Token) -> str:
         a = self.offsets[start.line - 1] + start.column - 1
