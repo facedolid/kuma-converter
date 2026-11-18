@@ -1784,13 +1784,16 @@ class CppEmitter:
                 marker = self.implicit_marker
             target = self.expr(node.children[0])
             value = self.expr(node.children[1])
-            # C++ resolves the target name, including aliases and local shadowing.
-            # Keep a probe-only marker so implicit_assignment can replace the
-            # default vector element type only after that resolution proves the
-            # target is an ordinary std::vector.
+            # Only a name or a direct field of a named object is safe to put
+            # into decltype without introducing another runtime evaluation.
+            lhs = node.children[0]
+            probe_target = lhs.value if lhs.kind == 'name' else None
+            if (lhs.kind == 'member' and not lhs.extra.get('pointer') and
+                    lhs.children[0].kind == 'name'):
+                probe_target = lhs.children[0].value + '.' + lhs.value
             if (self.vector_input_inference and (not self.vector_input_restrict_scope or self.in_implicit_main
                                                     or self.in_vector_input_function)
-                    and node.value == '=' and node.children[0].kind == 'name'
+                    and node.value == '=' and probe_target is not None
                     and node.children[1].kind == 'call'
                     and node.children[1].value == 'input'
                     and not node.children[1].extra.get('types')
@@ -1798,7 +1801,7 @@ class CppEmitter:
                     and not node.children[1].extra.get('kwargs')):
                 value = value.replace('kuma_rt::read_vec<long long>',
                                       'kuma_rt::read_vec<' + self.vector_input_marker
-                                      + node.children[0].value + '*/long long>', 1)
+                                      + probe_target + '*/long long>', 1)
             return prefix + marker + target + ' ' + node.value + ' ' + value + ';'
         if kind == 'exprstmt': return prefix + self.expr(node.children[0]) + ';'
         if kind in {'return', 'break', 'continue'}:
