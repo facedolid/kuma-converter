@@ -2181,6 +2181,16 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_mem
             return nested_collection(value.children[0])
         if (value.kind == 'method' and value.value == 'filter' and value.children):
             return nested_collection(value.children[0])
+        if (value.kind == 'method' and value.value == 'map'
+                and len(value.children) == 2 and value.children[1].kind == 'lambda'):
+            mapper = value.children[1]
+            params = mapper.extra.get('params', ())
+            if (len(params) == 1 and params[0][1] is None and mapper.extra.get('expression')):
+                var = params[0][0]
+                body = mapper.children[0] if mapper.children else None
+                if (body is not None and body.kind == 'name' and body.value == var
+                        and nested_collection(value.children[0])):
+                    return True
         if value.kind == 'slice' and value.children:
             return nested_collection(value.children[0])
         if value.kind != 'call' or value.value != 'input':
