@@ -499,6 +499,12 @@ class CppParser(InitializerSupport, Parser):
                                 self.source_range(self.tokens[start], self.tokens[end - 1]))
                 name = layout.previous.get(cursor, -1)
                 node.extra['main'] = name >= 0 and self.tokens[name].text == 'main'
+                # This path is a top-level native function definition. A
+                # qualified declarator may instead be an out-of-class method.
+                before_name = layout.previous.get(name, -1)
+                node.extra['independent_function'] = (name >= 0 and self.tokens[name].kind == 'IDENT' and
+                    layout.text(before_name) not in {'::', '.', '->', '~', 'operator'} and
+                    all(t.text != 'auto' for t in self.tokens[start:opening]))
                 return node
             if text in {';', '{', '}', '=', ':=', '=>'} or self.tokens[cursor].kind in {'EOF', 'CPP_DIRECTIVE'}:
                 return None
@@ -1237,7 +1243,9 @@ class CppEmitter:
         self.vector_input_marker = '/*kuma_vector_input:'
         self.implicit_assignments = False
         self.vector_input_inference = False
-        self.vector_input_main_only = False
+        self.vector_input_restrict_scope = False
+        self.in_vector_input_function = False
+        self.native_island_depth = 0
         self.implicit_bare_names = False
         self.in_implicit_main = False
         self.skip_bare_line = None
@@ -1721,10 +1729,15 @@ class CppEmitter:
                 self.expr(c, native=True) for c in node.children) + ');'
         if kind == 'cpp_opaque_sections':
             previous = self.in_implicit_main
+            previous_input_function = self.in_vector_input_function
             self.in_implicit_main = node.extra.get('main', False)
+            self.in_vector_input_function = bool(node.extra.get('independent_function'))
+            self.native_island_depth += 1
             try:
                 body = self.native_sections(node)
             finally:
+                self.native_island_depth -= 1
+                self.in_vector_input_function = previous_input_function
                 self.in_implicit_main = previous
             return prefix + body
         if kind == 'cpp_try':
@@ -1741,11 +1754,15 @@ class CppEmitter:
             return result
         if kind in {'cpp_main', 'cpp_function_body', 'cpp_loop'}:
             previous = self.in_implicit_main
+            previous_input_function = self.in_vector_input_function
             if kind != 'cpp_loop':
                 self.in_implicit_main = kind == 'cpp_main'
+                self.in_vector_input_function = (self.native_island_depth == 0 and
+                                                 not re.search(r'\bauto\b', node.value))
             try:
                 body = self.statements(node.extra['body'])
             finally:
+                self.in_vector_input_function = previous_input_function
                 self.in_implicit_main = previous
             return prefix + self.mark(node.value, node.token) + ' {\n' + body + '\n}'
         if kind == 'cpp_binding': return prefix + node.value + ' = ' + self.expr(node.children[0]) + ';'
@@ -1771,7 +1788,8 @@ class CppEmitter:
             # Keep a probe-only marker so implicit_assignment can replace the
             # default vector element type only after that resolution proves the
             # target is an ordinary std::vector.
-            if (self.vector_input_inference and (not self.vector_input_main_only or self.in_implicit_main)
+            if (self.vector_input_inference and (not self.vector_input_restrict_scope or self.in_implicit_main
+                                                    or self.in_vector_input_function)
                     and node.value == '=' and node.children[0].kind == 'name'
                     and node.children[1].kind == 'call'
                     and node.children[1].value == 'input'
@@ -1805,7 +1823,13 @@ class CppEmitter:
             return prefix + f'for (long long {name}=0, {limit}=kuma_rt::count({self.expr(node.children[0])}); {name}<{limit}; ++{name}) {{\n' + self.statements(node.extra['body']) + '\n}'
         if kind == 'function':
             params = ', '.join(cpp_type(t) + ' ' + name for name, t in node.extra['params'])
-            return prefix + cpp_type(node.extra['result']) + ' ' + node.value + '(' + params + ') {\n' + self.statements(node.extra['body']) + '\n}'
+            previous_input_function = self.in_vector_input_function
+            self.in_vector_input_function = self.native_island_depth == 0
+            try:
+                body = self.statements(node.extra['body'])
+            finally:
+                self.in_vector_input_function = previous_input_function
+            return prefix + cpp_type(node.extra['result']) + ' ' + node.value + '(' + params + ') {\n' + body + '\n}'
         if kind == 'record':
             fields = '\n'.join(cpp_type(f.extra['type']) + ' ' + ', '.join(f.value) + ';' for f in node.extra['fields'])
             names = ', '.join(name for field in node.extra['fields'] for name in field.value)
@@ -1970,9 +1994,10 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
                 emitter.sorted_key_ambiguous.add(name)
         if definitions != 1 or any(token.kind == 'CPP_DIRECTIVE' and re.search(r'\b' + re.escape(name) + r'\b', token.text) for token in parser.tokens):
             emitter.sorted_key_ambiguous.add(name)
-    # Class bodies remain opaque; only probe simple targets in main when a
-    # class is present. Templates and preprocessing still disable the probe.
-    emitter.vector_input_main_only = any(t.text == 'class' for t in parser.tokens)
+    # Class bodies remain opaque; only probe simple targets in main and
+    # independent functions when a class is present. Templates and
+    # preprocessing still disable the probe.
+    emitter.vector_input_restrict_scope = any(t.text == 'class' for t in parser.tokens)
     emitter.vector_input_inference = emitter.implicit_assignments and not any(
         t.text == 'template' or
         (t.kind == 'CPP_DIRECTIVE' and re.match(r'#\s*(if|ifdef|ifndef|define)\b', t.text))
