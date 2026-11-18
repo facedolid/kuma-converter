@@ -2213,6 +2213,33 @@ def _cpp_stmt_masked_members(tokens):
     return frozenset(masked)
 
 
+def _string_scalar_assign_rhs_atom(token, string_scalars: set[str]) -> bool:
+    if token.kind == 'STRING':
+        return True
+    return token.kind == 'IDENT' and token.text in string_scalars
+
+
+def _cpp_stmt_preserves_string_scalar_tracking(text: str, string_scalars: set[str]) -> bool:
+    """Conservative: lhs in string_scalars and rhs is literal, known name, or name/+ only."""
+    if not string_scalars:
+        return False
+    try:
+        compact = [t for t in lex(text, cpp=True) if t.kind not in {'NEWLINE', 'EOF'}]
+    except KumaError:
+        return False
+    if len(compact) < 4 or compact[0].kind != 'IDENT' or compact[1].text != '=' or compact[-1].text != ';':
+        return False
+    if compact[0].text not in string_scalars:
+        return False
+    rhs = compact[2:-1]
+    if len(rhs) == 1:
+        return _string_scalar_assign_rhs_atom(rhs[0], string_scalars)
+    if len(rhs) != 3 or rhs[1].text != '+':
+        return False
+    return (_string_scalar_assign_rhs_atom(rhs[0], string_scalars)
+            and _string_scalar_assign_rhs_atom(rhs[2], string_scalars))
+
+
 def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None,
                                    string_scalars=None, *, masked_members=frozenset()):
     """Conservative lexical proof for mixed-mode zero-argument calls.
@@ -2435,6 +2462,9 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None,
                 continue
         if node.kind.startswith('cpp_'):
             # No inference across unknown native declarations/macros/scopes.
+            if (node.kind == 'cpp_stmt' and string_scalars
+                    and _cpp_stmt_preserves_string_scalar_tracking(node.value, string_scalars)):
+                continue
             known.clear()
             nested.clear()
             ranges.clear()
