@@ -2010,6 +2010,28 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
     def nested_collection(value):
         if value.kind == 'name':
             return value.value in nested
+        if value.kind == 'array' and value.children:
+            # A single nested vector may select vector's copy deduction guide,
+            # making the result a vector of scalars instead of a matrix.
+            strings = all(c.kind == 'literal' and c.extra.get('type') == 'string'
+                          for c in value.children)
+            arrays = len(value.children) > 1 and all(c.kind == 'array' and c.children
+                                                     for c in value.children)
+            return strings or arrays
+        if value.kind == 'comprehension':
+            clauses = value.extra.get('clauses', [])
+            if not clauses or clauses[0].kind != 'comp_for':
+                return False
+            if any(clause.kind != 'comp_if' for clause in clauses[1:]):
+                return False
+            pattern = clauses[0].extra.get('pattern')
+            if pattern is None or pattern.kind != 'bind_name':
+                return False
+            var = pattern.value
+            body = value.children[0] if value.children else None
+            if body is None or body.kind != 'name' or body.value != var:
+                return False
+            return nested_collection(clauses[0].children[0])
         if value.kind != 'call' or value.value != 'input':
             return False
         types = value.extra.get('types', [])
