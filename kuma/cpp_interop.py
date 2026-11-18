@@ -78,10 +78,11 @@ class CppParser(InitializerSupport, Parser):
                     self.macro_names.add(match[1])
         self.native_bodies = NativeBodies(self.tokens, self.macro_names)
         self.input_parameter_bodies = set()
-        # Do not interpret macro-dependent declarations as C++ parameter names.
-        if self.local_input_tracking_safe and not any(
-                t.kind == 'CPP_DIRECTIVE' and re.match(r'#\s*define\b', t.text)
-                for t in self.tokens):
+        # Do not interpret macro-dependent declarations as C++ binding names.
+        self.simple_input_binding_safe = self.local_input_tracking_safe and not any(
+            t.kind == 'CPP_DIRECTIVE' and re.match(r'#\s*define\b', t.text)
+            for t in self.tokens)
+        if self.simple_input_binding_safe:
             types = {'bool', 'char', 'short', 'int', 'long', 'float', 'double',
                      'signed', 'unsigned', 'const', 'volatile', '*', '&', '&&'}
             bases = {'bool', 'char', 'short', 'int', 'long', 'float', 'double', 'signed', 'unsigned'}
@@ -1144,8 +1145,31 @@ class CppParser(InitializerSupport, Parser):
                     and not any(token.text in {';', ':'} for token in self.tokens[opening + 1:closing])):
                 return super().statement()
             self.take()
+            opening = self.position
             header = self.group('(', ')')
-            return Node('cpp_for', start, header, extra={'body': self.block(start)})
+            # Only unambiguous simple C++ bindings are tracked. The loop's
+            # scope includes its body but not the following statement.
+            prefix = []
+            for token in self.tokens[opening + 1:self.position - 1]:
+                if token.kind == 'NEWLINE':
+                    continue
+                if token.text in {'=', ';', ':'}:
+                    break
+                prefix.append(token.text)
+            types = {'auto', 'bool', 'char', 'short', 'int', 'long', 'float', 'double',
+                     'signed', 'unsigned', 'const', 'volatile', '*', '&', '&&'}
+            bases = types - {'const', 'volatile', '*', '&', '&&'}
+            has_input = (self.simple_input_binding_safe and len(prefix) >= 2
+                         and prefix[-1] == 'input' and set(prefix[:-1]) <= types
+                         and bool(set(prefix[:-1]) & bases))
+            if has_input:
+                self.local_input_scopes.append(True)
+            try:
+                body = self.block(start)
+            finally:
+                if has_input:
+                    self.local_input_scopes.pop()
+            return Node('cpp_for', start, header, extra={'body': body})
         if start.text not in {'if', 'while', 'rep', 'for', 'return', 'break', 'continue', 'else', 'fn', 'struct', *_BARE_CALLS}:
             # Do not confuse := or a short arrow with a native declaration.
             if start.kind == 'IDENT' and self.tokens[self.position + 1].text not in {':=', ',', '=>'}:
