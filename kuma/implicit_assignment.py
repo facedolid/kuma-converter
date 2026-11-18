@@ -74,7 +74,7 @@ def _resolve_vector_inputs(cpp, filename, compile_commands, marker, vector_marke
     """
     from .compile_config import compile_config
     compiler_command, macos_sdk_flags, stop_process_group, root = _probe_dependencies()
-    pattern = re.compile(re.escape(vector_marker) + r'([A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*|\[[A-Za-z_]\w*\])*)\*/long long')
+    pattern = re.compile(re.escape(vector_marker) + r"([A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*|\[(?:[A-Za-z_]\w*|[0-9][0-9']*LL)\])*)\*/long long")
     matches = list(pattern.finditer(cpp))
     if not matches:
         return []

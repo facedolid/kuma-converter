@@ -1856,6 +1856,13 @@ class CppEmitter:
                 elif lhs.kind == 'index' and lhs.children[1].kind == 'name':
                     parts.append('[' + lhs.children[1].value + ']')
                     lhs = lhs.children[0]
+                elif (lhs.kind == 'index' and lhs.children[1].kind == 'literal'
+                      and lhs.children[1].extra.get('type') == 'i64'
+                      and re.fullmatch(r"[0-9][0-9']*", lhs.children[1].value)):
+                    # Match the actual mixed emitter's LL suffix: C++ may have
+                    # different operator[] overloads for int and long long.
+                    parts.append('[' + lhs.children[1].value + 'LL]')
+                    lhs = lhs.children[0]
                 else:
                     break
             probe_target = (lhs.value + ''.join(reversed(parts))
