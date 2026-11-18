@@ -53,7 +53,7 @@ def uses_cpp(source: str) -> bool:
     return False
 
 
-from .cpp_initializers import InitializerSupport, member_ranges
+from .cpp_initializers import InitializerSupport, captureless_lambda_return, member_ranges
 
 
 class CppParser(InitializerSupport, Parser):
@@ -1907,7 +1907,10 @@ class CppEmitter:
                     if value.kind == 'lambda':
                         args = ', '.join(f'{cpp_type(t) if t else "auto"} {n}'
                                          for n, t in value.extra['params'])
-                        closure = '[](' + args + ') { return ' + self.expr(value.children[0]) + '; }'
+                        returned = captureless_lambda_return(value)
+                        if returned is None:
+                            self.fail(value, 'このフィールド初期化には型を明示してください（例: int value := 式;）')
+                        closure = '[](' + args + ') { return ' + self.expr(returned) + '; }'
                     else:
                         closure = self.expr(value)
                     terminator = self.mark(';', extra['closing']) if extra['closing'] else ';'

@@ -210,6 +210,23 @@ def inferred_field_safe(node: Node) -> bool:
             and all(inferred_field_safe(child) for child in node.extra.get('kwargs', {}).values()))
 
 
+def captureless_lambda_return(node: Node) -> Node | None:
+    """Return the single expression for a field arrow, if the body is provably one."""
+    if node.kind != 'lambda':
+        return None
+    if node.extra.get('return_expression') is not None:
+        return node.extra['return_expression']
+    if node.extra.get('expression'):
+        return node.children[0] if node.children else None
+    body = node.extra.get('body') or ()
+    if len(body) != 1:
+        return None
+    stmt = body[0]
+    if stmt.kind == 'return' and len(stmt.children) == 1:
+        return stmt.children[0]
+    return None
+
+
 def captureless_field_closure(node: Node) -> bool:
     """Prove an arrow needs no capture, or accept an explicitly empty C++ [].
 
@@ -218,7 +235,10 @@ def captureless_field_closure(node: Node) -> bool:
     """
     if node.extra.get('captureless_lambda'):
         return True
-    if node.kind != 'lambda' or not node.extra.get('expression'):
+    if node.kind != 'lambda':
+        return False
+    returned = captureless_lambda_return(node)
+    if returned is None:
         return False
 
     def names(pattern):
@@ -243,10 +263,40 @@ def captureless_field_closure(node: Node) -> bool:
         return (all(closed(child, bound) for child in expr.children)
                 and all(closed(child, bound) for child in expr.extra.get('kwargs', {}).values()))
 
-    return closed(node.children[0], {name for name, _ in node.extra['params']})
+    return closed(returned, {name for name, _ in node.extra['params']})
 
 
 class InitializerSupport:
+    def attach_lambda_return_expression(self, node: Node) -> None:
+        """Parse a single return expression from native `cpp_stmt` bodies in place."""
+        if node.kind != 'lambda' or node.extra.get('expression'):
+            return
+        body = node.extra.get('body') or ()
+        if len(body) != 1 or body[0].kind != 'cpp_stmt':
+            return
+        stmt = body[0]
+        if not stmt.value.lstrip().startswith('return'):
+            return
+        index = next((i for i, token in enumerate(self.tokens)
+                      if token.line == stmt.token.line and token.column == stmt.token.column), None)
+        if index is None or self.tokens[index].text != 'return':
+            return
+        saved, depth, splits = self.position, self.group_depth, len(self.type_splits)
+        try:
+            self.position = index + 1
+            self.soft_newlines()
+            if self.current.text == ';':
+                return
+            expr = self.expression()
+            self.soft_newlines()
+            if self.current.text != ';':
+                return
+            node.extra['return_expression'] = expr
+        except KumaError:
+            return
+        finally:
+            self.restore_type_trial(saved, depth, splits)
+
     def field_initializer(self, start: int, member: MemberRange) -> Node | None:
         closing = member.end
         saved, depth, splits = self.position, self.group_depth, len(self.type_splits)
@@ -301,6 +351,8 @@ class InitializerSupport:
             self.group_depth = 1
             self.soft_newlines()
             value = self.rhs()
+            if annotation is None:
+                self.attach_lambda_return_expression(value)
             self.soft_newlines()
             if self.position != closing:
                 raise KumaError('Kumaのフィールド初期化は一つずつ宣言してください',
