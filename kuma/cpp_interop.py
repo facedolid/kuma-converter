@@ -1378,16 +1378,23 @@ class CppEmitter:
         args = [self.expr(c) for c in node.children]
         kw = node.extra.get('kwargs', {})
         self.options(node, kw, {'until', 'mode'})
+        # Placeholder declarations acquire their type from the generated input
+        # expression; they are not concrete types usable inside decltype helpers.
+        placeholder = bool(expected and re.fullmatch(
+            r'(?:(?:const|volatile)\s+)*auto(?:\s+(?:const|volatile))*\s*(?:&&?)?',
+            expected.strip()))
+        concrete_expected = bool(expected and not placeholder)
         if types:
             type_ = cpp_type(types[0]) if len(types) == 1 else 'std::tuple<' + ', '.join(map(cpp_type, types)) + '>'
-        elif expected and expected != 'auto':
+        elif concrete_expected:
             type_ = f'std::remove_cvref_t<{cpp_type(expected)}>'
             for _ in args:
                 type_ = f'typename std::remove_cvref_t<{type_}>::value_type'
         else: type_ = 'long long'
         if 'until' in kw:
             if args or len(kw) != 1 or kw['until'].value != 'EOF': self.fail(node, 'until=EOF は固定個数や他のオプションと併用できません')
-            if expected and not types: type_ = f'typename {cpp_type(expected)}::value_type'
+            if concrete_expected and not types:
+                type_ = f'typename std::remove_cvref_t<{cpp_type(expected)}>::value_type'
             return f'kuma_rt::read_all<{type_}>()'
         if 'mode' in kw:
             if args or kw['mode'].value != '"line"': self.fail(node, '混在モードのmodeは mode="line" の単一行入力です')
