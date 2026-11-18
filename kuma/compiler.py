@@ -998,7 +998,7 @@ class Compiler(DeclarationSupport):
             if mode.kind != "literal" or mode.extra.get("type") != "string" or ast.literal_eval(mode.value) != "line":
                 self.fail('mode は文字列リテラル "line" にしてください', node)
             if explicit and explicit != STRING:
-                self.fail('行EOF入力は input<string>(mode="line", until=EOF) と書いてください', node)
+                self.fail('行EOF入力は input(mode="line", until=EOF) または input<string> / input<str> と書いてください', node)
             if expected and expected != Type("vec", (STRING,)):
                 self.fail("行EOF入力の結果は string の配列です", node)
             return Value(self.input_guard("kuma_rt::read_all_lines()", node), Type("vec", (STRING,)))
