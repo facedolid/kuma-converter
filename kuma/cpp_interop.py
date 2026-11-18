@@ -2179,6 +2179,8 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_mem
         if (value.kind == 'call' and value.value in {'filter', 'sorted', 'reversed'}
                 and value.children):
             return nested_collection(value.children[0])
+        if (value.kind == 'method' and value.value == 'filter' and value.children):
+            return nested_collection(value.children[0])
         if value.kind == 'slice' and value.children:
             return nested_collection(value.children[0])
         if value.kind != 'call' or value.value != 'input':
@@ -2207,8 +2209,15 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_mem
         # Both cpp_collect and cpp_flat_collect always return std::vector.
         if value.kind == 'comprehension':
             return True
-        # These unqualified Kuma calls always lower to eager vector helpers.
-        # Member calls are excluded: a native C++ method takes precedence.
+        if (value.kind == 'method' and value.value in {'map', 'filter'}
+                and value.children):
+            receiver = value.children[0]
+            if receiver.kind == 'binary' and receiver.value == '..':
+                return True
+            return collection(receiver)
+        # Unqualified Kuma calls always lower to eager vector helpers.
+        # Method chains count only when the receiver is already proven; other
+        # member spellings are left to native C++ (e.g. a custom View::map).
         if value.kind == 'call' and value.value in {'map', 'filter', 'zip', 'enumerate'}:
             return True
         if (value.kind == 'call' and value.value in {'sorted', 'reversed'}
