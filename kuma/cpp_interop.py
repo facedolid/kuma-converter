@@ -2402,6 +2402,20 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, 
                 for name, type_ in zip(node.value, types):
                     if cpp_type(type_) == 'std::string':
                         nested.add(name)
+            if (init is not None and len(node.value) > 1
+                    and init.kind == 'call' and init.value == 'input'
+                    and not init.extra.get('kwargs') and not init.children):
+                types = init.extra.get('types', [])
+                if types:
+                    if len(types) == len(node.value):
+                        per_name = types
+                    elif len(types) == 1 and cpp_type(types[0]) == 'std::string':
+                        per_name = types * len(node.value)
+                    else:
+                        per_name = ()
+                    for name, type_ in zip(node.value, per_name):
+                        if cpp_type(type_) == 'std::string':
+                            known.add(name)
             if inferred:
                 known.add(node.value[0])
             if nested_inferred:
