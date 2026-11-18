@@ -1285,7 +1285,40 @@ _TYPES = {'i64': 'long long', 'll': 'long long', 'i32': 'int', 'f64': 'double',
 
 
 def cpp_type(text):
-    return re.sub(r'(?<![:\w])(?:' + '|'.join(_TYPES) + r')\b', lambda m: _TYPES[m.group()], text)
+    # Keep the common type-only path cheap. Literals, comments and whitespace
+    # after :: need token-aware handling to preserve C++ meaning.
+    if (not any(c in text for c in ("\"", "'", '/', '\\'))
+            and not re.search(r'::\s|::template\b|\b(?:sizeof|decltype|noexcept|alignof|typeid)\s*\(', text)):
+        return re.sub(r'(?<![:\w])(?:' + '|'.join(_TYPES) + r')\b',
+                      lambda m: _TYPES[m.group()], text)
+    try:
+        tokens = lex(text, cpp=True)
+    except KumaError:
+        return text
+    starts = [0]
+    for line in text.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    changes = []
+    previous = None
+    before_previous = None
+    expression_parens = []
+    for token in tokens:
+        if token.kind in {'NEWLINE', 'EOF'}:
+            continue
+        if token.text == '(':
+            expression_parens.append(bool(expression_parens and expression_parens[-1])
+                                     or previous in {'sizeof', 'decltype', 'noexcept', 'alignof', 'typeid'})
+        elif token.text == ')' and expression_parens:
+            expression_parens.pop()
+        if (token.kind == 'IDENT' and token.text in _TYPES and previous != '::'
+                and not (previous == 'template' and before_previous == '::')
+                and not (expression_parens and expression_parens[-1])):
+            start = starts[token.line - 1] + token.column - 1
+            changes.append((start, start + len(token.text), _TYPES[token.text]))
+        before_previous, previous = previous, token.text
+    for start, end, replacement in reversed(changes):
+        text = text[:start] + replacement + text[end:]
+    return text
 
 
 class CppEmitter:
