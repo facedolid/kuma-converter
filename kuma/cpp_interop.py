@@ -1997,7 +1997,7 @@ class CppEmitter:
         self.fail(node, '混在モードで未対応の文です: ' + kind)
 
 
-def mark_optional_collection_calls(nodes, known=None):
+def mark_optional_collection_calls(nodes, known=None, nested=None):
     """Conservative lexical proof for mixed-mode zero-argument calls.
 
     Only auto-bound Kuma vector/string values qualify. Opaque C++ discards
@@ -2005,10 +2005,24 @@ def mark_optional_collection_calls(nodes, known=None):
     fields (including bit-fields) are never routed through a value helper.
     """
     known = set(known or ())
+    nested = set(nested or ())
+
+    def nested_collection(value):
+        if value.kind == 'name':
+            return value.value in nested
+        if value.kind != 'call' or value.value != 'input' or value.extra.get('kwargs'):
+            return False
+        types = value.extra.get('types', [])
+        return (len(value.children) == 2
+                or (len(value.children) == 1 and len(types) == 1
+                    and cpp_type(types[0]) == 'std::string'))
 
     def collection(value):
         if value.kind == 'name':
             return value.value in known
+        if (value.kind == 'index' and value.children[0].kind == 'name'
+                and value.children[0].value in nested):
+            return True
         if value.kind == 'array':
             return bool(value.children)
         # Both cpp_collect and cpp_flat_collect always return std::vector.
@@ -2055,6 +2069,7 @@ def mark_optional_collection_calls(nodes, known=None):
         if node.kind.startswith('cpp_'):
             # No inference across unknown native declarations/macros/scopes.
             known.clear()
+            nested.clear()
             if node.kind == 'cpp_opaque_sections':
                 for section in node.extra.get('sections', []):
                     if section[0] not in {'raw', 'expression', 'field'}:
@@ -2065,19 +2080,26 @@ def mark_optional_collection_calls(nodes, known=None):
                 for _, body in node.extra.get('handlers', []):
                     mark_optional_collection_calls(body)
             continue
-        inferred = (node.kind == 'declare' and len(node.value) == 1
-                    and not node.extra.get('type') and collection(node.children[0]))
+        candidate = (node.kind == 'declare' and len(node.value) == 1
+                     and not node.extra.get('type'))
+        inferred = candidate and collection(node.children[0])
+        nested_inferred = candidate and nested_collection(node.children[0])
         for child in node.children:
             expression(child, known)
         if node.kind == 'declare':
             known.difference_update(node.value)
+            nested.difference_update(node.value)
             if inferred:
                 known.add(node.value[0])
+            if nested_inferred:
+                nested.add(node.value[0])
         for key in ('body', 'else'):
             # Conditions cannot declare locals in Kuma; loop/function bindings
             # can. Their scopes deliberately start fresh until fully resolved.
+            scoped = node.kind in {'if', 'while'}
             mark_optional_collection_calls(node.extra.get(key, []),
-                                           known if node.kind in {'if', 'while'} else None)
+                                           known if scoped else None,
+                                           nested if scoped else None)
 
 
 def checked_tuple_key_functions(nodes, tokens, source, filename):
