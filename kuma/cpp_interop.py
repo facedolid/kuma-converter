@@ -1288,13 +1288,42 @@ def cpp_type(text):
     # Keep the common type-only path cheap. Literals, comments and whitespace
     # after :: need token-aware handling to preserve C++ meaning.
     if (not any(c in text for c in ("\"", "'", '/', '\\'))
-            and not re.search(r'::\s|::template\b|\b(?:sizeof|decltype|noexcept|alignof|typeid)\s*\(', text)):
+            and not re.search(r'::\s|::template\b|\bstd\s*::\s*array\s*<|\b(?:sizeof|decltype|noexcept|alignof|typeid)\s*\(', text)):
         return re.sub(r'(?<![:\w])(?:' + '|'.join(_TYPES) + r')\b',
                       lambda m: _TYPES[m.group()], text)
     try:
         tokens = lex(text, cpp=True)
     except KumaError:
         return text
+    tokens = [token for token in tokens if token.kind not in {'NEWLINE', 'EOF'}]
+    # In std::array<T, N>, a single identifier for N is a value, not a
+    # Kuma type alias. Do not guess more complex or user-defined templates.
+    array_extent = set()
+    angle_stack = []
+    group_depth = 0
+    for i, token in enumerate(tokens):
+        if token.text in {'(', '[', '{'}:
+            group_depth += 1
+            continue
+        if token.text in {')', ']', '}'}:
+            group_depth = max(0, group_depth - 1)
+            continue
+        if group_depth:
+            continue
+        if token.text == '<':
+            prefix = [t.text for t in tokens[max(0, i - 3):i]]
+            plain_std_array = (prefix == ['std', '::', 'array']
+                               and (i < 4 or tokens[i - 4].text != '::'
+                                    or i == 4 or tokens[i - 5].text in {'<', ','}))
+            angle_stack.append(plain_std_array)
+        elif token.text == ',' and angle_stack and angle_stack[-1]:
+            if (i + 2 < len(tokens) and tokens[i + 1].kind == 'IDENT'
+                    and tokens[i + 2].text in {'>', '>>'}):
+                array_extent.add(i + 1)
+        elif token.text in {'>', '>>'}:
+            for _ in range(1 if token.text == '>' else 2):
+                if angle_stack:
+                    angle_stack.pop()
     starts = [0]
     for line in text.splitlines(keepends=True):
         starts.append(starts[-1] + len(line))
@@ -1302,15 +1331,14 @@ def cpp_type(text):
     previous = None
     before_previous = None
     expression_parens = []
-    for token in tokens:
-        if token.kind in {'NEWLINE', 'EOF'}:
-            continue
+    for index, token in enumerate(tokens):
         if token.text == '(':
             expression_parens.append(bool(expression_parens and expression_parens[-1])
                                      or previous in {'sizeof', 'decltype', 'noexcept', 'alignof', 'typeid'})
         elif token.text == ')' and expression_parens:
             expression_parens.pop()
-        if (token.kind == 'IDENT' and token.text in _TYPES and previous != '::'
+        if (token.kind == 'IDENT' and token.text in _TYPES and index not in array_extent
+                and previous != '::'
                 and not (previous == 'template' and before_previous == '::')
                 and not (expression_parens and expression_parens[-1])):
             start = starts[token.line - 1] + token.column - 1
