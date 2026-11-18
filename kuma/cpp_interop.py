@@ -2126,12 +2126,27 @@ def split_shaped_input_init(init, name_count: int) -> bool:
             and len(init.children) == 1 and name_count >= 2 and len(types) == name_count)
 
 
-def mark_optional_collection_calls(nodes, known=None, nested=None):
+def _cpp_stmt_masked_members(tokens):
+    masked = set()
+    for token in tokens:
+        if token.kind != 'CPP_DIRECTIVE':
+            continue
+        defined = re.search(r'#\s*define\s+(\w+)\b', token.text)
+        if defined and defined.group(1) in {'size', 'empty', 'clear', 'pop_back'}:
+            masked.add(defined.group(1))
+    return frozenset(masked)
+
+
+def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_members=frozenset()):
     """Conservative lexical proof for mixed-mode zero-argument calls.
 
     Only auto-bound Kuma vector/string values qualify. Opaque C++ discards
     knowledge rather than guessing declarations or shadowing. Unrelated native
     fields (including bit-fields) are never routed through a value helper.
+
+    cpp_stmt rewrites insert ``()`` after the matched member name only; the
+    lexer does not preprocess ``#define``, so macro-expanded statements never
+    arrive as ``cpp_stmt`` (directives are separate nodes).
     """
     known = set(known or ())
     nested = set(nested or ())
@@ -2243,11 +2258,31 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
                 return
             value.extra['optional_collection_call'] = True
 
+    compound_optional = re.compile(
+        r'^([A-Za-z_]\w*)\s*(?P<op>\+=|\-=)\s*'
+        r'(?P<recv>[A-Za-z_]\w*)'
+        r'(?:\[\s*(?P<idx>[A-Za-z_]\w*|[0-9]+(?:\'[0-9]+)*)\s*\])?'
+        r'\s*\.\s*(?P<member>size|empty)\s*;$')
+
+    def cpp_stmt_receiver_ok(match):
+        recv = match.group('recv')
+        if match.group('idx') is None:
+            return recv in known
+        return recv in nested
+
     for node in nodes:
         if node.kind == 'cpp_stmt':
-            bare = re.fullmatch(r'([A-Za-z_]\w*)\s*\.\s*(size|empty|clear|pop_back)\s*;', node.value)
-            if bare and bare[1] in known:
-                node.value = bare[1] + '.' + bare[2] + '();'
+            bare = re.fullmatch(
+                r'([A-Za-z_]\w*)\s*\.\s*(?P<member>size|empty|clear|pop_back)\s*;', node.value)
+            if (bare and bare[1] in known and bare.group('member') not in masked_members):
+                end = bare.end('member')
+                node.value = node.value[:end] + '()' + node.value[end:]
+                continue
+            compound = compound_optional.match(node.value)
+            if (compound and cpp_stmt_receiver_ok(compound)
+                    and compound.group('member') not in masked_members):
+                end = compound.end('member')
+                node.value = node.value[:end] + '()' + node.value[end:]
                 continue
         if node.kind.startswith('cpp_'):
             # No inference across unknown native declarations/macros/scopes.
@@ -2256,12 +2291,14 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
             if node.kind == 'cpp_opaque_sections':
                 for section in node.extra.get('sections', []):
                     if section[0] not in {'raw', 'expression', 'field'}:
-                        mark_optional_collection_calls(section[1])
+                        mark_optional_collection_calls(
+                            section[1], masked_members=masked_members)
             else:
                 for key in ('body', 'else'):
-                    mark_optional_collection_calls(node.extra.get(key, []))
+                    mark_optional_collection_calls(
+                        node.extra.get(key, []), masked_members=masked_members)
                 for _, body in node.extra.get('handlers', []):
-                    mark_optional_collection_calls(body)
+                    mark_optional_collection_calls(body, masked_members=masked_members)
             continue
         if node.kind == 'for':
             pattern = node.extra.get('pattern')
@@ -2271,7 +2308,9 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
                 loop = pattern.value
                 body_known = (known - {loop}) | {loop}
                 body_nested = nested - {loop}
-                mark_optional_collection_calls(node.extra.get('body', []), body_known, body_nested)
+                mark_optional_collection_calls(
+                    node.extra.get('body', []), body_known, body_nested,
+                    masked_members=masked_members)
                 expression(iterable, known)
                 continue
         candidate = (node.kind == 'declare' and len(node.value) == 1
@@ -2300,7 +2339,8 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
             scoped = node.kind in {'if', 'while'}
             mark_optional_collection_calls(node.extra.get(key, []),
                                            known if scoped else None,
-                                           nested if scoped else None)
+                                           nested if scoped else None,
+                                           masked_members=masked_members)
 
 
 def checked_tuple_key_functions(nodes, tokens, source, filename):
@@ -2370,7 +2410,8 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
             raise KumaError('kuma_gen_ は生成コード用の予約名です', t, code='KUMA_CPP')
     nodes = parser.program()
     checked_tuple_key_functions(nodes, parser.tokens, source, filename)
-    mark_optional_collection_calls(nodes)
+    mark_optional_collection_calls(nodes,
+                                  masked_members=_cpp_stmt_masked_members(parser.tokens))
     emitter = emitter or CppEmitter(filename)
     functions = [node for node in nodes if node.kind == 'function']
     emitter.sorted_key_record_types = {node.value for node in nodes if node.kind == 'record'}
