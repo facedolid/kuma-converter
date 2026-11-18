@@ -2157,7 +2157,7 @@ def _cpp_stmt_masked_members(tokens):
     return frozenset(masked)
 
 
-def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_members=frozenset()):
+def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None, *, masked_members=frozenset()):
     """Conservative lexical proof for mixed-mode zero-argument calls.
 
     Only auto-bound Kuma vector/string values qualify. Opaque C++ discards
@@ -2170,6 +2170,7 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_mem
     """
     known = set(known or ())
     nested = set(nested or ())
+    ranges = set(ranges or ())
 
     def nested_collection(value):
         if value.kind == 'name':
@@ -2248,6 +2249,8 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_mem
                 return all(collection(child) for child in value.children)
             if value.value in {'map', 'filter'}:
                 if receiver.kind == 'binary' and receiver.value == '..':
+                    return True
+                if receiver.kind == 'name' and receiver.value in ranges:
                     return True
                 return collection(receiver)
             if value.value in {'sorted', 'reversed'}:
@@ -2334,17 +2337,19 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_mem
             # No inference across unknown native declarations/macros/scopes.
             known.clear()
             nested.clear()
+            ranges.clear()
             if node.kind == 'cpp_opaque_sections':
                 for section in node.extra.get('sections', []):
                     if section[0] not in {'raw', 'expression', 'field'}:
                         mark_optional_collection_calls(
-                            section[1], masked_members=masked_members)
+                            section[1], ranges=ranges, masked_members=masked_members)
             else:
                 for key in ('body', 'else'):
                     mark_optional_collection_calls(
-                        node.extra.get(key, []), masked_members=masked_members)
+                        node.extra.get(key, []), ranges=ranges, masked_members=masked_members)
                 for _, body in node.extra.get('handlers', []):
-                    mark_optional_collection_calls(body, masked_members=masked_members)
+                    mark_optional_collection_calls(
+                        body, ranges=ranges, masked_members=masked_members)
             continue
         if node.kind == 'for':
             pattern = node.extra.get('pattern')
@@ -2356,6 +2361,7 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_mem
                 body_nested = nested - {loop}
                 mark_optional_collection_calls(
                     node.extra.get('body', []), body_known, body_nested,
+                    ranges - {loop},
                     masked_members=masked_members)
                 expression(iterable, known)
                 continue
@@ -2368,7 +2374,11 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_mem
         if node.kind == 'declare':
             known.difference_update(node.value)
             nested.difference_update(node.value)
+            ranges.difference_update(node.value)
             init = node.children[0] if node.children else None
+            if (init is not None and len(node.value) == 1 and not node.extra.get('type')
+                    and init.kind == 'binary' and init.value == '..'):
+                ranges.add(node.value[0])
             if init is not None and len(node.value) > 1 and split_shaped_input_init(init, len(node.value)):
                 known.update(node.value)
                 types = init.extra.get('types', [])
@@ -2386,6 +2396,7 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, *, masked_mem
             mark_optional_collection_calls(node.extra.get(key, []),
                                            known if scoped else None,
                                            nested if scoped else None,
+                                           ranges if scoped else None,
                                            masked_members=masked_members)
 
 
