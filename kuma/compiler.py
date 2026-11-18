@@ -2066,7 +2066,7 @@ class Compiler(DeclarationSupport):
                         "auto result = ::topological_sort(::to_graph(adjacency, true)); "
                         "return std::pair<bool, std::vector<int>>{result.has_value(), result.value_or(std::vector<int>{})}; }())")
             return self.ordered([graph], Type("pair", (BOOL, Type("vec", (I32,)))), topo_code, borrow=True)
-        if node.kind == "call" and name == "grid_bfs_dist":
+        if node.kind in ("call", "method") and name == "grid_bfs_dist":
             if kwargs or not 2 <= len(args) <= 4 or node.extra.get("types"):
                 self.fail("grid_bfs_dist(盤面, 行, 列[, 壁]) または (盤面, 始点配列[, 壁]) と書いてください", node)
             grid = self.expr(args[0])
