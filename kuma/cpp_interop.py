@@ -1488,6 +1488,16 @@ class CppEmitter:
             for _ in args:
                 type_ = f'typename std::remove_cvref_t<{type_}>::value_type'
         else: type_ = 'long long'
+        if 'until' in kw and 'mode' in kw:
+            if (args or set(kw) != {'until', 'mode'} or kw['until'].value != 'EOF'
+                    or kw['mode'].value != '"line"'):
+                self.fail(node, '行のEOF入力は input<string>(mode="line", until=EOF) のみ対応しています')
+            string_type = ((len(types) == 1 and cpp_type(types[0]) == 'std::string')
+                           or (not types and concrete_expected
+                               and re.fullmatch(r'std::vector\s*<\s*std::string\s*>', cpp_type(expected))))
+            if not string_type:
+                self.fail(node, '行のEOF入力は input<string> / input<std::string> / input<str> に限ります')
+            return 'kuma_rt::read_all_lines()'
         if 'until' in kw:
             if args or len(kw) != 1 or kw['until'].value != 'EOF': self.fail(node, 'until=EOF は固定個数や他のオプションと併用できません')
             if concrete_expected and not types:
@@ -2071,6 +2081,10 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
         types = value.extra.get('types', [])
         options = value.extra.get('kwargs', {})
         string_element = len(types) == 1 and cpp_type(types[0]) == 'std::string'
+        if not value.children and set(options) == {'until', 'mode'}:
+            return (string_element and options['until'].kind == 'name'
+                    and options['until'].value == 'EOF'
+                    and options['mode'].value == '"line"')
         if not value.children and set(options) == {'until'}:
             return (string_element and options['until'].kind == 'name'
                     and options['until'].value == 'EOF')
@@ -2101,13 +2115,17 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
             return value.extra.get('type') == 'string'
         if value.kind == 'call' and value.value == 'input':
             options = value.extra.get('kwargs', {})
+            types = value.extra.get('types', [])
             # These modes return std::string and std::vector respectively,
             # even without an explicit input element type.
+            if not value.children and set(options) == {'until', 'mode'}:
+                return (options['until'].kind == 'name' and options['until'].value == 'EOF'
+                        and options['mode'].value == '"line"'
+                        and len(types) == 1 and cpp_type(types[0]) == 'std::string')
             if not value.children and set(options) == {'mode'}:
                 return options['mode'].value == '"line"'
             if not value.children and set(options) == {'until'}:
                 return options['until'].kind == 'name' and options['until'].value == 'EOF'
-            types = value.extra.get('types', [])
             # Shaped input always emits read_vec/read_mat, independently of T.
             # Scalar string aliases below are the ones cpp_type maps directly.
             return (bool(value.children)

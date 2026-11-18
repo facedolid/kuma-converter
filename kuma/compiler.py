@@ -989,6 +989,8 @@ class Compiler(DeclarationSupport):
         types = [self.parse_type(t, node.token) for t in node.extra.get("types", [])]
         explicit = Type("tuple", tuple(types)) if len(types) > 1 else types[0] if types else None
         kwargs = node.extra.get("kwargs", {})
+        if "until" in kwargs and "mode" in kwargs:
+            self.fail('行単位のEOF入力は混在モードの input<string>(mode="line", until=EOF) に限ります', node)
         if "until" in kwargs:
             end = kwargs["until"]
             if set(kwargs) != {"until"} or node.children or end.kind != "name" or end.value != "EOF":
