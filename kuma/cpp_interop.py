@@ -2061,7 +2061,10 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
             if body is None or body.kind != 'name' or body.value != var:
                 return False
             return nested_collection(clauses[0].children[0])
-        if value.kind == 'call' and value.value == 'filter' and value.children:
+        if (value.kind == 'call' and value.value in {'filter', 'sorted', 'reversed'}
+                and value.children):
+            return nested_collection(value.children[0])
+        if value.kind == 'slice' and value.children:
             return nested_collection(value.children[0])
         if value.kind != 'call' or value.value != 'input':
             return False
@@ -2089,6 +2092,11 @@ def mark_optional_collection_calls(nodes, known=None, nested=None):
         # Member calls are excluded: a native C++ method takes precedence.
         if value.kind == 'call' and value.value in {'map', 'filter', 'zip', 'enumerate'}:
             return True
+        if (value.kind == 'call' and value.value in {'sorted', 'reversed'}
+                and value.children):
+            return collection(value.children[0])
+        if value.kind == 'slice' and value.children:
+            return collection(value.children[0])
         if value.kind == 'literal':
             return value.extra.get('type') == 'string'
         if value.kind == 'call' and value.value == 'input':
