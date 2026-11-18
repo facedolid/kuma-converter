@@ -1967,8 +1967,11 @@ def mark_optional_collection_calls(nodes, known=None):
                 return options['mode'].value == '"line"'
             if not value.children and set(options) == {'until'}:
                 return options['until'].kind == 'name' and options['until'].value == 'EOF'
-            return (value.extra.get('types') == ['string']
-                    or (bool(value.children) and not value.extra.get('types')))
+            types = value.extra.get('types', [])
+            # Shaped input always emits read_vec/read_mat, independently of T.
+            # Scalar string aliases below are the ones cpp_type maps directly.
+            return (bool(value.children)
+                    or (len(types) == 1 and cpp_type(types[0]) == 'std::string'))
         return False
 
     def expression(value, names):
