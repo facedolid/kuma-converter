@@ -245,8 +245,8 @@ class Compiler(DeclarationSupport):
         return f"kuma_gen_{suffix}_{self.counter}"
 
     def fail(self, message: str, node: Node, *, code: str = "KUMA_TYPE",
-             hint: str | None = None) -> None:
-        raise KumaError(message, node.token, code=code, hint=hint)
+             hint: str | None = None, at: Token | None = None) -> None:
+        raise KumaError(message, at or node.token, code=code, hint=hint)
 
     def bind(self, name: str, type_: Type, node: Node) -> Symbol:
         if name.startswith("kuma_gen_"):
@@ -2906,7 +2906,8 @@ class Compiler(DeclarationSupport):
             protected = left.origins if node.children[0].kind in ("index", "member") else frozenset()
             if node.value == "**=":
                 if node.children[0].kind != "name":
-                    self.fail("**= の左辺は単純な変数に限定しています", node)
+                    self.fail("**= の左辺は単純な変数に限定しています", node,
+                              at=node.extra.get("operator_token"))
                 if left.type not in NUMBER:
                     self.fail("この型の複合代入には対応していません", node)
                 self.uses_power = True

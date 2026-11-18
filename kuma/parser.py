@@ -277,7 +277,7 @@ class Parser:
             self.newlines()
             right = self.rhs()
             self.end_statement()
-            return Node("assign", start, operator.text, [left, right])
+            return Node("assign", start, operator.text, [left, right], {"operator_token": operator})
         self.end_statement()
         return Node("exprstmt", start, children=[left])
 
