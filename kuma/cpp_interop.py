@@ -1557,8 +1557,8 @@ class CppEmitter:
         self.sequence += 1
         return f'kuma_gen_cpp_{self.sequence}_{hint}'
 
-    def fail(self, node, message, *, at=None):
-        raise KumaError(message, at or node.token, code='KUMA_CPP')
+    def fail(self, node, message, *, at=None, hint=None):
+        raise KumaError(message, at or node.token, code='KUMA_CPP', hint=hint)
 
     def pinned_key_chain(self, chain, root):
         """Re-emit the checked scalar expressions without altering the original functions."""
@@ -2176,8 +2176,14 @@ class CppEmitter:
                 if indexed:
                     if (rhs_node.kind != 'literal'
                             or rhs_node.extra.get('type') not in {'i32', 'i64', 'f64'}):
-                        self.fail(node, '配列要素への **= の指数は数値リテラルに限定しています',
-                                  at=operator_token)
+                        self.fail(
+                            node,
+                            '配列要素への **= の指数は数値リテラルに限定しています',
+                            at=operator_token,
+                            hint=('指数に変数や式を使う場合、添字と指数が配列や添字を変更しないなら、'
+                                  'a[i] = a[i] ** e と書けます。'
+                                  '副作用のある添字は先に変数に保存してください。'),
+                        )
                 self.uses_power = True
                 if not indexed:
                     lhs = self.expr(lhs_node)

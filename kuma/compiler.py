@@ -2921,8 +2921,14 @@ class Compiler(DeclarationSupport):
                 if indexed:
                     if (rhs.kind != "literal"
                             or rhs.extra.get("type") not in {"i32", "i64", "f64"}):
-                        self.fail("配列要素への **= の指数は数値リテラルに限定しています", node,
-                                  at=operator_token)
+                        self.fail(
+                            "配列要素への **= の指数は数値リテラルに限定しています",
+                            node,
+                            at=operator_token,
+                            hint=("指数に変数や式を使う場合、添字と指数が配列や添字を変更しないなら、"
+                                  "a[i] = a[i] ** e と書けます。"
+                                  "副作用のある添字は先に変数に保存してください。"),
+                        )
                     right = self.expr(rhs)
                 else:
                     with self.protect(protected):
