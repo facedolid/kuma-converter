@@ -2165,15 +2165,31 @@ class CppEmitter:
             if has_slice(node.children[0]):
                 self.fail(node, '混在モードのスライス代入は未対応です。スライスはコピーを返します')
             if node.value == '**=':
-                if node.children[0].kind != 'name':
-                    self.fail(node, '**= の左辺は単純な変数に限定しています',
-                              at=node.extra.get('operator_token'))
+                lhs_node = node.children[0]
+                operator_token = node.extra.get('operator_token')
+                if lhs_node.kind == 'member' or lhs_node.kind not in {'name', 'index'}:
+                    self.fail(node, '**= の左辺は単純な変数に限定しています', at=operator_token)
+                indexed = lhs_node.kind == 'index'
+                if indexed and lhs_node.children[0].kind != 'name':
+                    self.fail(node, '**= の左辺は単純な変数に限定しています', at=operator_token)
+                rhs_node = node.children[1]
+                if indexed:
+                    if (rhs_node.kind != 'literal'
+                            or rhs_node.extra.get('type') not in {'i32', 'i64', 'f64'}):
+                        self.fail(node, '配列要素への **= の指数は数値リテラルに限定しています',
+                                  at=operator_token)
                 self.uses_power = True
-                lhs = self.expr(node.children[0])
-                rhs = self.expr(node.children[1])
-                base, exponent = self.fresh('power_base'), self.fresh('power_exponent')
-                return (prefix + f'{{ auto {base} = {lhs}; auto {exponent} = {rhs}; '
-                        f'{lhs} = kuma_rt::power_m8({base}, {exponent}); }}')
+                if not indexed:
+                    lhs = self.expr(lhs_node)
+                    rhs = self.expr(rhs_node)
+                    base, exponent = self.fresh('power_base'), self.fresh('power_exponent')
+                    return (prefix + f'{{ auto {base} = {lhs}; auto {exponent} = {rhs}; '
+                            f'{lhs} = kuma_rt::power_m8({base}, {exponent}); }}')
+                lhs = self.expr(lhs_node)
+                exponent = self.expr(rhs_node)
+                slot, base = self.fresh('power_lvalue'), self.fresh('power_base')
+                return (prefix + f'{{ auto& {slot} = {lhs}; auto {base} = {slot}; '
+                        f'{slot} = kuma_rt::power_m8({base}, {exponent}); }}')
             marker = ''
             if (self.implicit_assignments and self.in_implicit_main and node.value == '='
                     and node.children[0].kind == 'name'):

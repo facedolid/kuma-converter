@@ -2905,21 +2905,43 @@ class Compiler(DeclarationSupport):
             # Index lvalues are borrowed before the RHS runs; keep their owner alive.
             protected = left.origins if node.children[0].kind in ("index", "member") else frozenset()
             if node.value == "**=":
-                if node.children[0].kind != "name":
+                lhs = node.children[0]
+                operator_token = node.extra.get("operator_token")
+                if lhs.kind == "member" or lhs.kind not in {"name", "index"}:
                     self.fail("**= の左辺は単純な変数に限定しています", node,
-                              at=node.extra.get("operator_token"))
+                              at=operator_token)
+                indexed = lhs.kind == "index"
+                if indexed and lhs.children[0].kind != "name":
+                    self.fail("**= の左辺は単純な変数に限定しています", node,
+                              at=operator_token)
                 if left.type not in NUMBER:
                     self.fail("この型の複合代入には対応していません", node)
                 self.uses_power = True
-                right = self.expr(node.children[1])
+                rhs = node.children[1]
+                if indexed:
+                    if (rhs.kind != "literal"
+                            or rhs.extra.get("type") not in {"i32", "i64", "f64"}):
+                        self.fail("配列要素への **= の指数は数値リテラルに限定しています", node,
+                                  at=operator_token)
+                    right = self.expr(rhs)
+                else:
+                    with self.protect(protected):
+                        right = self.expr(rhs)
                 if right.type not in NUMBER:
                     self.fail("** の両辺は数値にしてください", node)
                 self.owned(right, node)
                 result_type = F64 if F64 in (left.type, right.type) else I64
-                power = self.ordered([left, right], result_type,
-                                     lambda ns: f"kuma_rt::power_m8({ns[0]}, {ns[1]})")
-                power = self.coerce(power, left.type, node)
-                return prefix + f"{left.code} = {power.code};"
+                if not indexed:
+                    power = self.ordered([left, right], result_type,
+                                         lambda ns: f"kuma_rt::power_m8({ns[0]}, {ns[1]})")
+                    power = self.coerce(power, left.type, node)
+                    return prefix + f"{left.code} = {power.code};"
+                target, base = self.fresh(), self.fresh()
+                power = self.coerce(Value(f"kuma_rt::power_m8({base}, {right.code})", result_type),
+                                    left.type, node)
+                return prefix + (f"{{ auto&& {target} = {left.code}; "
+                                 f"{result_type.cpp()} {base} = {target}; "
+                                 f"{target} = {power.code}; }}")
             with self.protect(protected):
                 right = self.expr(node.children[1], left.type)
                 self.owned(right, node)
