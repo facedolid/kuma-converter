@@ -802,6 +802,8 @@ class CppParser(InitializerSupport, Parser):
             return None
         if compound_assign_kuma_slice_member_pattern(visible):
             return None
+        if not terminated and _simple_vector_assign_missing_semicolon(visible):
+            return None
         self.position = end
         return Node('cpp_stmt', start, self.source_range(start, part[-1]) + ';',
                     extra={'bare_identifier': not terminated and len(part) == 1 and start.kind == 'IDENT'})
@@ -1425,6 +1427,25 @@ def _lexer_double_colon_slice_bounds(inner) -> bool:
             and _simple_slice_bound(inner[split + 1:]))
 
 
+def _simple_vector_assign_missing_semicolon(tokens) -> bool:
+    """``recv.add_assign(arg)`` / ``recv.sub_assign(arg)`` without an explicit ``;``."""
+    from .compiler import _VECTOR_ASSIGN_METHODS
+
+    compact = [t for t in tokens if t.kind not in {'NEWLINE', 'EOF'}]
+    if (len(compact) < 6 or compact[0].kind != 'IDENT' or compact[1].text != '.'
+            or compact[2].text not in _VECTOR_ASSIGN_METHODS or compact[3].text != '('):
+        return False
+    depth = 0
+    for i, token in enumerate(compact[3:], 3):
+        if token.text == '(':
+            depth += 1
+        elif token.text == ')':
+            depth -= 1
+            if depth == 0:
+                return i == len(compact) - 1
+    return False
+
+
 def compound_assign_kuma_slice_member_pattern(tokens) -> bool:
     """``lhs +=|-= recv[bounds].size|empty``; bounds are empty, ident, or signed decimal int."""
     compact = [t for t in tokens if t.kind not in {'NEWLINE', 'EOF'}]
@@ -1954,9 +1975,13 @@ class CppEmitter:
                           'all', 'some', 'every', 'discard_line', 'min', 'max', 'abs'}
             native_args = kind == 'method' or (kind == 'call' and value not in kuma_calls | set(_TYPES))
             from .compiler import (_SCALAR_CONVERSION_METHODS, _SEQUENCE_ARITHMETIC_METHODS,
-                                   _STRING_PAD_METHODS, emit_mixed_scalar_conversion,
-                                   emit_mixed_sequence_method, emit_mixed_string_pad)
-            extension_members = _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS | _SEQUENCE_ARITHMETIC_METHODS
+                                   _STRING_PAD_METHODS, _INTEGER_MASK_METHODS, _VECTOR_ASSIGN_METHODS,
+                                   emit_mixed_scalar_conversion, emit_mixed_integer_mask_method,
+                                   emit_mixed_sequence_method, emit_mixed_string_pad,
+                                   emit_mixed_vector_assign_method)
+            extension_members = (_SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
+                                   | _SEQUENCE_ARITHMETIC_METHODS | _INTEGER_MASK_METHODS
+                                   | _VECTOR_ASSIGN_METHODS)
             args = [self.expr(c, native=(native_args and not (
                         not native and c.kind == 'method' and c.value in extension_members)))
                     for c in node.children]
@@ -1969,6 +1994,10 @@ class CppEmitter:
                     if value in _STRING_PAD_METHODS:
                         return emit_mixed_string_pad(value, args[0], args[1:], self.fresh)
                     return emit_mixed_scalar_conversion(value, args[0], args[1:], self.fresh)
+                if value in _INTEGER_MASK_METHODS and not node.extra.get('types'):
+                    self.options(node, kw)
+                    return emit_mixed_integer_mask_method(value, args[0], args[1:], self.fresh,
+                                                          type_probe=self.type_probe)
             if value in {'sort', 'sorted', 'reverse', 'reversed'} and not node.extra.get('pointer'):
                 sorting = value in {'sort', 'sorted'}
                 self.options(node, kw, {'start', 'end', 'compare'} if sorting else {'start', 'end'})
@@ -2004,6 +2033,10 @@ class CppEmitter:
                         args[0] = self.expr(receiver)
                     return emit_mixed_sequence_method(value, args[0], args[1], self.fresh,
                                                       type_probe=self.type_probe)
+                if value in _VECTOR_ASSIGN_METHODS:
+                    self.options(node, kw)
+                    return emit_mixed_vector_assign_method(value, args[0], args[1], self.fresh,
+                                                           type_probe=self.type_probe)
             if kind == 'method' and value in member_helpers and not node.extra.get('pointer'):
                 self.options(node, kw)
                 return f'kuma_rt::cpp_member_{value}(' + ', '.join(args) + ')'

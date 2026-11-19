@@ -52,6 +52,10 @@ class Type:
             return "kuma_rt::EnumerateView<" + self.args[1].cpp() + ", " + self.args[0].cpp() + ">"
         if self.name == "zip_view":
             return "kuma_rt::ZipView<" + ", ".join(t.cpp() for t in self.args) + ">"
+        if self.name == "set_bits_view":
+            return f"kuma_rt::SetBitsView<{self.args[0].cpp()}>"
+        if self.name == "submasks_view":
+            return f"kuma_rt::SubmasksView<{self.args[0].cpp()}>"
         if self.name == "bitset":
             return f"std::bitset<{self.args[0].name}>"
         template = {"vec": "std::vector", "tuple": "std::tuple", "pair": "std::pair",
@@ -236,6 +240,8 @@ _STRING_PAD_METHODS = frozenset({"zfill", "pad_start", "pad_end"})
 
 _SCALAR_METHOD_DISPATCH = _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
 
+_INTEGER_MASK_METHODS = frozenset({"has_bit", "bit_count", "set_bits", "submasks"})
+
 
 def emit_scalar_conversion(method, receiver, base="10"):
     targets = {"to_int": "int", "to_ll": "long long"}
@@ -354,6 +360,8 @@ def emit_mixed_binary(op: str, left_expr, right_expr, fresh, *, type_probe=False
 
 _SEQUENCE_ARITHMETIC_METHODS = frozenset({"dot", "mul_each", "concat", "repeat"})
 
+_VECTOR_ASSIGN_METHODS = frozenset({"add_assign", "sub_assign"})
+
 
 def emit_mixed_sequence_method(name, recv_expr, arg_expr, fresh, *, type_probe=False):
     left, right = (fresh(suffix) for suffix in ("seq_l", "seq_r"))
@@ -386,6 +394,60 @@ def emit_mixed_sequence_method(name, recv_expr, arg_expr, fresh, *, type_probe=F
             f"{{ {body} }}({arg_expr})); }}({recv_expr}))")
 
 
+def emit_mixed_vector_assign_method(method, recv_expr, arg_expr, fresh, *, type_probe=False):
+    if type_probe:
+        # A vector mutation returns void and cannot initialize a field.
+        return f"({recv_expr}).{method}({arg_expr})"
+    helper = {"add_assign": "kuma_vector_iadd", "sub_assign": "kuma_vector_isub"}[method]
+    left, right = (fresh(suffix) for suffix in ("va_l", "va_r"))
+    tl, tr, bare, mutable, matched = (fresh(suffix) for suffix in
+                                      ("va_tl", "va_tr", "va_bare", "va_mutable", "va_matched"))
+    native = f"(std::forward<{tl}>({left})).{method}({arg_expr})"
+    # Only the vector branch binds the argument to a reference. A native member
+    # can still receive a bit-field by value, an overload set, or a null constant.
+    body = (f"using {bare} = std::remove_cvref_t<{tl}>; "
+            f"if constexpr (kuma_rt::kuma_numeric_vector<{bare}>::value) {{ "
+            f"constexpr bool {mutable} = std::is_lvalue_reference_v<{tl}> && "
+            f"!std::is_const_v<std::remove_reference_t<{tl}>> && "
+            f"!std::is_volatile_v<std::remove_reference_t<{tl}>>; "
+            f"static_assert({mutable}, \"{method}: receiver must be a mutable vector\"); "
+            f"return [&]<class {tr}>({tr}&& {right}) {{ "
+            f"constexpr bool {matched} = std::is_same_v<{bare}, std::remove_cvref_t<{tr}>> && "
+            f"!std::is_volatile_v<std::remove_reference_t<{tr}>>; "
+            f"static_assert({matched}, \"{method}: both vectors must have the same numeric element type\"); "
+            f"if constexpr ({mutable} && {matched}) kuma_rt::{helper}({left}, {right}); "
+            f"}}({arg_expr}); }} else return {native};")
+    return (f"([&]<class {tl}>({tl}&& {left}) -> decltype(auto) "
+            f"{{ {body} }}({recv_expr}))")
+
+
+def emit_mixed_integer_mask_method(method, recv_expr, args, fresh, *, type_probe=False):
+    arguments = ", ".join(args)
+    if len(args) != (1 if method == "has_bit" else 0):
+        return f"({recv_expr}).{method}({arguments})"
+    recv, typ, bare = (fresh(suffix) for suffix in ("mask_recv", "mask_t", "mask_bare"))
+    forward = f"std::forward<{typ}>({recv})"
+    helper = {
+        "has_bit": "mask_has_bit", "bit_count": "mask_bit_count",
+        "set_bits": "mask_set_bits", "submasks": "mask_submasks",
+    }[method]
+
+    def body(argument):
+        call = f"kuma_rt::{helper}({forward}" + (", " + argument if args else "") + ")"
+        return (f"using {bare} = std::remove_cvref_t<{typ}>; "
+                f"if constexpr (kuma_rt::kuma_mask_integral<{bare}>) return {call}; "
+                f"else return ({forward}).{method}({argument});")
+
+    if type_probe and args:
+        # An unevaluated type probe must not capture and preserves indexing overloads.
+        index, itype = fresh("mask_index"), fresh("mask_index_t")
+        return (f"([]<class {typ}, class {itype}>({typ}&& {recv}, {itype}&& {index}) -> decltype(auto) "
+                f"{{ {body(f'std::forward<{itype}>({index})')} }}({recv_expr}, {arguments}))")
+    capture = "[&]" if args else "[]"
+    return (f"({capture}<class {typ}>({typ}&& {recv}) -> decltype(auto) "
+            f"{{ {body(arguments)} }}({recv_expr}))")
+
+
 def emit_mixed_string_pad(method, recv_expr, args, fresh):
     recv, typ, bare = (fresh(suffix) for suffix in ("pad_recv", "pad_t", "pad_bare"))
     forward = f"std::forward<{typ}>({recv})"
@@ -398,6 +460,8 @@ def emit_mixed_string_pad(method, recv_expr, args, fresh):
     branch = f"if constexpr ({string}) return {emit_string_pad(method, recv, width, fill)}; else "
     return (f"([&]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ "
             f"using {bare} = std::remove_cvref_t<{typ}>; {branch}return {native}; }}(({recv_expr})))")
+
+
 
 
 class Compiler(DeclarationSupport):
@@ -1070,6 +1134,10 @@ class Compiler(DeclarationSupport):
             return CHAR
         if type_.name == "range":
             return I64
+        if type_.name == "set_bits_view":
+            return I32
+        if type_.name == "submasks_view":
+            return type_.args[0]
         self.fail("走査対象は配列・文字列・整数範囲・set・dictにしてください", node)
 
     def iter_adapter(self, node: Node) -> Value:
@@ -1550,6 +1618,58 @@ class Compiler(DeclarationSupport):
         features = [self.ordered_key_features(part) for part in type_.args]
         return any(record for record, _ in features), type_ == F64 or any(floating for _, floating in features)
 
+    def lower_integer_mask_method(self, node: Node) -> Value | None:
+        name, args = node.value, node.children
+        if node.kind != "method" or name not in _INTEGER_MASK_METHODS:
+            return None
+        if node.extra.get("kwargs") or node.extra.get("types"):
+            self.fail(f"{name} の引数は位置指定で渡してください", node)
+        receiver = self.expr(args[0])
+        self.owned(receiver, node)
+        if receiver.type not in INTEGER:
+            self.fail(f"{receiver.type} には {name} を使えません", node, code="KUMA_API")
+        mask_cpp = receiver.type.cpp()
+        if name == "has_bit":
+            if len(args) != 2:
+                self.fail("has_bit(i) と書いてください", node)
+            index = self.expr(args[1])
+            if index.type not in INTEGER:
+                self.fail("has_bit の位置は整数にしてください", args[1])
+            return self.ordered([receiver, index], BOOL,
+                                lambda ns: f"kuma_rt::mask_has_bit({ns[0]}, {ns[1]})")
+        if len(args) != 1:
+            self.fail(f"{name}() と書いてください", node)
+        if name == "bit_count":
+            return self.ordered([receiver], I32,
+                                lambda ns: f"kuma_rt::mask_bit_count<{mask_cpp}>({ns[0]})")
+        view = "set_bits_view" if name == "set_bits" else "submasks_view"
+        helper = "mask_set_bits" if name == "set_bits" else "mask_submasks"
+        result = Type(view, (receiver.type,))
+        return self.ordered([receiver], result,
+                            lambda ns: f"kuma_rt::{helper}<{mask_cpp}>({ns[0]})")
+
+    def lower_vector_assign_method(self, node: Node) -> Value | None:
+        name, args = node.value, node.children
+        if node.kind != "method" or name not in _VECTOR_ASSIGN_METHODS:
+            return None
+        if len(args) != 2 or node.extra.get("kwargs") or node.extra.get("types"):
+            self.fail(f"{name}(配列) の引数を1個指定してください", node)
+        receiver = self.expr(args[0])
+        self.writable(receiver, node)
+        protected = receiver.origins if args[0].kind in ("index", "member") else frozenset()
+        with self.protect(protected):
+            other = self.expr(args[1])
+        self.owned(other, node)
+        if not numeric_vec_type(receiver.type) or receiver.type != other.type:
+            self.fail(f"{name} は要素型が同じ数値配列同士に使ってください", node)
+        helper = {"add_assign": "kuma_vector_iadd", "sub_assign": "kuma_vector_isub"}[name]
+        target, source = self.fresh(), self.fresh()
+        return Value(
+            f"([&]() {{ auto&& {target} = {receiver.code}; auto&& {source} = {other.code}; "
+            f"kuma_rt::{helper}({target}, {source}); }}())",
+            VOID,
+        )
+
     def lower_scalar_conversion(self, node: Node) -> Value | None:
         name, args = node.value, node.children
         if node.kind != "method" or name not in _SCALAR_METHOD_DISPATCH:
@@ -1609,6 +1729,12 @@ class Compiler(DeclarationSupport):
     def call(self, node: Node, expected: Type | None) -> Value:
         name, args = node.value, node.children
         kwargs = node.extra.get("kwargs", {})
+        converted = self.lower_integer_mask_method(node)
+        if converted is not None:
+            return converted
+        converted = self.lower_vector_assign_method(node)
+        if converted is not None:
+            return converted
         converted = self.lower_scalar_conversion(node)
         if converted is not None:
             return converted
