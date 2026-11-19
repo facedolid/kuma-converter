@@ -69,7 +69,7 @@ ALIASES = {"int": "i32", "ll": "i64", "longlong": "i64", "double": "f64",
            "str": "string", "vector": "vec", "map": "dict"}
 RESERVED = {
     "range", "SortedList",
-    "input", "print", "if", "else", "while", "for", "in", "rep", "break",
+    "input", "print", "read", "write", "if", "else", "while", "for", "in", "rep", "break",
     "EOF", "continue", "return", "true", "false", "auto", "long", "void", "tuple",
     "i64", "i32", "f64", "bool", "char", "string", "vec", *ALIASES,
     "len", "size", "sum", "sort", "sorted", "reverse", "reversed", "min",
@@ -190,6 +190,103 @@ class Function:
     captures: dict[str, Symbol]
     code: str | None = None
     result: Type | None = None
+
+
+
+def emit_string(texts, specs, expressions, quote):
+    """Emit an owning C++ string and observe each value once, in source order."""
+    lines = ["std::ostringstream kuma_gen_out;"]
+    for index, text in enumerate(texts):
+        if text:
+            lines.append(f"kuma_gen_out << std::string({quote(text)}, {len(text.encode('utf-8'))});")
+        if index < len(expressions):
+            spec = specs[index]
+            value = expressions[index]
+            if spec is None:
+                lines.append(f"kuma_gen_out << ({value});")
+            else:
+                lines.append(f"kuma_gen_out << std::fixed << std::setprecision({spec}) << static_cast<long double>({value})"
+                             " << std::defaultfloat << std::setprecision(6);")
+    lines.append("return kuma_gen_out.str();")
+    return "([&]() { " + " ".join(lines) + " }())"
+
+
+_SCALAR_CONVERSION_METHODS = frozenset({
+    "to_string", "to_int", "to_ll", "ctoi", "stoi", "stoll", "to_num",
+})
+
+_STRING_PAD_METHODS = frozenset({"zfill", "pad_start", "pad_end"})
+
+_SCALAR_METHOD_DISPATCH = _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
+
+
+def emit_scalar_conversion(method, receiver, base="10"):
+    targets = {"to_int": "int", "to_ll": "long long"}
+    if method in targets:
+        return f"kuma_rt::numeric_cast<{targets[method]}>({receiver})"
+    if method == "ctoi":
+        return f"::ctoi({receiver})"
+    if method in {"stoi", "stoll"}:
+        return f"std::{method}({receiver}, nullptr, kuma_rt::checked_radix({base}))"
+    return f"std::to_string({receiver})"
+
+
+def emit_mixed_scalar_conversion(method, recv_expr, args, fresh):
+    recv, typ, bare = (fresh(suffix) for suffix in ("conv_recv", "conv_t", "conv_bare"))
+    forward = f"std::forward<{typ}>({recv})"
+    native = f"({forward}).{method}(" + ", ".join(args) + ")"
+    numeric = (f"(std::is_integral_v<{bare}> || std::is_floating_point_v<{bare}>)"
+               + "".join(f" && !std::is_same_v<{bare}, {t}>" for t in (
+                   "bool", "char", "signed char", "unsigned char", "wchar_t", "char8_t", "char16_t", "char32_t")))
+    char = f"std::is_same_v<{bare}, char>"
+    string = f"std::is_same_v<{bare}, std::string>"
+    cases = []
+    if not args and method in {"to_string", "to_int", "to_ll"}:
+        cases.append((numeric, method))
+    if not args and method in {"ctoi", "to_num"}:
+        cases.append((char, "ctoi"))
+    if len(args) <= 1 and method in {"stoi", "stoll", "to_num"}:
+        cases.append((string, "stoll" if method == "to_num" else method))
+    if not args and method == "to_int":
+        cases.append((char, "ctoi"))
+    if len(args) <= 1 and method == "to_int":
+        cases.append((string, "stoi"))
+    if len(args) <= 1 and method == "to_ll":
+        cases.append((string, "stoll"))
+    if not cases:
+        return f"({recv_expr}).{method}(" + ", ".join(args) + ")"
+    base = args[0] if args else "10"
+    branches = "".join(f"if constexpr ({condition}) return {emit_scalar_conversion(operation, recv, base)}; else "
+                       for condition, operation in cases)
+    return (f"([&]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ "
+            f"using {bare} = std::remove_cvref_t<{typ}>; {branches}return {native}; }}(({recv_expr})))")
+
+
+_STRING_PAD_SIDES = {
+    "zfill": "kuma_rt::StringPadSide::ZFill",
+    "pad_start": "kuma_rt::StringPadSide::Start",
+    "pad_end": "kuma_rt::StringPadSide::End",
+}
+
+
+def emit_string_pad(method, receiver, width, fill="' '"):
+    side = _STRING_PAD_SIDES[method]
+    fill_arg = "'0'" if method == "zfill" else fill
+    return (f"kuma_rt::string_pad({receiver}, {width}, {fill_arg}, {side})")
+
+
+def emit_mixed_string_pad(method, recv_expr, args, fresh):
+    recv, typ, bare = (fresh(suffix) for suffix in ("pad_recv", "pad_t", "pad_bare"))
+    forward = f"std::forward<{typ}>({recv})"
+    native = f"({forward}).{method}(" + ", ".join(args) + ")"
+    if not 1 <= len(args) <= (1 if method == "zfill" else 2):
+        return f"({recv_expr}).{method}(" + ", ".join(args) + ")"
+    string = f"std::is_same_v<{bare}, std::string>"
+    width = args[0]
+    fill = args[1] if len(args) == 2 else "' '"
+    branch = f"if constexpr ({string}) return {emit_string_pad(method, recv, width, fill)}; else "
+    return (f"([&]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ "
+            f"using {bare} = std::remove_cvref_t<{typ}>; {branch}return {native}; }}(({recv_expr})))")
 
 
 class Compiler(DeclarationSupport):
@@ -359,6 +456,19 @@ class Compiler(DeclarationSupport):
             return Value(f"static_cast<char>({ord(text)})", CHAR)
         return Value(f"std::string({quote(text)}, {len(text.encode('utf-8'))})", STRING)
 
+    def interpolated_string(self, node: Node) -> Value:
+        values = [self.expr(child) for child in node.children]
+        for value in values:
+            self.owned(value, node)
+        return Value(emit_string(node.extra["texts"], node.extra["specs"],
+                                 [value.code for value in values], quote), STRING)
+
+    def write_stream(self, arguments: list[Node], node: Node) -> str:
+        values = [self.expr(argument) for argument in arguments]
+        for value in values:
+            self.owned(value, node)
+        return "{ " + " ".join(f"std::cout << ({value.code});" for value in values) + " }"
+
     def expr(self, node: Node, expected: Type | None = None) -> Value:
         kind = node.kind
         if kind == "resolved_value":
@@ -380,6 +490,8 @@ class Compiler(DeclarationSupport):
             return Value("{}", type_)
         if kind == "literal":
             return self.literal(node)
+        if kind == "interpolated":
+            return self.interpolated_string(node)
         if kind == "name":
             sym = self.lookup(node.value, node)
             return Value(sym.code, sym.type, lvalue=sym.function is None,
@@ -451,7 +563,8 @@ class Compiler(DeclarationSupport):
                 return self.ordered([left, right], Type("range"), lambda ns: f"kuma_rt::range({ns[0]}, {ns[1]})")
             numeric = left.type in NUMBER and right.type in NUMBER
             comparison = op in ("==", "!=", "<", "<=", ">", ">=")
-            if not numeric and not (left.type == right.type and (comparison or (left.type == STRING and op == "+"))):
+            string_concat = op == "+" and left.type == STRING and right.type in (STRING, CHAR)
+            if not (numeric or string_concat or (left.type == right.type and comparison)):
                 hint = None
                 lhs = node.children[0]
                 if left.type == VOID and lhs.kind == "call" and lhs.value == "print":
@@ -1283,9 +1396,68 @@ class Compiler(DeclarationSupport):
         features = [self.ordered_key_features(part) for part in type_.args]
         return any(record for record, _ in features), type_ == F64 or any(floating for _, floating in features)
 
+    def lower_scalar_conversion(self, node: Node) -> Value | None:
+        name, args = node.value, node.children
+        if node.kind != "method" or name not in _SCALAR_METHOD_DISPATCH:
+            return None
+        receiver = self.expr(args[0])
+        self.owned(receiver, node)
+        extras = args[1:]
+        if node.extra.get("kwargs"):
+            self.fail(f"{name} の引数は位置指定で渡してください", node)
+        if name in _STRING_PAD_METHODS:
+            if receiver.type != STRING:
+                self.fail(f"{receiver.type} には {name} を使えません", node, code="KUMA_API")
+            pad_specs = {"zfill": 1, "pad_start": 2, "pad_end": 2}
+            if not 1 <= len(extras) <= pad_specs[name]:
+                self.fail(f"{name} の引数の数を確認してください", node)
+            width = self.expr(extras[0])
+            if width.type not in INTEGER:
+                self.fail("幅には整数を指定してください", extras[0])
+            values = [receiver, width]
+            if len(extras) > 1:
+                fill_value = self.expr(extras[1])
+                if fill_value.type != CHAR:
+                    self.fail("埋め文字には char を指定してください", extras[1])
+                values.append(fill_value)
+            return self.ordered(values, STRING, lambda ns: emit_string_pad(
+                name, ns[0], ns[1], ns[2] if len(ns) > 2 else "' '"))
+        if name == "to_num":
+            method = {"char": "ctoi", "string": "stoll"}.get(receiver.type.name, name)
+        elif name == "to_int":
+            method = {"char": "ctoi", "string": "stoi"}.get(receiver.type.name, name)
+        elif name == "to_ll":
+            method = {"string": "stoll"}.get(receiver.type.name, name)
+        else:
+            method = name
+        specs = {
+            "to_string": (NUMBER, 0, STRING),
+            "to_int": (NUMBER, 0, I32),
+            "to_ll": (NUMBER, 0, I64),
+            "ctoi": ((CHAR,), 0, I32),
+            "stoi": ((STRING,), 1, I32),
+            "stoll": ((STRING,), 1, I64),
+        }
+        if method not in specs or receiver.type not in specs[method][0]:
+            self.fail(f"{receiver.type} には {name} を使えません", node, code="KUMA_API")
+        _, max_args, result = specs[method]
+        if len(extras) > max_args:
+            self.fail(f"{name} の引数の数を確認してください", node)
+        values = [receiver]
+        if extras:
+            base = self.expr(extras[0])
+            if base.type not in INTEGER:
+                self.fail("基数には整数を指定してください", extras[0])
+            values.append(base)
+        return self.ordered(values, result, lambda ns:
+                            emit_scalar_conversion(method, ns[0], ns[1] if extras else "10"))
+
     def call(self, node: Node, expected: Type | None) -> Value:
         name, args = node.value, node.children
         kwargs = node.extra.get("kwargs", {})
+        converted = self.lower_scalar_conversion(node)
+        if converted is not None:
+            return converted
         if node.kind == "call" and name == "SortedList":
             if set(kwargs) - {"key"} or node.extra.get("types") or len(args) > 1:
                 self.fail("SortedList([配列], key=関数) と書いてください", node)
@@ -2959,6 +3131,21 @@ class Compiler(DeclarationSupport):
                     self.fail("この複合代入は整数に使ってください", node)
             target, source = self.fresh(), self.fresh()
             return prefix + f"{{ auto&& {target} = {left.code}; {right.type.cpp()} {source} = {right.code}; {target} {node.value} {source}; }}"
+        if kind == "read":
+            targets: list[Value] = []
+            for child in node.children:
+                if child.kind not in {"name", "index", "member"}:
+                    self.fail("read の対象は変数または配列要素にしてください", node)
+                value = self.expr(child)
+                self.writable(value, node)
+                if not self.input_type(value.type):
+                    self.fail("read は input と同じスカラー型に対応しています", node)
+                targets.append(value)
+
+            steps = (f"std::cin >> ({target.code}); kuma_rt::check_input();" for target in targets)
+            return prefix + "{ " + " ".join(steps) + " }"
+        if kind == "write":
+            return prefix + self.write_stream(node.children, node)
         if kind == "exprstmt":
             expression = node.children[0]
             if (expression.kind == "name" and not expression.value.startswith("kuma_gen_")

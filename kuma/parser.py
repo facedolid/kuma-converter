@@ -1,5 +1,9 @@
 """Kuma's layout-aware grammar, including M2 arrows and comprehensions."""
 
+import ast
+import re
+from dataclasses import dataclass
+
 from .lexer import lex
 from .model import KumaError, Node, Token
 
@@ -177,6 +181,22 @@ class Parser:
             self.take()
             self.end_statement()
             return Node(start.text, start)
+        if start.text == "read":
+            self.take()
+            targets = [self.rhs()]
+            while self.accept(","):
+                self.newlines()
+                targets.append(self.rhs())
+            self.end_statement()
+            return Node("read", start, children=targets)
+        if start.text == "write":
+            self.take()
+            arguments = [self.write_operand()]
+            while self.accept(","):
+                self.newlines()
+                arguments.append(self.write_operand())
+            self.end_statement()
+            return Node("write", start, children=arguments)
         if start.text == "return":
             if not self.lambda_depth:
                 raise KumaError("return は関数の本体で使用してください", start)
@@ -652,8 +672,34 @@ class Parser:
             left = Node("binary", token, token.text, [left, right])
         return left
 
+    def formatted_string(self) -> Node | None:
+        prefix = self.current
+        if prefix.text != "f":
+            return None
+        quoted = self.tokens[self.position + 1]
+        if (quoted.kind not in {"STRING", "CHAR"} or quoted.line != prefix.line
+                or quoted.column != prefix.column + len(prefix.text)):
+            return None
+        self.take()
+        return parse_interpolation(self, self.take())
+
+    def write_operand(self) -> Node:
+        if self.current.kind != "STRING":
+            return self.rhs()
+        previous = getattr(self, "_write_literal", None)
+        self._write_literal = self.current
+        try:
+            return self.rhs()
+        finally:
+            self._write_literal = previous
+
     def primary(self) -> Node:
         self.soft_newlines()
+        if self.current is getattr(self, "_write_literal", None):
+            return parse_interpolation(self, self.take())
+        formatted = self.formatted_string()
+        if formatted is not None:
+            return formatted
         if self.current.text == "(" and self.parenthesized_lambda():
             return self.lambda_parameters()
         token = self.take()
@@ -854,3 +900,145 @@ class Parser:
 def parse(source: str) -> list[Node]:
     """Parse the complete source or raise a location-bearing KumaError."""
     return Parser(source).program()
+
+@dataclass
+class _Segment:
+    literal: str | None = None
+    expr_source: str | None = None
+    expr_offset: int = 0
+
+
+def _decode_literal_piece(raw: str, token: Token) -> str:
+    try:
+        value = ast.literal_eval(raw)
+    except (SyntaxError, ValueError) as error:
+        raise KumaError('文字列・文字リテラルのエスケープを確認してください', token) from error
+    if not isinstance(value, str):
+        raise KumaError('文字列リテラルが必要です', token)
+    return value
+
+
+def parse_interpolation(owner, token: Token) -> Node:
+    """Split a quoted string into literal segments and embedded expressions."""
+    raw = token.text
+    if len(raw) < 2 or raw[0] not in ('"', "'") or raw[-1] != raw[0]:
+        raise KumaError('文字列リテラルが必要です', token)
+    delimiter = raw[0]
+    segments: list[_Segment] = []
+    literal_start = 1
+    index = 1
+
+    def flush_literal(end: int) -> None:
+        if end <= literal_start:
+            return
+        piece = _decode_literal_piece(delimiter + raw[literal_start:end] + delimiter, token)
+        if piece:
+            if segments and segments[-1].literal is not None:
+                segments[-1].literal += piece
+            else:
+                segments.append(_Segment(literal=piece))
+
+    while index < len(raw) - 1:
+        ch = raw[index]
+        if ch == '\\':
+            index += 2
+            continue
+        if ch == '{':
+            if index + 1 < len(raw) - 1 and raw[index + 1] == '{':
+                flush_literal(index)
+                if segments and segments[-1].literal is not None:
+                    segments[-1].literal += '{'
+                else:
+                    segments.append(_Segment(literal='{'))
+                literal_start = index + 2
+                index = literal_start
+                continue
+            flush_literal(index)
+            close = index + 1
+            depth = 0
+            quoted = ''
+            while close < len(raw) - 1:
+                inner = raw[close]
+                if inner == '\\':
+                    close += 2
+                    continue
+                if quoted:
+                    if inner == quoted:
+                        quoted = ''
+                    close += 1
+                    continue
+                if inner in ('"', "'") and not (inner == "'" and raw[close - 1].isalnum()
+                                               and close + 1 < len(raw) and raw[close + 1].isalnum()):
+                    quoted = inner
+                    close += 1
+                    continue
+                if inner == '{':
+                    depth += 1
+                elif inner == '}':
+                    if depth == 0:
+                        break
+                    depth -= 1
+                close += 1
+            else:
+                raise KumaError('文字列内の { } が対応していません', token)
+            substring = raw[index + 1:close]
+            expr_source = substring.strip()
+            if not expr_source:
+                raise KumaError('文字列内の {} は式を指定してください', token)
+            leading_spaces = len(substring) - len(substring.lstrip())
+            segments.append(_Segment(expr_source=expr_source, expr_offset=index + 1 + leading_spaces))
+            literal_start = close + 1
+            index = literal_start
+            continue
+        if ch == '}':
+            if index + 1 < len(raw) - 1 and raw[index + 1] == '}':
+                flush_literal(index)
+                if segments and segments[-1].literal is not None:
+                    segments[-1].literal += '}'
+                else:
+                    segments.append(_Segment(literal='}'))
+                literal_start = index + 2
+                index = literal_start
+                continue
+            raise KumaError('文字列内の { } が対応していません', token)
+        index += 1
+
+    flush_literal(len(raw) - 1)
+
+    texts: list[str] = []
+    expressions: list[Node] = []
+    specs: list[int | None] = []
+    pending_text = ''
+    for segment in segments:
+        if segment.literal is not None:
+            pending_text += segment.literal
+        else:
+            texts.append(pending_text)
+            pending_text = ''
+            try:
+                sub = Parser(segment.expr_source or '', cpp=owner.cpp)
+                sub.tokens = [Token(t.kind, t.text, token.line,
+                                    token.column + segment.expr_offset + t.column - 1,
+                                    token.indent) for t in sub.tokens]
+                sub.user_types = owner.user_types
+                sub.bare_functions = owner.bare_functions
+                expr = sub.expression()
+                spec = None
+                if sub.current.text == ':':
+                    suffix_offset = sub.current.column - token.column - segment.expr_offset + 1
+                    suffix = (segment.expr_source or '')[suffix_offset:]
+                    precision = re.fullmatch(r'\.([0-9]{1,2})f', suffix)
+                    if precision is None:
+                        raise KumaError('書式は現時点では .2f のような固定小数点のみ対応しています', token)
+                    spec = int(precision.group(1))
+                elif not sub.at_end():
+                    raise KumaError('ここでは !r / !s / !a・デバッグ用の = は未対応です'
+                                    if sub.current.text in {'!', '='} else '式の続きが解釈できません', token)
+            except KumaError as error:
+                raise KumaError('文字列内の式: ' + error.message, token,
+                                hint='プレースホルダ内は単一のKuma式にしてください。') from error
+            expressions.append(expr)
+            specs.append(spec)
+    texts.append(pending_text)
+
+    return Node('interpolated', token, children=expressions, extra={'texts': texts, 'specs': specs})

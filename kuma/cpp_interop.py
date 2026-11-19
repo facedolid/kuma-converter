@@ -1200,6 +1200,27 @@ class CppParser(InitializerSupport, Parser):
                     ) from error
                 raise
             return Node('cpp_loop', start, header, extra={'body': body})
+        if self.depth and start.text in {'read', 'write'}:
+            operand = self.tokens[self.position + 1]
+            # Native calls, subscripts, operators and declarations keep their
+            # C++ meaning. A quoted write operand cannot begin a declaration.
+            literal_write = start.text == 'write' and operand.kind in {'STRING', 'CHAR', 'NUMBER'}
+            bare_expr = operand.kind == 'IDENT' or (
+                start.text == 'write' and operand.text in {'+', '-', '!', '~', '*', '&'})
+            if bare_expr:
+                last = self.position + 2
+                while self.tokens[last].kind not in {'NEWLINE', 'EOF'} and self.tokens[last].text not in {';', '}'}:
+                    last += 1
+                while self.tokens[last].kind == 'NEWLINE':
+                    last += 1
+                bare_expr = self.tokens[last].text != ';'
+                if start.text == 'write' and operand.text == 'f':
+                    quoted = self.tokens[self.position + 2]
+                    if (quoted.kind in {'STRING', 'CHAR'} and quoted.line == operand.line
+                            and quoted.column == operand.column + len(operand.text)):
+                        literal_write = True
+            if literal_write or bare_expr:
+                return super().statement()
         if self.depth:
             parenthesized = self.parenthesized_println_slice()
             if parenthesized is not None:
@@ -1776,6 +1797,10 @@ class CppEmitter:
             if self.type_probe and kind == 'name' and value in self.type_bindings:
                 return self.type_bindings[value]
             return self.mark(value, node.token)
+        if kind == 'interpolated':
+            from .compiler import emit_string, quote
+            return emit_string(node.extra['texts'], node.extra['specs'],
+                               [self.expr(child) for child in node.children], quote)
         if kind == 'literal':
             literal = self.mark(value, node.token)
             if not native and node.extra['type'] == 'i64' and re.fullmatch(r"[0-9][0-9']*", value): return literal + 'LL'
@@ -1919,7 +1944,21 @@ class CppEmitter:
                           'sort', 'sorted', 'reverse', 'reversed', 'len', 'reduce', 'any',
                           'all', 'some', 'every', 'discard_line', 'min', 'max', 'abs'}
             native_args = kind == 'method' or (kind == 'call' and value not in kuma_calls | set(_TYPES))
-            args = [self.expr(c, native=native_args) for c in node.children]
+            from .compiler import (_SCALAR_CONVERSION_METHODS, _STRING_PAD_METHODS,
+                                   emit_mixed_scalar_conversion, emit_mixed_string_pad)
+            extension_members = _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
+            args = [self.expr(c, native=(native_args and not (
+                        not native and c.kind == 'method' and c.value in extension_members)))
+                    for c in node.children]
+            if not native and kind == 'method' and not node.extra.get('pointer'):
+                if value in _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS:
+                    self.options(node, kw)
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    if value in _STRING_PAD_METHODS:
+                        return emit_mixed_string_pad(value, args[0], args[1:], self.fresh)
+                    return emit_mixed_scalar_conversion(value, args[0], args[1:], self.fresh)
             if value in {'sort', 'sorted', 'reverse', 'reversed'} and not node.extra.get('pointer'):
                 sorting = value in {'sort', 'sorted'}
                 self.options(node, kw, {'start', 'end', 'compare'} if sorting else {'start', 'end'})
@@ -2238,6 +2277,17 @@ class CppEmitter:
                                       'kuma_rt::' + reader + '<' + self.vector_input_marker
                                       + probe_target + '*/long long>', 1)
             return prefix + marker + target + ' ' + node.value + ' ' + value + ';'
+        if kind == 'read':
+            targets = []
+            for child in node.children:
+                if child.kind not in {'name', 'index', 'member'}:
+                    self.fail(node, 'read の対象は変数または配列要素にしてください')
+                targets.append(self.expr(child))
+            steps = (f'std::cin >> ({target}); kuma_rt::check_input();' for target in targets)
+            return prefix + '{ ' + ' '.join(steps) + ' }'
+        if kind == 'write':
+            parts = (f'std::cout << ({self.expr(argument)});' for argument in node.children)
+            return prefix + '{ ' + ' '.join(parts) + ' }'
         if kind == 'exprstmt': return prefix + self.expr(node.children[0]) + ';'
         if kind in {'return', 'break', 'continue'}:
             return prefix + kind + (' ' + self.expr(node.children[0]) if node.children else '') + ';'
