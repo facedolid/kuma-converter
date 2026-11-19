@@ -1388,6 +1388,22 @@ def _simple_slice_bound(segment) -> bool:
     return False
 
 
+def _lexer_double_colon_slice_bounds(inner) -> bool:
+    """Kuma slices where the lexer kept ``::``; reject ``[::ident]`` C++ subscripts."""
+    if not any(token.text == '::' for token in inner):
+        return False
+    if any(token.text == ':' for token in inner):
+        return False
+    for index, token in enumerate(inner):
+        if token.text == '::' and index + 1 < len(inner) and inner[index + 1].kind == 'IDENT':
+            return False
+    if inner[0].text == '::':
+        return _simple_slice_bound(inner[1:])
+    split = next(i for i, token in enumerate(inner) if token.text == '::')
+    return (_simple_slice_bound(inner[:split])
+            and _simple_slice_bound(inner[split + 1:]))
+
+
 def compound_assign_kuma_slice_member_pattern(tokens) -> bool:
     """``lhs +=|-= recv[bounds].size|empty``; bounds are empty, ident, or signed decimal int."""
     compact = [t for t in tokens if t.kind not in {'NEWLINE', 'EOF'}]
@@ -1413,9 +1429,10 @@ def compound_assign_kuma_slice_member_pattern(tokens) -> bool:
         else:
             current.append(token)
     segments.append(current)
-    if not (2 <= len(segments) <= 3):
-        return False
-    return all(_simple_slice_bound(part) for part in segments)
+    if 2 <= len(segments) <= 3 and all(_simple_slice_bound(part) for part in segments):
+        return True
+    inner = compact[4:close]
+    return _lexer_double_colon_slice_bounds(inner)
 
 
 def line_eof_input_allowed(type_names):
