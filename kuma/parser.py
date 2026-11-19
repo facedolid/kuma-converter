@@ -241,6 +241,9 @@ class Parser:
             self.position = position
 
         if ((self.current.text in _TYPE_NAMES | self.user_types and self.tokens[self.position + 1].text != "(")
+                or (self.current.text == "bitset" and self.current.text not in self.user_types
+                    and self.tokens[self.position + 1].text == "<"
+                    and self.tokens[self.position + 2].kind == "NUMBER")
                 or (self.current.text in {"min_heap", "max_heap", "deque"} and self.current.text not in self.user_types
                     and self.tokens[self.position + 1].text == "<"
                     and (self.tokens[self.position + 2].text in _TYPE_NAMES | self.user_types or self.tokens[self.position + 2].text == "("))
@@ -520,6 +523,10 @@ class Parser:
             if len(arguments) != 1:
                 raise KumaError("型引数は1個にしてください", name)
             return name.text + "<" + arguments[0] + ">"
+        if name.text == "bitset" and name.text not in self.user_types and self.current.text == "<":
+            self.expect("<")
+            width = self.bitset_width_literal(name)
+            return f"bitset<{width}>"
         if name.text in _SCALARS | {"auto", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"} | self.user_types:
             return name.text
         if name.text in {"vec", "vector", "tuple", "prefix2d", *_CONSTRUCTORS}:
@@ -530,6 +537,21 @@ class Parser:
                 raise KumaError(f"{name.text} の型引数は {arity} 個です", name)
             return name.text + "<" + ",".join(arguments) + ">"
         raise KumaError(f"現時点では未対応の型です: {name.text}", name)
+
+    def bitset_width_literal(self, token: Token) -> str:
+        if self.current.kind != "NUMBER" or "." in self.current.text:
+            raise KumaError("bitset の幅は 0 以上の10進整数リテラルにしてください", self.current)
+        width = self.take().text
+        if not re.fullmatch(r"[0-9]+", width):
+            raise KumaError("bitset の幅は 0 以上の10進整数リテラルにしてください", token)
+        self.soft_newlines()
+        if self.current.text == ">>":
+            marker = self.current
+            self.type_splits.append((self.position, marker))
+            self.tokens[self.position] = Token(">", ">", marker.line, marker.column + 1, marker.indent)
+        else:
+            self.expect(">", "bitset の型引数を閉じる > が必要です")
+        return width
 
     def type_arguments_after_open(self) -> list[str]:
         self.newlines()
@@ -720,6 +742,12 @@ class Parser:
                 types = self.type_arguments_after_open()
                 arguments, keywords = self.arguments()
                 return Node("call", token, token.text, arguments, {"types": types, "kwargs": keywords})
+            if token.text == "bitset" and self.accept("<"):
+                width = self.bitset_width_literal(token)
+                arguments, keywords = self.arguments()
+                if arguments or keywords:
+                    raise KumaError("bitset<N>() と書いてください", token)
+                return Node("call", token, "bitset", arguments, {"types": [width], "kwargs": keywords})
             if token.text == "input":
                 types = self.type_arguments_after_open() if self.accept("<") else []
                 if self.current.text == "(":
@@ -798,7 +826,7 @@ class Parser:
         while self.current.text != ")":
             annotation = None
             const = bool(self.accept("const"))
-            if self.current.text in _TYPE_NAMES | self.user_types | {"deque", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"} or self.current.text == "(":
+            if self.current.text in _TYPE_NAMES | self.user_types | {"deque", "bitset", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"} or self.current.text == "(":
                 annotation = self.type_name()
                 if annotation == "auto":
                     annotation = None

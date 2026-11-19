@@ -1826,6 +1826,15 @@ class CppEmitter:
                 left, right = self.fresh('power_base'), self.fresh('power_exponent')
                 return (f'([&]() {{ auto {left} = {a}; auto {right} = {b}; '
                         f'return kuma_rt::power_m8({left}, {right}); }}())')
+            # Giving a forwarding-reference parameter a native bit-field is
+            # ill-formed. An opaque member read (or a conditional selecting one)
+            # keeps the original operator rather than guessing the member type.
+            forwardable = all(child.kind not in {'cpp_expr', 'ternary'} and
+                              (child.kind != 'member' or child.extra.get('optional_collection_call'))
+                              for child in node.children)
+            if value in ('+', '-', '*', '/') and not native and forwardable:
+                from .compiler import emit_mixed_binary
+                return emit_mixed_binary(value, a, b, self.fresh, type_probe=self.type_probe)
             return f'kuma_rt::range({a}, {b})' if value == '..' else f'({a} {value} {b})'
         if kind == 'ternary':
             c, a, b = (self.expr(c, native=native) for c in node.children)
@@ -1944,9 +1953,10 @@ class CppEmitter:
                           'sort', 'sorted', 'reverse', 'reversed', 'len', 'reduce', 'any',
                           'all', 'some', 'every', 'discard_line', 'min', 'max', 'abs'}
             native_args = kind == 'method' or (kind == 'call' and value not in kuma_calls | set(_TYPES))
-            from .compiler import (_SCALAR_CONVERSION_METHODS, _STRING_PAD_METHODS,
-                                   emit_mixed_scalar_conversion, emit_mixed_string_pad)
-            extension_members = _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
+            from .compiler import (_SCALAR_CONVERSION_METHODS, _SEQUENCE_ARITHMETIC_METHODS,
+                                   _STRING_PAD_METHODS, emit_mixed_scalar_conversion,
+                                   emit_mixed_sequence_method, emit_mixed_string_pad)
+            extension_members = _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS | _SEQUENCE_ARITHMETIC_METHODS
             args = [self.expr(c, native=(native_args and not (
                         not native and c.kind == 'method' and c.value in extension_members)))
                     for c in node.children]
@@ -1986,6 +1996,14 @@ class CppEmitter:
                     'sort': 'cpp_sort', 'sorted': 'cpp_sorted',
                     'reverse': 'cpp_reverse', 'reversed': 'cpp_reversed'}[value]
                 return 'kuma_rt::' + helper + '(' + ', '.join(args) + ')'
+            if (kind == 'method' and not native and len(args) == 2 and
+                    not node.extra.get('pointer') and not kw and not node.extra.get('types')):
+                if value in _SEQUENCE_ARITHMETIC_METHODS:
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return emit_mixed_sequence_method(value, args[0], args[1], self.fresh,
+                                                      type_probe=self.type_probe)
             if kind == 'method' and value in member_helpers and not node.extra.get('pointer'):
                 self.options(node, kw)
                 return f'kuma_rt::cpp_member_{value}(' + ', '.join(args) + ')'

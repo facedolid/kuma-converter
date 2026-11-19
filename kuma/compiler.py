@@ -52,6 +52,8 @@ class Type:
             return "kuma_rt::EnumerateView<" + self.args[1].cpp() + ", " + self.args[0].cpp() + ">"
         if self.name == "zip_view":
             return "kuma_rt::ZipView<" + ", ".join(t.cpp() for t in self.args) + ">"
+        if self.name == "bitset":
+            return f"std::bitset<{self.args[0].name}>"
         template = {"vec": "std::vector", "tuple": "std::tuple", "pair": "std::pair",
                     "set": "std::set", "dict": "std::map", "deque": "std::deque", "SortedList": "kuma_rt::SortedList", "prefix2d": "kuma_rt::Prefix2D"}[self.name]
         return template + "<" + ", ".join(t.cpp() for t in self.args) + ">"
@@ -86,8 +88,17 @@ BUILTINS = {
 }
 
 
+def bitset_width(text: str, token: Token) -> str:
+    # Bound size()/count() to Kuma's signed integer result type. Normalize
+    # leading zeroes so C++ never interprets a decimal Kuma width as octal.
+    width = text.lstrip("0") or "0"
+    if not re.fullmatch(r"[0-9]+", text) or len(width) > 19 or int(width) >= 2**63:
+        raise KumaError("bitset の幅は 0 以上の i64 整数リテラルにしてください", token)
+    return width
+
+
 def parse_type(text: str, token: Token, *, records=None, allow_owned_heaps=False) -> Type:
-    tokens = re.findall(r"[A-Za-z_][A-Za-z_0-9]*|[<>,()]", text.replace("long long", "longlong"))
+    tokens = re.findall(r"[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[<>,()]", text.replace("long long", "longlong"))
     pos = 0
 
     def one() -> Type:
@@ -105,6 +116,12 @@ def parse_type(text: str, token: Token, *, records=None, allow_owned_heaps=False
             close = None
         name = ALIASES.get(name, name)
         args = []
+        if close == ">" and name == "bitset":
+            if pos + 1 >= len(tokens) or tokens[pos + 1] != ">":
+                raise KumaError("型は bitset<N> と書いてください", token)
+            width = bitset_width(tokens[pos], token)
+            pos += 2
+            return Type("bitset", (Type(width),))
         if close:
             args.append(one())
             while pos < len(tokens) and tokens[pos] == ",":
@@ -273,6 +290,100 @@ def emit_string_pad(method, receiver, width, fill="' '"):
     side = _STRING_PAD_SIDES[method]
     fill_arg = "'0'" if method == "zfill" else fill
     return (f"kuma_rt::string_pad({receiver}, {width}, {fill_arg}, {side})")
+
+
+def emit_string_repeat(string, count):
+    return f"kuma_rt::string_repeat({string}, {count})"
+
+
+_CHAR_LIKE_INTEGRALS = (
+    "char", "signed char", "unsigned char", "wchar_t", "char8_t", "char16_t", "char32_t",
+)
+
+
+def _mixed_genuine_integral(bare: str) -> str:
+    return (f"(std::is_integral_v<{bare}> && !std::is_same_v<{bare}, bool>"
+            + "".join(f" && !std::is_same_v<{bare}, {t}>" for t in _CHAR_LIKE_INTEGRALS) + ")")
+
+
+def numeric_vec_type(type_: Type) -> bool:
+    return type_.name == "vec" and type_.args[0] in NUMBER
+
+
+def emit_mixed_binary(op: str, left_expr, right_expr, fresh, *, type_probe=False):
+    left, right = (fresh(suffix) for suffix in ("bin_l", "bin_r"))
+    typ_l, typ_r = (fresh(suffix) for suffix in ("bin_tl", "bin_tr"))
+    bare_l, bare_r = (fresh(suffix) for suffix in ("bin_bl", "bin_br"))
+    forward_l, forward_r = f"std::forward<{typ_l}>({left})", f"std::forward<{typ_r}>({right})"
+    native = f"({forward_l}) {op} ({forward_r})"
+    setup = (f"using {bare_l} = std::remove_cvref_t<{typ_l}>; "
+             f"using {bare_r} = std::remove_cvref_t<{typ_r}>; ")
+    branches = []
+    vec_l, vec_r = (f"kuma_rt::kuma_numeric_vector<{bare}>::value" for bare in (bare_l, bare_r))
+    scalar_l, scalar_r = (f"kuma_rt::kuma_arithmetic_scalar<{bare}>" for bare in (bare_l, bare_r))
+    if op in {"+", "-"}:
+        helper = {"+": "add", "-": "sub"}[op]
+        branches.append(f"if constexpr ({vec_l} && {vec_r}) {{ "
+                        f"if constexpr (requires {{ {native}; }}) {{ "
+                        f"kuma_rt::kuma_vector_same_size({left}, {right}); return {native}; }} else "
+                        f"return kuma_rt::kuma_vector_{helper}({forward_l}, {forward_r}); }} else ")
+    elif op == "*":
+        string_l, string_r = (f"std::is_same_v<{bare}, std::string>" for bare in (bare_l, bare_r))
+        int_l, int_r = _mixed_genuine_integral(bare_l), _mixed_genuine_integral(bare_r)
+        branches.append(f"if constexpr (requires {{ {native}; }}) return {native}; else ")
+        for condition, helper in ((f"{vec_l} && {scalar_r}", "mul"), (f"{scalar_l} && {vec_r}", "rmul")):
+            branches.append(f"if constexpr ({condition}) "
+                            f"return kuma_rt::kuma_vector_{helper}({forward_l}, {forward_r}); else ")
+        branches.append(f"if constexpr ({string_l} && {int_r}) "
+                        f"return {emit_string_repeat(forward_l, forward_r)}; else ")
+        branches.append(f"if constexpr ({int_l} && {string_r}) "
+                        f"return {emit_string_repeat(forward_r, forward_l)}; else ")
+    elif op == "/":
+        branches.append(f"if constexpr ({vec_l} && {scalar_r}) {{ "
+                        f"if constexpr (requires {{ {native}; }}) {{ "
+                        f"kuma_rt::kuma_vector_divisor_ok({left}, {right}); return {native}; }} else "
+                        f"return kuma_rt::kuma_vector_div({forward_l}, {forward_r}); }} else ")
+    body = setup + "".join(branches) + f"return {native};"
+    if type_probe:
+        return (f"([]<class {typ_l}, class {typ_r}>({typ_l}&& {left}, {typ_r}&& {right}) -> decltype(auto) "
+                f"{{ {body} }}({left_expr}, {right_expr}))")
+    return (f"([&]<class {typ_l}>({typ_l}&& {left}) -> decltype(auto) {{ "
+            f"return ([&]<class {typ_r}>({typ_r}&& {right}) -> decltype(auto) "
+            f"{{ {body} }}({right_expr})); }}({left_expr}))")
+
+
+_SEQUENCE_ARITHMETIC_METHODS = frozenset({"dot", "mul_each", "concat", "repeat"})
+
+
+def emit_mixed_sequence_method(name, recv_expr, arg_expr, fresh, *, type_probe=False):
+    left, right = (fresh(suffix) for suffix in ("seq_l", "seq_r"))
+    tl, tr = (fresh(suffix) for suffix in ("seq_tl", "seq_tr"))
+    force_l, force_r = f"std::forward<{tl}>({left})", f"std::forward<{tr}>({right})"
+    bare_l, bare_r = (fresh(suffix) for suffix in ("seq_bl", "seq_br"))
+    native = f"({force_l}).{name}({force_r})"
+    body = (f"using {bare_l} = std::remove_cvref_t<{tl}>; "
+            f"using {bare_r} = std::remove_cvref_t<{tr}>; "
+            f"if constexpr (requires {{ {native}; }}) return {native}; else ")
+    if name in {"dot", "mul_each"}:
+        body += (f"if constexpr (kuma_rt::kuma_numeric_vector<{bare_l}>::value && "
+                 f"kuma_rt::kuma_numeric_vector<{bare_r}>::value) "
+                 f"return kuma_rt::vector_{name}({left}, {right}); else ")
+    elif name == "concat":
+        body += (f"if constexpr (kuma_rt::is_plain_vector<{bare_l}> && std::is_same_v<{bare_l}, {bare_r}>) "
+                 f"return kuma_rt::vector_concat({left}, {right}); else ")
+    elif name == "repeat":
+        integral = _mixed_genuine_integral(bare_r)
+        body += (f"if constexpr ({integral} && std::is_same_v<{bare_l}, std::string>) "
+                 f"return kuma_rt::string_repeat({left}, {right}); else "
+                 f"if constexpr ({integral} && kuma_rt::is_plain_vector<{bare_l}>) "
+                 f"return kuma_rt::vector_repeat({left}, {right}); else ")
+    body += f"return {native};"
+    if type_probe:
+        return (f"([]<class {tl}, class {tr}>({tl}&& {left}, {tr}&& {right}) -> decltype(auto) "
+                f"{{ {body} }}({recv_expr}, {arg_expr}))")
+    return (f"([&]<class {tl}>({tl}&& {left}) -> decltype(auto) {{ "
+            f"return ([&]<class {tr}>({tr}&& {right}) -> decltype(auto) "
+            f"{{ {body} }}({arg_expr})); }}({recv_expr}))")
 
 
 def emit_mixed_string_pad(method, recv_expr, args, fresh):
@@ -517,6 +628,8 @@ class Compiler(DeclarationSupport):
             if node.value == "!":
                 self.condition(val, node)
                 return Value(f"(!({val.code}))", BOOL)
+            if val.type.name == "bitset" and node.value == "~":
+                return Value(f"(~{val.code})", val.type)
             if val.type not in NUMBER or (node.value == "~" and val.type not in INTEGER):
                 self.fail("この単項演算子に対応しない型です", node)
             constant = val.constant
@@ -561,9 +674,40 @@ class Compiler(DeclarationSupport):
                 if left.type not in INTEGER or right.type not in INTEGER:
                     self.fail("範囲の両端は整数にしてください", node)
                 return self.ordered([left, right], Type("range"), lambda ns: f"kuma_rt::range({ns[0]}, {ns[1]})")
+            if left.type.name == "bitset" or right.type.name == "bitset":
+                if left.type.name == "bitset" and op in ("<<", ">>") and right.type in INTEGER:
+                    result_type = left.type
+                elif left.type == right.type and op in ("&", "|", "^", "==", "!="):
+                    result_type = BOOL if op in ("==", "!=") else left.type
+                else:
+                    self.fail(f"演算 {op} に {left.type} と {right.type} は使えません", node)
+                return self.ordered([left, right], result_type, lambda ns: f"({ns[0]} {op} {ns[1]})")
             numeric = left.type in NUMBER and right.type in NUMBER
             comparison = op in ("==", "!=", "<", "<=", ">", ">=")
             string_concat = op == "+" and left.type == STRING and right.type in (STRING, CHAR)
+            string_repeat = (op == "*" and ((left.type == STRING and right.type in INTEGER)
+                                            or (right.type == STRING and left.type in INTEGER)))
+            if string_repeat:
+                order = (0, 1) if left.type == STRING else (1, 0)
+                return self.ordered([left, right], STRING,
+                                    lambda ns: emit_string_repeat(ns[order[0]], ns[order[1]]))
+            if op in ("+", "-") and numeric_vec_type(left.type) and numeric_vec_type(right.type):
+                elem = self.common_type([left.type.args[0], right.type.args[0]], node)
+                result_type = Type("vec", (elem,))
+                helper = "kuma_rt::kuma_vector_add" if op == "+" else "kuma_rt::kuma_vector_sub"
+                return self.ordered([left, right], result_type, lambda ns: f"{helper}({ns[0]}, {ns[1]})")
+            if op == "*" and numeric_vec_type(left.type) and right.type in NUMBER:
+                elem = self.common_type([left.type.args[0], right.type], node)
+                return self.ordered([left, right], Type("vec", (elem,)),
+                                    lambda ns: f"kuma_rt::kuma_vector_mul({ns[0]}, {ns[1]})")
+            if op == "*" and left.type in NUMBER and numeric_vec_type(right.type):
+                elem = self.common_type([left.type, right.type.args[0]], node)
+                return self.ordered([left, right], Type("vec", (elem,)),
+                                    lambda ns: f"kuma_rt::kuma_vector_rmul({ns[0]}, {ns[1]})")
+            if op == "/" and numeric_vec_type(left.type) and right.type in NUMBER:
+                elem = self.common_type([left.type.args[0], right.type], node)
+                return self.ordered([left, right], Type("vec", (elem,)),
+                                    lambda ns: f"kuma_rt::kuma_vector_div({ns[0]}, {ns[1]})")
             if not (numeric or string_concat or (left.type == right.type and comparison)):
                 hint = None
                 lhs = node.children[0]
@@ -674,6 +818,16 @@ class Compiler(DeclarationSupport):
                                  lvalue=True, origins=sequence.origins, readonly=True)
                 result = self.ordered([sequence], target, lambda ns: f"std::get<{int(index.constant)}>({ns[0]})")
                 return result
+            if sequence.type.name == "bitset":
+                if index.type not in INTEGER:
+                    self.fail("bitset の添字は整数にしてください", node)
+                seqname, idxname = self.fresh("bitset"), self.fresh("bitset_index")
+                ret = "bool" if not sequence.lvalue else "decltype(auto)"
+                code = (f"([&]() -> {ret} {{ auto&& {seqname} = {sequence.code}; "
+                        f"auto {idxname} = {index.code}; return {seqname}[{idxname}]; }}())")
+                return Value(code, BOOL, lvalue=sequence.lvalue,
+                             origins=sequence.origins if sequence.lvalue else frozenset(),
+                             readonly=sequence.readonly)
             if sequence.type.name not in ("vec", "string", "deque") or index.type not in INTEGER:
                 self.fail("添字は配列・文字列・deque に対する整数だけに対応しています", node,
                           hint=f"添字を付ける対象の型は {sequence.type}、添字の型は {index.type} です。")
@@ -1458,6 +1612,28 @@ class Compiler(DeclarationSupport):
         converted = self.lower_scalar_conversion(node)
         if converted is not None:
             return converted
+        if node.kind == "method" and name in _SEQUENCE_ARITHMETIC_METHODS:
+            if len(args) != 2 or kwargs or node.extra.get("types"):
+                self.fail(f"{name} の引数を1個指定してください", node)
+            left = self.expr(args[0])
+            right = self.expr(args[1], left.type if name == "concat" else None)
+            if name == "repeat":
+                if left.type != STRING and left.type.name != "vec":
+                    self.fail("repeat は文字列か配列に使ってください", node)
+                if right.type not in INTEGER:
+                    self.fail("repeat の回数は整数にしてください", node)
+                result, helper = left.type, "string_repeat" if left.type == STRING else "vector_repeat"
+            elif name == "concat":
+                if left.type.name != "vec" or left.type != right.type:
+                    self.fail("concat には要素型が同じ配列を指定してください", node)
+                result, helper = left.type, "vector_concat"
+            else:
+                if not numeric_vec_type(left.type) or not numeric_vec_type(right.type):
+                    self.fail(f"{name} は数値配列同士に使ってください", node)
+                element = self.common_type([left.type.args[0], right.type.args[0]], node)
+                result = element if name == "dot" else Type("vec", (element,))
+                helper = f"vector_{name}"
+            return self.ordered([left, right], result, lambda ns: f"kuma_rt::{helper}({ns[0]}, {ns[1]})")
         if node.kind == "call" and name == "SortedList":
             if set(kwargs) - {"key"} or node.extra.get("types") or len(args) > 1:
                 self.fail("SortedList([配列], key=関数) と書いてください", node)
@@ -1507,6 +1683,34 @@ class Compiler(DeclarationSupport):
             if not values:
                 values = [Value(f"std::vector<{element.cpp()}>{{}}", Type("vec", (element,)))]
             return self.ordered(values, result, lambda ns: result.cpp() + "(" + ns[0] + ", " + code + ")")
+        if node.kind == "method" and name in ("size", "count", "test", "any", "all", "none", "set", "reset", "flip"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "bitset":
+                mutators = {"set", "reset", "flip"}
+                if kwargs or node.extra.get("types"):
+                    self.fail(f"bitset の {name} の引数を確認してください", node)
+                extra = len(args) - 1
+                limits = {
+                    "size": (0, 0), "count": (0, 0), "any": (0, 0), "all": (0, 0), "none": (0, 0),
+                    "test": (1, 1), "set": (0, 2), "reset": (0, 1), "flip": (0, 1),
+                }
+                lo, hi = limits[name]
+                if extra < lo or extra > hi:
+                    self.fail(f"bitset の {name} の引数を確認してください", node)
+                if name in mutators:
+                    self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = []
+                    for i, arg in enumerate(args[1:]):
+                        target = BOOL if name == "set" and i == 1 else I64
+                        values.append(self.coerce(self.expr(arg), target, node))
+                recv = self.fresh("bitset")
+                result_type = VOID if name in mutators else (I64 if name in ("size", "count") else BOOL)
+                tail = self.ordered(values, result_type,
+                                    lambda ns: (f"static_cast<long long>({recv}.{name}())" if name in ("size", "count")
+                                                else f"{recv}.{name}(" + ", ".join(ns) + ")"))
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; "
+                             + ("" if result_type == VOID else "return ") + tail.code + "; }())", result_type)
         if node.kind == "method" and name in ("size", "empty", "front", "back", "clear", "push_front", "push_back", "pop_front", "pop_back"):
             receiver = self.expr(args[0])
             if receiver.type.name == "deque":
@@ -1769,6 +1973,13 @@ class Compiler(DeclarationSupport):
             return self.input_call(node, expected)
         if node.kind == "call" and (name in ("set", "dict", "pair") or name == "map" and node.extra.get("types")):
             return self.construct_collection(node, expected)
+        if node.kind == "call" and name == "bitset" and node.extra.get("types"):
+            types = node.extra["types"]
+            if kwargs or len(types) != 1 or args:
+                self.fail("bitset<N>() と書いてください", node)
+            width = bitset_width(types[0], node.token)
+            result = Type("bitset", (Type(width),))
+            return Value(result.cpp() + "()", result)
         if node.extra.get("types"):
             self.fail("この呼び出しの明示型引数は未対応です", node)
         if node.kind == "call" and (name not in BUILTINS or name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")):
@@ -3120,14 +3331,37 @@ class Compiler(DeclarationSupport):
                 return prefix + (f"{{ auto&& {target} = {left.code}; "
                                  f"{result_type.cpp()} {base} = {target}; "
                                  f"{target} = {power.code}; }}")
+            if numeric_vec_type(left.type) and node.value in ("+=", "-=", "*=", "/="):
+                with self.protect(protected):
+                    right = self.expr(node.children[1])
+                    self.owned(right, node)
+                if node.value in ("+=", "-=") and not numeric_vec_type(right.type):
+                    self.fail("配列の複合代入の右辺は数値配列にしてください", node)
+                if node.value in ("*=", "/=") and right.type not in NUMBER:
+                    self.fail("配列の複合代入の右辺は数値にしてください", node)
+                if node.value in ("+=", "-="):
+                    merged = self.common_type([left.type.args[0], right.type.args[0]], node)
+                else:
+                    merged = self.common_type([left.type.args[0], right.type], node)
+                if merged != left.type.args[0]:
+                    self.fail("複合代入の結果型が左辺より狭くなることはできません", node)
+                helpers = {"+=": "kuma_vector_iadd", "-=": "kuma_vector_isub",
+                           "*=": "kuma_vector_imul", "/=": "kuma_vector_idiv"}
+                target, source = self.fresh(), self.fresh()
+                return (prefix + f"{{ auto&& {target} = {left.code}; auto&& {source} = {right.code}; "
+                        f"kuma_rt::{helpers[node.value]}({target}, {source}); }}")
             with self.protect(protected):
                 right = self.expr(node.children[1], left.type)
                 self.owned(right, node)
-                right = self.coerce(right, left.type, node)
+                bitset_shift = left.type.name == "bitset" and node.value in ("<<=", ">>=")
+                right = self.coerce(right, I64 if bitset_shift else left.type, node)
             if node.value != "=":
-                if left.type not in NUMBER and not (left.type == STRING and node.value == "+="):
+                if left.type.name == "bitset":
+                    if node.value not in ("|=", "&=", "^=", "<<=", ">>="):
+                        self.fail("この型の複合代入には対応していません", node)
+                elif left.type not in NUMBER and not (left.type == STRING and node.value == "+="):
                     self.fail("この型の複合代入には対応していません", node)
-                if node.value in ("%=", "&=", "|=", "^=", "<<=", ">>=") and left.type not in INTEGER:
+                elif node.value in ("%=", "&=", "|=", "^=", "<<=", ">>=") and left.type not in INTEGER:
                     self.fail("この複合代入は整数に使ってください", node)
             target, source = self.fresh(), self.fresh()
             return prefix + f"{{ auto&& {target} = {left.code}; {right.type.cpp()} {source} = {right.code}; {target} {node.value} {source}; }}"
