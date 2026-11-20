@@ -30,7 +30,8 @@ class Type:
     def cpp(self) -> str:
         scalar = {"i64": "long long", "i32": "int", "f64": "double",
                   "string": "std::string", "bool": "bool", "char": "char",
-                  "void": "void", "range": "kuma_rt::Range", "union_find": "::UnionFind", "dfs_result": "::DfsResult"}
+                  "void": "void", "range": "kuma_rt::Range", "union_find": "::UnionFind",
+                  "dynamic_bitset": "kuma_rt::DynamicBitset", "dfs_result": "::DfsResult"}
         if self.name.startswith("record:"):
             return "kuma_gen_type_" + self.name.removeprefix("record:")
         if self.name in scalar:
@@ -58,6 +59,8 @@ class Type:
             return f"kuma_rt::SubmasksView<{self.args[0].cpp()}>"
         if self.name == "bitset":
             return f"std::bitset<{self.args[0].name}>"
+        if self.name == "descending_integral_key":
+            return f"ac::descending_integral_key<{self.args[0].cpp()}>"
         template = {"vec": "std::vector", "tuple": "std::tuple", "pair": "std::pair",
                     "set": "std::set", "dict": "std::map", "deque": "std::deque", "SortedList": "kuma_rt::SortedList", "prefix2d": "kuma_rt::Prefix2D"}[self.name]
         return template + "<" + ", ".join(t.cpp() for t in self.args) + ">"
@@ -84,7 +87,7 @@ RESERVED = {
     "template", "abs", "flush", "reduce", "any", "all", "count", "some", "every",
 }
 BUILTINS = {
-    "range", "SortedList", "deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "prefix_sum", "prefix_sum2d", "prefix2d", "range_sum", "lower_bound_idx", "upper_bound_idx", "equal_range_idx", "has_bit", "bit_count", "bit_ctz", "rotate90", "transpose", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices", "frequencies", "read_graph", "read_weighted_graph", "bfs_dist", "dijkstra_dist", "bfs_path", "dijkstra_path",
+    "range", "SortedList", "deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "prefix_sum", "prefix_sum2d", "prefix2d", "range_sum", "lower_bound_idx", "upper_bound_idx", "equal_range_idx", "has_bit", "bit_count", "bit_ctz", "rotate90", "transpose", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices", "frequencies", "read_graph", "read_weighted_graph", "bfs_dist", "dijkstra_dist", "bfs_path", "dijkstra_path",
     "input", "print", "len", "size", "sum", "sort", "sorted", "reverse",
     "reversed", "min", "max", "discard_line", "map", "filter",
     "i32", "int", "i64", "ll", "f64", "double", "zip", "enumerate", "lazy", "zip_view", "enumerate_view",
@@ -239,6 +242,18 @@ _SCALAR_CONVERSION_METHODS = frozenset({
 _STRING_PAD_METHODS = frozenset({"zfill", "pad_start", "pad_end"})
 
 _SCALAR_METHOD_DISPATCH = _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
+
+_BETWEEN_METHODS = frozenset({"between"})
+
+_COUNT_IF_METHODS = frozenset({"count_if"})
+
+_FIND_IDX_METHODS = frozenset({"find_idx", "rfind_idx"})
+
+_SORTED_BY_METHODS = frozenset({"sorted_by"})
+
+_FIND_IDX_ELEMENTS = (
+    "int", "long long", "double", "bool", "char", "std::string",
+)
 
 _INTEGER_MASK_METHODS = frozenset({"has_bit", "bit_count", "set_bits", "submasks"})
 
@@ -462,6 +477,150 @@ def emit_mixed_string_pad(method, recv_expr, args, fresh):
             f"using {bare} = std::remove_cvref_t<{typ}>; {branch}return {native}; }}(({recv_expr})))")
 
 
+def emit_mixed_between(recv_expr, lo_expr, hi_expr, fresh, *, string_literals, type_probe=False):
+    sr, sl, sh = (fresh(suffix) for suffix in ("btw_sr", "btw_sl", "btw_sh"))
+    rx, lx, hx = (fresh(suffix) for suffix in ("btw_rx", "btw_lx", "btw_hx"))
+    tl, tlo, thi = (fresh(suffix) for suffix in ("btw_tl", "btw_tlo", "btw_thi"))
+    bl, blo, bhi = (fresh(suffix) for suffix in ("btw_bl", "btw_blo", "btw_bhi"))
+    fwd_r, fwd_l, fwd_h = (f"std::forward<{t}>({a})" for t, a in ((tl, rx), (tlo, lx), (thi, hx)))
+    native = f"({fwd_r}).between({fwd_l}, {fwd_h})"
+    setup = (f"using {bl} = std::remove_cvref_t<{tl}>; "
+             f"using {blo} = std::remove_cvref_t<{tlo}>; "
+             f"using {bhi} = std::remove_cvref_t<{thi}>; ")
+    numeric = (f"kuma_rt::kuma_arithmetic_scalar<{bl}> && "
+               f"kuma_rt::kuma_arithmetic_scalar<{blo}> && "
+               f"kuma_rt::kuma_arithmetic_scalar<{bhi}>")
+    homo_char = (f"std::is_same_v<{bl}, char> && std::is_same_v<{blo}, char> && "
+                 f"std::is_same_v<{bhi}, char>")
+    homo_string = " && ".join(
+        "true" if literal else f"std::is_same_v<{name}, std::string>"
+        for name, literal in zip((bl, blo, bhi), string_literals))
+    closed = f"({fwd_l} <= {fwd_r} && {fwd_r} <= {fwd_h})"
+    v, l, h = (f"std::string_view({value})" for value in (fwd_r, fwd_l, fwd_h))
+    body = (setup
+            + f"if constexpr (requires {{ {native}; }}) return {native}; else "
+            + f"if constexpr ({numeric}) return ::between({fwd_r}, {fwd_l}, {fwd_h}); else "
+            + f"if constexpr ({homo_char}) return {closed}; else "
+            + f"if constexpr ({homo_string}) return ({l} <= {v} && {v} <= {h}); else "
+            + f"return {native};")
+    invoke = (f"[]<class {tl}, class {tlo}, class {thi}>({tl}&& {rx}, {tlo}&& {lx}, {thi}&& {hx}) "
+              f"-> decltype(auto) {{ {body} }}")
+    if type_probe:
+        return f"({invoke})({recv_expr}, {lo_expr}, {hi_expr})"
+    return (f"([&]() {{ auto&& {sr} = {recv_expr}; auto&& {sl} = {lo_expr}; auto&& {sh} = {hi_expr}; "
+            f"return ({invoke})(std::forward<decltype({sr})>({sr}), "
+            f"std::forward<decltype({sl})>({sl}), std::forward<decltype({sh})>({sh})); }}())")
+
+
+def emit_mixed_count_if(recv_expr, pred_expr, fresh, *, type_probe=False):
+    sr, sp = (fresh(suffix) for suffix in ("cif_sr", "cif_sp"))
+    rx, px = (fresh(suffix) for suffix in ("cif_rx", "cif_px"))
+    tl, tp = (fresh(suffix) for suffix in ("cif_tl", "cif_tp"))
+    bare = fresh("cif_bl")
+    fwd_r, fwd_p = f"std::forward<{tl}>({rx})", f"std::forward<{tp}>({px})"
+    native = f"({fwd_r}).count_if({fwd_p})"
+    setup = f"using {bare} = std::remove_cvref_t<{tl}>; "
+    bool_pred = lambda elem: (
+        f"requires {{ {{ {fwd_p}(std::declval<const {elem}&>()) }} -> std::same_as<bool>; }}")
+    kuma_fallback = (
+        f"if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ "
+        f"using Elem = typename {bare}::value_type; "
+        f"if constexpr ({bool_pred('Elem')}) "
+        f"return static_cast<long long>(::count_if(std::as_const({rx}), {fwd_p})); "
+        f"else return {native}; }} "
+        f"else if constexpr (kuma_rt::is_deque<{bare}>::value) {{ "
+        f"using Elem = typename {bare}::value_type; "
+        f"if constexpr (std::is_same_v<{bare}, std::deque<Elem>> && {bool_pred('Elem')}) "
+        f"return static_cast<long long>(::count_if(std::as_const({rx}), {fwd_p})); "
+        f"else return {native}; }} "
+        f"else if constexpr (std::is_same_v<{bare}, std::string>) {{ "
+        f"if constexpr ({bool_pred('char')}) "
+        f"return static_cast<long long>(::count_if(std::as_const({rx}), {fwd_p})); "
+        f"else return {native}; }} "
+        f"else return {native};")
+    body = setup + f"if constexpr (requires {{ {native}; }}) return {native}; else " + kuma_fallback
+    invoke = (f"[]<class {tl}, class {tp}>({tl}&& {rx}, {tp}&& {px}) "
+              f"-> decltype(auto) {{ {body} }}")
+    if type_probe:
+        return f"({invoke})({recv_expr}, {pred_expr})"
+    return (f"([&]() {{ auto&& {sr} = {recv_expr}; auto&& {sp} = {pred_expr}; "
+            f"return ({invoke})(std::forward<decltype({sr})>({sr}), "
+            f"std::forward<decltype({sp})>({sp})); }}())")
+
+
+def _find_idx_element_checks(var: str) -> str:
+    return " || ".join(f"std::is_same_v<{var}, {elem}>" for elem in _FIND_IDX_ELEMENTS)
+
+
+def _find_idx_vector_target_checks(target: str) -> str:
+    signed_cross = (f"((std::is_same_v<Elem, int> && std::is_same_v<{target}, long long>) "
+                    f"|| (std::is_same_v<Elem, long long> && std::is_same_v<{target}, int>))")
+    return f"(std::is_same_v<{target}, Elem> || {signed_cross})"
+
+
+def emit_mixed_find_idx(name, recv_expr, target_expr, fresh, *, type_probe=False):
+    rx, tx = (fresh(suffix) for suffix in ("fidx_rx", "fidx_tx"))
+    tl, tt = (fresh(suffix) for suffix in ("fidx_tl", "fidx_tt"))
+    bare, bare_t = fresh("fidx_bl"), fresh("fidx_bt")
+    fwd_r, fwd_t = f"std::forward<{tl}>({rx})", f"std::forward<{tt}>({tx})"
+    native = f"({fwd_r}).{name}({fwd_t})"
+    elem = _find_idx_element_checks("Elem")
+    fallback = f"return ::{name}({fwd_r}, {fwd_t});"
+    kuma_branch = (
+        f"if constexpr (std::is_same_v<{bare}, std::string>) {{ "
+        f"if constexpr (std::is_same_v<{bare_t}, char>) {{ {fallback} }} "
+        f"else return {native}; }} "
+        f"else if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ "
+        f"using Elem = typename {bare}::value_type; "
+        f"if constexpr ({elem}) {{ "
+        f"if constexpr ({_find_idx_vector_target_checks(bare_t)}) {{ {fallback} }} "
+        f"else return {native}; }} "
+        f"else return {native}; }} "
+        f"else return {native};")
+    body = (f"using {bare} = std::remove_cvref_t<{tl}>; "
+            f"using {bare_t} = std::remove_cvref_t<{tt}>; "
+            f"if constexpr (requires {{ {native}; }}) return {native}; else {kuma_branch}")
+    invoke = (f"[]<class {tl}, class {tt}>({tl}&& {rx}, {tt}&& {tx}) "
+              f"-> decltype(auto) {{ {body} }}")
+    if type_probe:
+        return f"({invoke})({recv_expr}, {target_expr})"
+    # The receiver is evaluated in the postfix expression before the target.
+    # Keep both operands at the caller so their temporaries last through the
+    # enclosing full expression, including for native reference returns.
+    return (f"([]<class {tl}>({tl}&& {rx}) {{ "
+            f"return [&{rx}]<class {tt}>({tt}&& {tx}) -> decltype(auto) "
+            f"{{ {body} }}; }}({recv_expr}))({target_expr})")
+
+
+def _sorted_by_fallback_elem_checks(var: str) -> str:
+    scalars = " || ".join(f"std::is_same_v<{var}, {elem}>" for elem in _FIND_IDX_ELEMENTS)
+    pair = f"std::is_same_v<{var}, std::pair<long long, long long>>"
+    return f"({scalars} || {pair})"
+
+
+def emit_mixed_sorted_by(recv_expr, key_expr, fresh, *, type_probe=False):
+    rx, kx = (fresh(suffix) for suffix in ("sby_rx", "sby_kx"))
+    tl, tk = (fresh(suffix) for suffix in ("sby_tl", "sby_tk"))
+    bare = fresh("sby_bl")
+    fwd_r, fwd_k = f"std::forward<{tl}>({rx})", f"std::forward<{tk}>({kx})"
+    native = f"({fwd_r}).sorted_by({fwd_k})"
+    fallback = f"return ::sorted_by({fwd_r}, {fwd_k});"
+    elem = _sorted_by_fallback_elem_checks("Elem")
+    kuma_branch = (
+        f"if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ "
+        f"using Elem = typename {bare}::value_type; "
+        f"if constexpr ({elem}) {{ {fallback} }} "
+        f"else return {native}; }} "
+        f"else return {native};")
+    body = (f"using {bare} = std::remove_cvref_t<{tl}>; "
+            f"if constexpr (requires {{ {native}; }}) return {native}; else {kuma_branch}")
+    invoke = (f"[]<class {tl}, class {tk}>({tl}&& {rx}, {tk}&& {kx}) "
+              f"-> decltype(auto) {{ {body} }}")
+    if type_probe:
+        return f"({invoke})({recv_expr}, {key_expr})"
+    return (f"([]<class {tl}>({tl}&& {rx}) {{ "
+            f"return [&{rx}]<class {tk}>({tk}&& {kx}) -> decltype(auto) "
+            f"{{ {body} }}; }}({recv_expr}))({key_expr})")
 
 
 class Compiler(DeclarationSupport):
@@ -546,9 +705,9 @@ class Compiler(DeclarationSupport):
         if value.type not in (*NUMBER, BOOL):
             self.fail("条件は bool または数値にしてください", node)
 
-    def owned(self, value: Value, node: Node, *, allow_void=False) -> None:
-        if value.type == FUNCTION:
-            self.fail("関数はローカル名・呼び出し・map/filterの引数にだけ使えます。返却やコンテナ保存は未対応です", node)
+    def owned(self, value: Value, node: Node, *, allow_void=False, allow_function=False) -> None:
+        if value.type == FUNCTION and not allow_function:
+            self.fail("関数はローカル名・呼び出し・map/filter/他アローの引数にだけ使えます。返却やコンテナ保存は未対応です", node)
         if value.type.name == "range" or (value.type == VOID and not allow_void):
             self.fail("ここには所有する値が必要です", node)
 
@@ -930,7 +1089,7 @@ class Compiler(DeclarationSupport):
                 self.parameter(annotation, None, node)
 
         def use(name: str, at: Node, local: set[str], *, callee=False) -> None:
-            if name in local or (callee and (name in BUILTINS or name in self.records) and not (name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices") and name in available)):
+            if name in local or (callee and (name in BUILTINS or name in self.records) and not (name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices") and name in available)):
                 return
             if name not in available:
                 self.fail(f"定義位置から参照できない名前です: {name}。後方参照・再帰は未対応です", at)
@@ -1024,17 +1183,32 @@ class Compiler(DeclarationSupport):
         try:
             declarations = []
             for i, ((name, annotation), actual) in enumerate(zip(params, argument_types)):
-                self.owned(Value("", actual), node)
+                if actual != FUNCTION:
+                    self.owned(Value("", actual), node)
                 target, mode = self.parameter(annotation, actual, node)
                 if mode != "value" and target != actual:
                     self.fail("参照引数の型は完全に一致させてください", node)
                 if mode == "ref" and argument_values is None:
                     self.fail("コールバックには値またはconst参照引数を使ってください", node)
-                self.coerce(Value("", actual), target, node)
+                if target != FUNCTION:
+                    self.coerce(Value("", actual), target, node)
+                passed = argument_values[i] if argument_values is not None else None
+                lexical_callable = (
+                    passed is not None and passed.type == FUNCTION and not annotation
+                    and mode == "value" and passed.function is not None and passed.function.code is None
+                    and not any(ann for _, ann in passed.function.node.extra["params"])
+                )
+                if lexical_callable:
+                    symbol = self.bind(name, FUNCTION, node)
+                    symbol.function = passed.function
+                    continue
                 symbol = self.bind(name, target, node)
                 symbol.readonly = mode == "const" or observe
                 if mode != "value" and argument_values is not None:
                     symbol.origins = argument_values[i].origins
+                if target == FUNCTION:
+                    declarations.append(f"auto {symbol.code}")
+                    continue
                 qualifier = ("const " if mode == "const" else "") + target.cpp() + ("&" if mode != "value" else "")
                 if observe and target == actual:
                     qualifier = "const auto&"
@@ -1597,6 +1771,8 @@ class Compiler(DeclarationSupport):
         return False
 
     def ordered_owned_type_supported(self, type_: Type) -> bool:
+        if type_.name == "descending_integral_key":
+            return type_.args[0] in INTEGER
         if type_ in (I32, I64, F64, BOOL, CHAR, STRING):
             return True
         if type_.name in ("tuple", "pair"):
@@ -1611,6 +1787,8 @@ class Compiler(DeclarationSupport):
         return allowed_shape and self.ordered_owned_type_supported(type_) and not self.ordered_key_features(type_)[1]
 
     def ordered_key_features(self, type_: Type) -> tuple[bool, bool]:
+        if type_.name == "descending_integral_key":
+            return False, False
         if type_.name.startswith("record:"):
             children = [field for _, field, _ in self.records[type_.name.removeprefix("record:")]]
             features = [self.ordered_key_features(child) for child in children]
@@ -1726,6 +1904,57 @@ class Compiler(DeclarationSupport):
         return self.ordered(values, result, lambda ns:
                             emit_scalar_conversion(method, ns[0], ns[1] if extras else "10"))
 
+    def lower_between_method(self, node: Node) -> Value | None:
+        name, args = node.value, node.children
+        if node.kind != "method" or name not in _BETWEEN_METHODS:
+            return None
+        if node.extra.get("kwargs") or node.extra.get("types"):
+            self.fail("between(lo, hi) の引数は位置指定で渡してください", node)
+        if len(args) != 3:
+            self.fail("between(lo, hi) と書いてください", node)
+        receiver = self.expr(args[0])
+        lo = self.expr(args[1])
+        hi = self.expr(args[2])
+        types = (receiver.type, lo.type, hi.type)
+        if all(t in NUMBER for t in types):
+            return self.ordered([receiver, lo, hi], BOOL,
+                                lambda ns: f"::between({ns[0]}, {ns[1]}, {ns[2]})")
+        if all(t == CHAR for t in types):
+            return self.ordered([receiver, lo, hi], BOOL,
+                                lambda ns: f"({ns[1]} <= {ns[0]} && {ns[0]} <= {ns[2]})")
+        if all(t == STRING for t in types):
+            return self.ordered([receiver, lo, hi], BOOL,
+                                lambda ns: f"({ns[1]} <= {ns[0]} && {ns[0]} <= {ns[2]})")
+        self.fail("between の3つの値は同じ型（数値・char・string）にしてください", node, code="KUMA_API")
+
+    def lower_count_if_method(self, node: Node) -> Value | None:
+        name, args = node.value, node.children
+        if node.kind != "method" or name not in _COUNT_IF_METHODS:
+            return None
+        if node.extra.get("kwargs") or node.extra.get("types"):
+            self.fail("count_if(条件) の引数は位置指定で渡してください", node)
+        if len(args) != 2:
+            self.fail("配列.count_if(条件) と書いてください", node)
+        sequence = self.expr(args[0])
+        if sequence.type.name not in ("vec", "deque", "string"):
+            self.fail("count_if は配列・deque・文字列に使ってください", node)
+        element = (sequence.type.args[0] if sequence.type.name == "deque"
+                   else CHAR if sequence.type == STRING else sequence.type.args[0])
+        with self.protect(sequence.origins):
+            callback = self.expr(args[1])
+        if callback.function is None:
+            self.fail("count_if の条件には1引数の関数を指定してください", node)
+        self.owned(callback, node, allow_function=True)
+        with self.protect(sequence.origins):
+            code, result = self.lower_function(callback.function, [element])
+        if result != BOOL:
+            self.fail("count_if の条件は bool を返してください", node)
+        source_name = self.fresh("aggregate_source")
+        statements = [f"auto&& {source_name} = {sequence.code};"]
+        expression = f"kuma_rt::count_matching<{element.cpp()}>({source_name}, {code})"
+        statements.append(f"return {expression};")
+        return Value("([&]() { " + " ".join(statements) + " }())", I64)
+
     def call(self, node: Node, expected: Type | None) -> Value:
         name, args = node.value, node.children
         kwargs = node.extra.get("kwargs", {})
@@ -1738,6 +1967,14 @@ class Compiler(DeclarationSupport):
         converted = self.lower_scalar_conversion(node)
         if converted is not None:
             return converted
+        converted = self.lower_between_method(node)
+        if converted is not None:
+            return converted
+        converted = self.lower_count_if_method(node)
+        if converted is not None:
+            return converted
+        if node.kind == "call" and name in _COUNT_IF_METHODS:
+            self.fail("count_if は a.count_if(条件) と書いてください", node)
         if node.kind == "method" and name in _SEQUENCE_ARITHMETIC_METHODS:
             if len(args) != 2 or kwargs or node.extra.get("types"):
                 self.fail(f"{name} の引数を1個指定してください", node)
@@ -1835,6 +2072,38 @@ class Compiler(DeclarationSupport):
                 tail = self.ordered(values, result_type,
                                     lambda ns: (f"static_cast<long long>({recv}.{name}())" if name in ("size", "count")
                                                 else f"{recv}.{name}(" + ", ".join(ns) + ")"))
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; "
+                             + ("" if result_type == VOID else "return ") + tail.code + "; }())", result_type)
+        if node.kind == "method" and name in ("size", "count", "test", "set", "or_shift_left"):
+            receiver = self.expr(args[0])
+            if receiver.type.name == "dynamic_bitset":
+                mutators = {"set", "or_shift_left"}
+                if kwargs or node.extra.get("types"):
+                    self.fail(f"dynamic_bitset の {name} の引数を確認してください", node)
+                extra = len(args) - 1
+                limits = {
+                    "size": (0, 0), "count": (0, 0),
+                    "test": (1, 1), "set": (1, 2), "or_shift_left": (1, 1),
+                }
+                lo, hi = limits[name]
+                if extra < lo or extra > hi:
+                    self.fail(f"dynamic_bitset の {name} の引数を確認してください", node)
+                if name in mutators:
+                    self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = []
+                    for i, arg in enumerate(args[1:]):
+                        target = BOOL if name == "set" and i == 1 else I64
+                        values.append(self.coerce(self.expr(arg), target, node))
+                recv = self.fresh("dynamic_bitset")
+                result_type = VOID if name in mutators else (I64 if name in ("size", "count") else BOOL)
+
+                def dynamic_call(ns):
+                    if name in ("size", "count"):
+                        return f"{recv}.{name}()"
+                    return f"{recv}.{name}(" + ", ".join(ns) + ")"
+
+                tail = self.ordered(values, result_type, dynamic_call)
                 return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; "
                              + ("" if result_type == VOID else "return ") + tail.code + "; }())", result_type)
         if node.kind == "method" and name in ("size", "empty", "front", "back", "clear", "push_front", "push_back", "pop_front", "pop_back"):
@@ -2108,13 +2377,13 @@ class Compiler(DeclarationSupport):
             return Value(result.cpp() + "()", result)
         if node.extra.get("types"):
             self.fail("この呼び出しの明示型引数は未対応です", node)
-        if node.kind == "call" and (name not in BUILTINS or name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")):
+        if node.kind == "call" and (name not in BUILTINS or name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")):
             symbol = next((scope[name] for scope in reversed(self.scopes) if name in scope), None)
             if symbol and symbol.function:
                 if kwargs:
                     self.fail("アロー関数は位置引数だけに対応しています", node)
-                return self.invoke(Value("", FUNCTION, function=symbol.function), args, node)
-            if symbol and name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices"):
+                return self.invoke(Value(symbol.code, FUNCTION, function=symbol.function), args, node)
+            if symbol and name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices"):
                 self.fail(name + " は関数として呼び出せません", node)
         if node.kind == "call" and name == "segment_tree":
             if kwargs or node.extra.get("types") or len(args) != 3:
@@ -2284,6 +2553,14 @@ class Compiler(DeclarationSupport):
                 self.fail("union_find の要素数は整数にしてください", node)
             self.uses_algo = True
             return self.ordered([size], Type("union_find"), lambda ns: f"::UnionFind(kuma_rt::dimension({ns[0]}))")
+        if node.kind == "call" and name == "dynamic_bitset":
+            if kwargs or node.extra.get("types") or len(args) != 1:
+                self.fail("dynamic_bitset(width) と書いてください", node)
+            size = self.expr(args[0])
+            if size.type not in INTEGER:
+                self.fail("dynamic_bitset の幅は整数にしてください", node)
+            return self.ordered([size], Type("dynamic_bitset"),
+                                lambda ns: f"kuma_rt::DynamicBitset(static_cast<long long>({ns[0]}))")
         if name in ("zip", "enumerate", "zip_view", "enumerate_view"):
             return self.iter_adapter(node)
         if name in ("reduce", "any", "all", "count", "some", "every"):
@@ -2911,9 +3188,9 @@ class Compiler(DeclarationSupport):
             if self.ordered_key_features(left_type)[1] or self.ordered_key_features(right_type)[1]:
                 self.fail("has_common の要素に f64 は使えません", node)
             return self.ordered([left, right], BOOL, lambda ns: f"::has_common({ns[0]}, {ns[1]})", borrow=True)
-        if node.kind == "call" and name == "positions":
-            if len(args) not in (1, 2) or node.extra.get("types"):
-                self.fail("positions(配列または文字列[, 開始位置]) と書いてください", node)
+        if node.kind in ("call", "method") and name == "positions":
+            if kwargs or node.extra.get("types") or len(args) not in (1, 2):
+                self.fail("positions(配列または文字列[, 開始位置]) または 対象.positions([開始位置]) と書いてください", node)
             values = self.expr(args[0])
             if values.type.name not in ("vec", "string"):
                 self.fail("positions は配列または文字列に使ってください", node)
@@ -3112,6 +3389,14 @@ class Compiler(DeclarationSupport):
                         "throw std::overflow_error(\"lcm: result exceeds result type\"); "
                         "return std::lcm(a, b); }())")
             return self.ordered(values, result_type, lcm_code)
+        if node.kind == "call" and name == "desc":
+            if kwargs or len(args) != 1:
+                self.fail("desc(値) と書いてください", node)
+            value = self.expr(args[0])
+            if value.type not in INTEGER:
+                self.fail("desc の引数は i32 または i64 にしてください", node)
+            result = Type("descending_integral_key", (value.type,))
+            return self.ordered([value], result, lambda ns: f"::ac::desc({ns[0]})")
         if node.kind == "call" and name == "gcd":
             if len(args) != 2 or node.extra.get("types"):
                 self.fail("gcd(a, b) と書いてください", node)
@@ -3358,6 +3643,15 @@ class Compiler(DeclarationSupport):
             if id(node) not in self.top_definitions:
                 self.fail("関数・構造体の定義はトップレベルに置いてください", node)
             return ""
+        if kind == "main_entry":
+            if id(node) not in self.top_definitions:
+                self.fail("main: はトップレベルにだけ置けます", node)
+            saved_returns, saved_expected = self.return_types, self.return_expected
+            self.return_types, self.return_expected = [], I32
+            try:
+                return prefix + self.block(node.extra["body"])
+            finally:
+                self.return_types, self.return_expected = saved_returns, saved_expected
         if kind == "declare":
             names = node.value
             explicit = node.extra.get("type")

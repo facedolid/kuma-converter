@@ -22,7 +22,16 @@ class DeclarationSupport:
     def prepare(self, nodes):
         """Register all signatures before checking bodies (mutual recursion is allowed)."""
         from .compiler import FUNCTION, Function, RESERVED, Type, VOID
-        self.top_definitions = {id(node) for node in nodes if node.kind in ('function', 'record')}
+        entries = [node for node in nodes if node.kind == 'main_entry']
+        if len(entries) > 1:
+            self.fail('main: は1つだけ書いてください', entries[1])
+        if entries:
+            for node in nodes:
+                if node.kind == 'function' and node.value == 'main':
+                    self.fail('main という関数と main: は併用できません', node)
+                if node.kind not in ('function', 'record', 'main_entry'):
+                    self.fail('main: があるとき、他のトップレベルの実行文は書けません', node)
+        self.top_definitions = {id(node) for node in nodes if node.kind in ('function', 'record', 'main_entry')}
         for node in nodes:
             if node.kind != 'record':
                 continue
@@ -149,7 +158,7 @@ class DeclarationSupport:
         return Value(code, field, lvalue=owner.lvalue, origins=owner.origins if owner.lvalue else frozenset(), readonly=owner.readonly)
 
     def invoke(self, callee, arguments, node):
-        from .compiler import Value, VOID
+        from .compiler import FUNCTION, Value, VOID
         if not callee.function:
             self.fail('呼び出し先は関数にしてください', node)
         params = callee.function.node.extra['params']
@@ -161,7 +170,17 @@ class DeclarationSupport:
             expected, mode = self.parameter(annotation, None, node) if annotation else (None, 'value')
             with self.protect(borrowed):
                 value = self.expr(argument, expected)
-            self.owned(value, node)
+            if value.type == FUNCTION:
+                if annotation:
+                    self.fail('型注釈付きの引数には関数値を渡せません', argument)
+                if mode != 'value':
+                    self.fail('関数引数は値渡しの位置引数だけに対応しています', argument)
+                if not value.function or value.function.code is not None:
+                    self.fail('渡せるのはローカルアローだけです', argument)
+                if any(annotation for _, annotation in value.function.node.extra['params']):
+                    self.fail('型注釈付きのアローは引数として渡せません', argument)
+            else:
+                self.owned(value, node)
             if mode == 'value':
                 value = self.coerce(value, expected, argument) if expected else value
             else:
@@ -186,6 +205,8 @@ class DeclarationSupport:
             code, result = self.lower_function(callee.function, [v.type for v in values], argument_values=values)
         names, statements = [], []
         for value, mode in zip(values, modes):
+            if value.type == FUNCTION:
+                continue
             name = self.fresh('arg')
             names.append(name if mode != 'value' else f'std::move({name})')
             type_code = ('const ' if mode == 'const' else '') + value.type.cpp() + ('&' if mode != 'value' else '')

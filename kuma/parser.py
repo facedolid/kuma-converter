@@ -44,6 +44,7 @@ class Parser:
         self.group_depth = 0
         self.lambda_depth = 0
         self.record_depth = 0
+        self.main_entry_depth = 0
         # Recognize type spellings before parsing; the resolver validates their definitions.
         self.user_types = {self.tokens[i + 1].text for i, t in enumerate(self.tokens[:-1])
                            if t.text == "struct" and self.tokens[i + 1].kind == "IDENT"}
@@ -118,6 +119,51 @@ class Parser:
         if style == "spaces" and self.indent_width is None:
             self.space_indents.append(token)
 
+    def parse_main_entry(self, start: Token) -> Node:
+        if self.lambda_depth or start.column != 1:
+            raise KumaError("main: はトップレベルにだけ置けます", start)
+        self.take()
+        self.take()
+        first = self.position
+        while self.tokens[first].kind == "NEWLINE":
+            first += 1
+        if first == self.position or self.tokens[first].text == "{":
+            raise KumaError("main: の本体は改行と字下げで書いてください", self.tokens[first],
+                            code="KUMA_LAYOUT")
+        self.main_entry_depth += 1
+        try:
+            body = self.block(start)
+        finally:
+            self.main_entry_depth -= 1
+        if not body:
+            raise KumaError("main: の本体を空にできません", start)
+        return Node("main_entry", start, extra={"body": body})
+
+    def looks_like_kuma_named_function(self, position: int | None = None) -> bool:
+        position = self.position if position is None else position
+        if position >= len(self.tokens) or self.tokens[position].text not in {"fn", "def"}:
+            return False
+        if position + 2 >= len(self.tokens):
+            return False
+        if self.tokens[position + 1].kind != "IDENT" or self.tokens[position + 2].text != "(":
+            return False
+        depth = 0
+        index = position + 2
+        while index < len(self.tokens):
+            text = self.tokens[index].text
+            if text == "(":
+                depth += 1
+            elif text == ")":
+                depth -= 1
+                if depth == 0:
+                    following = index + 1
+                    while following < len(self.tokens) and self.tokens[following].kind == "NEWLINE":
+                        following += 1
+                    return following < len(self.tokens) and self.tokens[following].text == "->"
+                return False
+            index += 1
+        return False
+
     def program(self) -> list[Node]:
         result: list[Node] = []
         self.separators()
@@ -160,13 +206,16 @@ class Parser:
             finally:
                 self.record_depth -= 1
             return Node("record", name, name.text, extra={"fields": fields})
-        if start.text == "fn":
+        if start.text in {"fn", "def"}:
             self.take()
             name = self.identifier()
             params = self.parameters(typed=True)
-            self.expect("->", "fn の戻り値型は -> i64 のように明示してください")
+            self.expect("->", "通常関数の戻り値型は -> i64 のように明示してください")
             result = self.type_name()
             return self.function_body(start, name, params, result)
+        if (start.text == "main" and not self.cpp and not self.record_depth
+                and self.position + 1 < len(self.tokens) and self.tokens[self.position + 1].text == ":"):
+            return self.parse_main_entry(start)
         if start.text == "if":
             return self.if_statement()
         if start.text == "while":
@@ -198,7 +247,7 @@ class Parser:
             self.end_statement()
             return Node("write", start, children=arguments)
         if start.text == "return":
-            if not self.lambda_depth:
+            if not self.lambda_depth and not self.main_entry_depth:
                 raise KumaError("return は関数の本体で使用してください", start)
             self.take()
             values = [] if self.at_end() else [self.rhs()]
@@ -206,7 +255,7 @@ class Parser:
             return Node("return", start, children=values)
         if start.text == "else":
             raise KumaError("対応する if がありません。else の字下げを確認してください", start)
-        if start.text in {"fn", "def", "function", "struct", "class", "namespace", "using", "template"}:
+        if start.text in {"function", "struct", "class", "namespace", "using", "template"}:
             raise KumaError("通常関数・独自型・C++ 宣言は現時点では未対応です", start)
 
         # A short declaration can bind several names, but is never an assignment.

@@ -69,7 +69,10 @@ def uses_cpp(source: str) -> bool:
         if (bodies.text(name) == 'main'
                 and bodies.text(bodies.previous.get(name, -1)) in {'int', 'signed', 'auto'}):
             return True
-    return False
+    from .native_cpp import source_mode
+    return source_mode(source) == 'mixed' and any(
+        token.text == 'main' and not token.indent and following.text == ':'
+        for token, following in zip(tokens, tokens[1:]))
 
 
 from .cpp_initializers import InitializerSupport, captureless_lambda_return, member_ranges
@@ -257,7 +260,7 @@ class CppParser(InitializerSupport, Parser):
                 name = self.identifier()
                 annotation = None
                 if typed:
-                    raise KumaError('fn の引数には型が必要です', name, code='KUMA_CPP')
+                    raise KumaError('通常関数の引数には型が必要です', name, code='KUMA_CPP')
             parameters.append((name.text, annotation))
             self.newlines()
             if not self.accept(','): break
@@ -1092,6 +1095,9 @@ class CppParser(InitializerSupport, Parser):
         if self.record_depth:
             return super().statement()
         start = self.current
+        if (not self.depth and start.text == 'main' and self.position + 1 < len(self.tokens)
+                and self.tokens[self.position + 1].text == ':'):
+            return self.parse_main_entry(start)
         if start.text == 'try':
             return self.try_statement()
         if start.text == 'catch':
@@ -1153,7 +1159,8 @@ class CppParser(InitializerSupport, Parser):
                        and self.tokens[self.position + 2].kind == 'NEWLINE'
                        and self.tokens[self.position + 3].text not in {'{', ':', 'final'}
                        and self.tokens[self.position + 3].indent > start.indent)
-        if not self.depth and not kuma_record and start.text not in {'fn', 'if', 'while', 'for', 'rep'}:
+        kuma_named = start.text == 'fn' or (start.text == 'def' and self.looks_like_kuma_named_function())
+        if not self.depth and not kuma_record and start.text not in {'if', 'while', 'for', 'rep'} | ({'fn', 'def'} if kuma_named else set()):
             definition = self.native_definition()
             if definition is not None:
                 return definition
@@ -1272,7 +1279,10 @@ class CppParser(InitializerSupport, Parser):
                 if has_input:
                     self.local_input_scopes.pop()
             return Node('cpp_for', start, header, extra={'body': body})
-        if start.text not in {'if', 'while', 'rep', 'for', 'return', 'break', 'continue', 'else', 'fn', 'struct', *_BARE_CALLS}:
+        blocked = {'if', 'while', 'rep', 'for', 'return', 'break', 'continue', 'else', 'struct', *_BARE_CALLS, 'fn'}
+        if kuma_named:
+            blocked.add('def')
+        if start.text not in blocked:
             # Do not confuse := or a short arrow with a native declaration.
             if start.kind == 'IDENT' and self.tokens[self.position + 1].text not in {':=', ',', '=>'}:
                 result = self.cpp_declaration()
@@ -1555,6 +1565,134 @@ def cpp_type(text):
     for start, end, replacement in reversed(changes):
         text = text[:start] + replacement + text[end:]
     return text
+
+
+_RUN_LENGTH_METHODS = frozenset({'run_length_encode', 'run_length_decode'})
+
+_RUN_LENGTH_ELEMENTS = (
+    'int', 'long long', 'double', 'bool', 'char', 'std::string',
+)
+
+
+def _run_length_element_same_checks(var: str) -> str:
+    return ' || '.join(f'std::is_same_v<{var}, {elem}>' for elem in _RUN_LENGTH_ELEMENTS)
+
+
+def emit_mixed_run_length_method(name, recv_expr, fresh):
+    recv, typ, bare = (fresh(suffix) for suffix in ('rle_recv', 'rle_t', 'rle_bare'))
+    forward = f'std::forward<{typ}>({recv})'
+    native = f'({forward}).{name}()'
+    elem = _run_length_element_same_checks('Elem')
+    decode_rows = ' || '.join(
+        f'std::is_same_v<Row, std::pair<{element}, int>>' for element in _RUN_LENGTH_ELEMENTS)
+    encode_fallback = (
+        f"if ({forward}.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
+        f'throw std::out_of_range("run_length_encode: input too large"); '
+        f"return ::run_length_encode({forward});")
+    decode_fallback = (
+        f"([&]() {{ std::size_t total = 0; "
+        f"using Elem = typename Row::first_type; "
+        f"const auto limit = std::vector<Elem>{{}}.max_size(); "
+        f"for (const auto& item : {forward}) {{ "
+        f"if (item.second < 0) throw std::invalid_argument(\"run_length_decode: negative count\"); "
+        f"const auto count = static_cast<std::size_t>(item.second); "
+        f"if (count > limit - total) throw std::length_error(\"run_length_decode: output too large\"); "
+        f"total += count; }} "
+        f"return ::run_length_decode({forward}); }})()")
+    if name == 'run_length_encode':
+        kuma_branch = (
+            f"if constexpr (std::is_same_v<{bare}, std::string>) {{ {encode_fallback} }} "
+            f"else if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ "
+            f"using Elem = typename {bare}::value_type; "
+            f"if constexpr ({elem}) {{ {encode_fallback} }} "
+            f"else return {native}; }} "
+            f"else return {native};")
+    else:
+        kuma_branch = (
+            f"if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ "
+            f"using Row = typename {bare}::value_type; "
+            f"if constexpr ({decode_rows}) return {decode_fallback}; "
+            f"else return {native}; }} "
+            f"else return {native};")
+    body = (f"using {bare} = std::remove_cvref_t<{typ}>; "
+            f"if constexpr (requires {{ {native}; }}) return {native}; else {kuma_branch}")
+    return f"([]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ {body} }})({recv_expr})"
+
+
+_FREQUENCIES_METHODS = frozenset({'frequencies'})
+
+_POSITIONS_METHODS = frozenset({'positions'})
+
+_POSITIONS_ELEMENTS = (
+    'int', 'long long', 'bool', 'char', 'std::string',
+)
+
+
+def _positions_element_checks(var: str) -> str:
+    return ' || '.join(f'std::is_same_v<{var}, {elem}>' for elem in _POSITIONS_ELEMENTS)
+
+
+def emit_mixed_positions_method(recv_expr, start_expr, fresh, *, has_start, type_probe=False):
+    rx = fresh('pos_rx')
+    tl = fresh('pos_tl')
+    bare = fresh('pos_bare')
+    fwd_r = f'std::forward<{tl}>({rx})'
+    start_permitted = ''
+    if has_start:
+        tx = fresh('pos_tx')
+        tt = fresh('pos_tt')
+        fwd_s = f'std::forward<{tt}>({tx})'
+        native = f'({fwd_r}).positions({fwd_s})'
+        fallback = f'return ::positions({fwd_r}, {fwd_s});'
+        start_type = f'std::remove_cvref_t<{tt}>'
+        start_permitted = (f' && (std::is_same_v<{start_type}, int> '
+                           f'|| std::is_same_v<{start_type}, long long>)')
+    else:
+        native = f'({fwd_r}).positions()'
+        fallback = f'return ::positions({fwd_r});'
+    elem = _positions_element_checks('Elem')
+    kuma_branch = (
+        f'if constexpr (std::is_same_v<{bare}, std::string>{start_permitted}) {{ {fallback} }} '
+        f'else if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ '
+        f'using Elem = typename {bare}::value_type; '
+        f'if constexpr (({elem}){start_permitted}) {{ {fallback} }} '
+        f'else return {native}; }} '
+        f'else return {native};')
+    body = (f'using {bare} = std::remove_cvref_t<{tl}>; '
+            f'if constexpr (requires {{ {native}; }}) return {native}; else {kuma_branch}')
+    if has_start:
+        invoke = (f'[]<class {tl}, class {tt}>({tl}&& {rx}, {tt}&& {tx}) '
+                  f'-> decltype(auto) {{ {body} }}')
+        if type_probe:
+            return f'({invoke})({recv_expr}, {start_expr})'
+        return (f'([]<class {tl}>({tl}&& {rx}) {{ '
+                f'return [&{rx}]<class {tt}>({tt}&& {tx}) -> decltype(auto) '
+                f'{{ {body} }}; }}({recv_expr}))({start_expr})')
+    invoke = f'[]<class {tl}>({tl}&& {rx}) -> decltype(auto) {{ {body} }}'
+    if type_probe:
+        return f'({invoke})({recv_expr})'
+    return f'({invoke})({recv_expr})'
+
+
+def emit_mixed_frequencies_method(recv_expr, fresh, *, type_probe=False):
+    recv, typ, bare = (fresh(suffix) for suffix in ('freq_recv', 'freq_t', 'freq_bare'))
+    forward = f'std::forward<{typ}>({recv})'
+    native = f'({forward}).frequencies()'
+    elem = _run_length_element_same_checks('Elem')
+    fallback = f'return ::frequencies({forward});'
+    kuma_branch = (
+        f'if constexpr (std::is_same_v<{bare}, std::string>) {{ {fallback} }} '
+        f'else if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ '
+        f'using Elem = typename {bare}::value_type; '
+        f'if constexpr ({elem}) {{ {fallback} }} '
+        f'else return {native}; }} '
+        f'else return {native};')
+    body = (f'using {bare} = std::remove_cvref_t<{typ}>; '
+            f'if constexpr (requires {{ {native}; }}) return {native}; else {kuma_branch}')
+    invoke = f'[]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ {body} }}'
+    if type_probe:
+        return f'({invoke})({recv_expr})'
+    return f'({invoke})({recv_expr})'
 
 
 class CppEmitter:
@@ -1976,12 +2114,18 @@ class CppEmitter:
             native_args = kind == 'method' or (kind == 'call' and value not in kuma_calls | set(_TYPES))
             from .compiler import (_SCALAR_CONVERSION_METHODS, _SEQUENCE_ARITHMETIC_METHODS,
                                    _STRING_PAD_METHODS, _INTEGER_MASK_METHODS, _VECTOR_ASSIGN_METHODS,
-                                   emit_mixed_scalar_conversion, emit_mixed_integer_mask_method,
-                                   emit_mixed_sequence_method, emit_mixed_string_pad,
-                                   emit_mixed_vector_assign_method)
+                                   _BETWEEN_METHODS, _COUNT_IF_METHODS, _FIND_IDX_METHODS,
+                                   _SORTED_BY_METHODS,
+                                   emit_mixed_scalar_conversion,
+                                   emit_mixed_integer_mask_method, emit_mixed_sequence_method,
+                                   emit_mixed_string_pad, emit_mixed_vector_assign_method,
+                                   emit_mixed_between, emit_mixed_count_if, emit_mixed_find_idx,
+                                   emit_mixed_sorted_by)
             extension_members = (_SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
                                    | _SEQUENCE_ARITHMETIC_METHODS | _INTEGER_MASK_METHODS
-                                   | _VECTOR_ASSIGN_METHODS)
+                                   | _VECTOR_ASSIGN_METHODS | _BETWEEN_METHODS | _COUNT_IF_METHODS
+                                   | _FIND_IDX_METHODS | _RUN_LENGTH_METHODS | _FREQUENCIES_METHODS
+                                   | _POSITIONS_METHODS | _SORTED_BY_METHODS)
             args = [self.expr(c, native=(native_args and not (
                         not native and c.kind == 'method' and c.value in extension_members)))
                     for c in node.children]
@@ -1998,6 +2142,61 @@ class CppEmitter:
                     self.options(node, kw)
                     return emit_mixed_integer_mask_method(value, args[0], args[1:], self.fresh,
                                                           type_probe=self.type_probe)
+                if (value in _BETWEEN_METHODS and len(args) == 3 and not kw
+                        and not node.extra.get('types')):
+                    self.options(node, kw)
+                    literals = tuple(child.kind == 'literal' and child.extra.get('type') == 'string'
+                                     for child in node.children)
+                    return emit_mixed_between(*args, self.fresh, string_literals=literals,
+                                              type_probe=self.type_probe)
+                if (value in _COUNT_IF_METHODS and len(args) == 2 and not kw
+                        and not node.extra.get('types')):
+                    self.options(node, kw)
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return emit_mixed_count_if(args[0], args[1], self.fresh,
+                                               type_probe=self.type_probe)
+                if (value in _FIND_IDX_METHODS and len(args) == 2 and not kw
+                        and not node.extra.get('types')):
+                    self.options(node, kw)
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return emit_mixed_find_idx(value, args[0], args[1], self.fresh,
+                                               type_probe=self.type_probe)
+                if (value in _RUN_LENGTH_METHODS and len(args) == 1 and not kw
+                        and not node.extra.get('types')):
+                    self.options(node, kw)
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return emit_mixed_run_length_method(value, args[0], self.fresh)
+                if (value in _FREQUENCIES_METHODS and len(args) == 1 and not kw
+                        and not node.extra.get('types')):
+                    self.options(node, kw)
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return emit_mixed_frequencies_method(args[0], self.fresh,
+                                                         type_probe=self.type_probe)
+                if (value in _POSITIONS_METHODS and len(args) in (1, 2) and not kw
+                        and not node.extra.get('types')):
+                    self.options(node, kw)
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return emit_mixed_positions_method(
+                        args[0], args[1] if len(args) == 2 else None, self.fresh,
+                        has_start=len(args) == 2, type_probe=self.type_probe)
+                if (value in _SORTED_BY_METHODS and len(args) == 2 and not kw
+                        and not node.extra.get('types')):
+                    self.options(node, kw)
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return emit_mixed_sorted_by(args[0], args[1], self.fresh,
+                                                type_probe=self.type_probe)
             if value in {'sort', 'sorted', 'reverse', 'reversed'} and not node.extra.get('pointer'):
                 sorting = value in {'sort', 'sorted'}
                 self.options(node, kw, {'start', 'end', 'compare'} if sorting else {'start', 'end'})
@@ -2805,6 +3004,52 @@ def checked_tuple_key_functions(nodes, tokens, source, filename):
         node.extra['body'] = parsed_body
 
 
+_MIXED_MAIN_PREAMBLE = frozenset({
+    'cpp_directive', 'cpp_global', 'cpp_opaque_sections', 'cpp_main', 'cpp_function_body',
+    'function', 'record',
+})
+
+
+def _simple_direct_fast_io_statement(node: Node) -> bool:
+    """Recognize the ordinary direct fast_io() spelling, not an argument or a qualified call."""
+    if node.kind == 'cpp_bare_call' and node.value == 'fast_io' and not node.children:
+        return True
+    if node.kind == 'cpp_stmt':
+        return re.fullmatch(r'fast_io\s*\(\s*\)\s*;', node.value.strip()) is not None
+    return False
+
+
+def _explicit_fast_io_at_entry(statements: list[Node]) -> bool:
+    """Keep a single leading explicit initialization, including native dispatch."""
+    direct = [index for index, node in enumerate(statements) if _simple_direct_fast_io_statement(node)]
+    if not direct:
+        return False
+    if len(direct) != 1 or direct[0] != 0:
+        offending = direct[1] if direct[0] == 0 else direct[0]
+        raise KumaError('fast_io() を書く場合は、main: の先頭に1回だけ置いてください',
+                        statements[offending].token, code='KUMA_CPP',
+                        hint='省略した場合は高速入出力が自動で初期化されます。')
+    return True
+
+
+def validate_mixed_main_entries(nodes: list[Node], parser: CppParser) -> Node | None:
+    entries = [node for node in nodes if node.kind == 'main_entry']
+    if len(entries) > 1:
+        raise KumaError('main: は1つだけ書いてください', entries[1].token, code='KUMA_CPP')
+    if not entries:
+        return None
+    if parser.has_native_main or any(node.kind == 'cpp_main' for node in nodes):
+        raise KumaError('main: と int main() は併用できません', entries[0].token, code='KUMA_CPP')
+    if any(node.kind == 'function' and node.value == 'main' for node in nodes):
+        raise KumaError('fn main と main: は併用できません', entries[0].token, code='KUMA_CPP')
+    allowed = _MIXED_MAIN_PREAMBLE | {'main_entry'}
+    for node in nodes:
+        if node.kind not in allowed:
+            raise KumaError('main: があるとき、他のトップレベルの実行文は書けません', node.token,
+                            code='KUMA_CPP')
+    return entries[0]
+
+
 def transpile_cpp(source: str, filename: str, *, emitter=None,
                   native_checked: bool = False) -> str:
     from .native_cpp import native_cpp
@@ -2815,6 +3060,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
         if t.kind == 'IDENT' and t.text.startswith('kuma_gen_'):
             raise KumaError('kuma_gen_ は生成コード用の予約名です', t, code='KUMA_CPP')
     nodes = parser.program()
+    mixed_main = validate_mixed_main_entries(nodes, parser)
     checked_tuple_key_functions(nodes, parser.tokens, source, filename)
     mark_optional_collection_calls(nodes,
                                   masked_members=_cpp_stmt_masked_members(parser.tokens))
@@ -2832,7 +3078,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
             key_use = before == '=' and i >= 2 and parser.tokens[i - 2].text == 'key'
             call_use = (parser.tokens[i].line in return_lines and i + 1 < len(parser.tokens)
                         and parser.tokens[i + 1].text == '(' and before not in ('.', '->', '::'))
-            if before != 'fn' and not key_use and not call_use:
+            if before not in {'fn', 'def'} and not key_use and not call_use:
                 emitter.sorted_key_ambiguous.add(name)
         if definitions != 1 or any(token.kind == 'CPP_DIRECTIVE' and re.search(r'\b' + re.escape(name) + r'\b', token.text) for token in parser.tokens):
             emitter.sorted_key_ambiguous.add(name)
@@ -2869,16 +3115,24 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     has_main = False
     executable_seen = False
     for node in nodes:
+        if node.kind == 'main_entry':
+            executable_seen = True
+            continue
         if node.kind == 'cpp_directive' and executable_seen:
             raise KumaError('指令は実行文より前にまとめてください（指令順序を変えないため）', node.token, code='KUMA_CPP')
-        if node.kind in {'cpp_directive', 'cpp_global', 'cpp_opaque_sections', 'cpp_main', 'cpp_function_body', 'function', 'record'}:
+        if node.kind in _MIXED_MAIN_PREAMBLE:
             preamble.append(emitter.stmt(node))
             has_main |= node.extra.get('main', False)
         else:
             executable_seen = True
             body.append(node)
-    if has_main and body:
-        raise KumaError('明示的なC++ mainとトップレベルの実行文は併用できません', body[0].token, code='KUMA_CPP')
+    if has_main and (body or mixed_main):
+        raise KumaError('明示的なC++ mainとトップレベルの実行文は併用できません',
+                        (mixed_main or body[0]).token, code='KUMA_CPP')
+    explicit_init = False
+    if mixed_main:
+        body = mixed_main.extra['body']
+        explicit_init = _explicit_fast_io_at_entry(body)
     emitter.in_implicit_main = not has_main
     emitted_body = emitter.statements(body)
     emitter.in_implicit_main = False
@@ -2912,4 +3166,5 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
               + '\n'.join(emitter.pinned_key_definitions) + '\n')
     prefix = header + '\n'.join(preamble) + '\n'
     if has_main: return prefix
-    return prefix + 'int main() {\ntry {\nkuma_rt::init();\n' + emitted_body + '\nreturn 0;\n} catch (const std::exception& kuma_gen_error) {\nstd::cerr << "Kuma runtime error: " << kuma_gen_error.what() << "\\n";\nreturn 1;\n}\n}\n'
+    initialization = '' if explicit_init else 'kuma_rt::init();\n'
+    return prefix + 'int main() {\ntry {\n' + initialization + emitted_body + '\nreturn 0;\n} catch (const std::exception& kuma_gen_error) {\nstd::cerr << "Kuma runtime error: " << kuma_gen_error.what() << "\\n";\nreturn 1;\n}\n}\n'
