@@ -6,7 +6,9 @@ M1-M5 checked frontend: opaque C++ must never enter its borrow/purity optimizer.
 """
 from __future__ import annotations
 
+import math
 import re
+import sys
 from .lexer import lex
 from .cpp_bodies import NativeBodies
 from .model import KumaError, Node, Token, safe_sorted_key, sorted_key_captures, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
@@ -2206,6 +2208,20 @@ class CppEmitter:
 
     def expr(self, node, expected=None, *, native=False):
         kind, value = node.kind, node.value
+        if not native and not self.type_probe and node.extra.get('kuma_iter_collect'):
+            source, pred, mapper, count = node.extra['kuma_iter_collect']
+            incoming, snapshot, predicate, transform = (
+                self.fresh('iter_' + name) for name in ('input', 'source', 'pred', 'map'))
+            # Each invocation keeps its argument's temporaries alive through the
+            # nested calls, including references returned from temporary owners.
+            return (f'([&](auto&& {incoming}) {{ '
+                    f'auto {snapshot} = std::forward<decltype({incoming})>({incoming}); '
+                    f'return ([&](auto&& {predicate}) {{ '
+                    f'return ([&](auto&& {transform}) {{ '
+                    f'return kuma_rt::cpp_iter_filter_map_take_collect('
+                    f'std::move({snapshot}), {predicate}, {transform}, ({self.expr(count)})); '
+                    f'}})(({self.expr(mapper)})); }})(({self.expr(pred)})); '
+                    f'}})(({self.expr(source)}))')
         if kind == 'cpp_bare_call':
             return self.mark(node.value, node.token) + '(' + ', '.join(
                 self.expr(c, native=True) for c in node.children) + ')'
@@ -3249,6 +3265,106 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None,
                                            masked_members=masked_members)
 
 
+def mark_iter_collect(nodes, tokens):
+    """V1 proof: checked main: value expressions over explicitly proven vectors."""
+    if any(t.kind == 'CPP_DIRECTIVE' and not re.match(r'#\s*include\b', t.text)
+           for t in tokens):
+        return []
+    sites = []
+    vector_types = {'int', 'long long', 'double', 'bool', 'char', 'std::string'}
+    digits = r"[0-9](?:'?[0-9])*"
+    integer = re.compile(r"(0|[1-9](?:'?[0-9])*)(?:LL|ll)?")
+    floating = re.compile(
+        rf"(?:{digits}\.(?:{digits})?|\.{digits})(?:[eE][+-]?{digits})?"
+        rf"|{digits}[eE][+-]?{digits}")
+    character = re.compile(r"\x27(?:[\x20-\x26\x28-\x5b\x5d-\x7e]|\\[abfnrtv\\\x27\x22?0])\x27")
+
+    def literal_type(expr):
+        if expr.kind != 'literal':
+            return None
+        spelling = expr.value
+        tag = expr.extra.get('type')
+        if tag == 'i64':
+            # Bare decimals gain LL from CppEmitter; an explicit LL is also
+            # known. Radix forms and other suffixes keep native C++ types.
+            match = integer.fullmatch(spelling)
+            if match:
+                raw = match[1].replace("'", '')
+                if len(raw) <= 19 and int(raw) <= (1 << 63) - 1:
+                    return 'long long'
+        elif tag == 'f64' and len(spelling) <= 128 and floating.fullmatch(spelling):
+            number = float(spelling.replace("'", ''))
+            if math.isfinite(number) and abs(number) >= sys.float_info.min:
+                return 'double'
+            # Allow literal zero, not nonzero spellings rounded down to zero.
+            mantissa = re.split('[eE]', spelling, maxsplit=1)[0]
+            if number == 0 and not re.search('[1-9]', mantissa):
+                return 'double'
+        elif tag == 'bool' and spelling in ('true', 'false'):
+            return 'bool'
+        elif tag == 'char' and character.fullmatch(spelling):
+            return 'char'
+        elif tag == 'string' and spelling.startswith('"') and spelling.endswith('"'):
+            return 'std::string'
+        return None
+
+    def vector(expr, names):
+        if expr.kind == 'name':
+            return expr.value in names
+        if expr.kind == 'array' and expr.children:
+            kinds = {literal_type(child) for child in expr.children}
+            return len(kinds) == 1 and None not in kinds
+        if (expr.kind == 'call' and expr.value == 'input'
+                and len(expr.children) == 1 and not expr.extra.get('kwargs')):
+            types = expr.extra.get('types') or ()
+            return not types or len(types) == 1 and cpp_type(types[0]) in vector_types
+        return False
+
+    def chain(expr):
+        values = []
+        for name, arity in (('collect', 1), ('take', 2), ('map', 2),
+                            ('filter', 2), ('iter', 1)):
+            if (expr.kind != 'method' or expr.value != name or len(expr.children) != arity
+                    or any(expr.extra.get(k) for k in ('pointer', 'kwargs', 'types'))):
+                return None
+            if arity == 2:
+                values.append(expr.children[1])
+            expr = expr.children[0]
+        return (expr, *reversed(values))
+
+    def expression(expr, names):
+        if expr.kind in {'lambda', 'comprehension', 'cpp_opaque_sections'}:
+            return
+        candidate = chain(expr) if expr.value == 'collect' else None
+        if candidate and vector(candidate[0], names):
+            expr.extra['kuma_iter_collect'] = candidate
+            sites.append(expr.token)
+        for child in expr.children:
+            expression(child, names)
+
+    def block(statements, inherited=()):
+        names = set(inherited)
+        for stmt in statements:
+            if stmt.kind.startswith('cpp_'):
+                names.clear()
+                continue
+            for child in stmt.children:
+                expression(child, names)
+            if stmt.kind == 'declare':
+                proved = (len(stmt.value) == 1 and not stmt.extra.get('type')
+                          and vector(stmt.children[0], names))
+                names.difference_update(stmt.value)
+                if proved:
+                    names.add(stmt.value[0])
+            for key in ('body', 'else'):
+                block(stmt.extra.get(key, ()), names if stmt.kind in {'if', 'while'} else ())
+
+    for node in nodes:
+        if node.kind == 'main_entry':
+            block(node.extra.get('body', ()))
+    return sites
+
+
 def checked_tuple_key_functions(nodes, tokens, source, filename):
     """Lower only type-checked Kuma tuple returns used by named key functions."""
     from .compiler import Compiler
@@ -3363,6 +3479,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     nodes = parser.program()
     mixed_main = validate_mixed_main_entries(nodes, parser)
     checked_tuple_key_functions(nodes, parser.tokens, source, filename)
+    mark_iter_collect(nodes, parser.tokens)
     mark_optional_collection_calls(nodes,
                                   masked_members=_cpp_stmt_masked_members(parser.tokens))
     emitter = emitter or CppEmitter(filename)
