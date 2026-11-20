@@ -1669,7 +1669,7 @@ def emit_mixed_sort_by(recv_expr, key_expr, fresh):
             f'return [&{recv}]<class {kt}>({kt}&& {key}) -> decltype(auto) '
             f'{{ {body} }}; }}({recv_expr}))({key_expr})')
 _WINDOW_EXTREMA_METHODS = frozenset({'sliding_window_min', 'sliding_window_max'})
-_PREDICATE_INDEX_METHODS = frozenset({'find_if_idx', 'adjacent_find_idx'})
+_PREDICATE_INDEX_METHODS = frozenset({'find_if_idx', 'adjacent_find_idx', 'partition_point_idx'})
 
 
 def emit_mixed_predicate_index(name, args, fresh, *, type_probe=False):
@@ -1833,6 +1833,35 @@ def emit_mixed_numeric_vector_method(name, recv_expr, fresh):
             f'if constexpr (requires {{ {native}; }}) return {native}; else {kuma_branch}')
     invoke = f'[]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ {body} }}'
     return f'({invoke})({recv_expr})'
+
+
+def emit_mixed_range_sum(recv_expr, lo_expr, hi_expr, fresh, *, type_probe=False):
+    recv, lo, hi, rt, lt, ht, bare = (
+        fresh('rs_' + x) for x in ('recv', 'lo', 'hi', 'rt', 'lt', 'ht', 'bare'))
+    recv_fwd, lo_fwd, hi_fwd = (
+        f'std::forward<{t}>({v})' for t, v in ((rt, recv), (lt, lo), (ht, hi)))
+    native = f'({recv_fwd}).range_sum({lo_fwd}, {hi_fwd})'
+    elem = ' || '.join(f'std::is_same_v<Elem, {t}>' for t in _NUMERIC_VECTOR_ELEMENTS)
+    ints = ' && '.join(
+        f'(std::is_same_v<std::remove_cvref_t<{t}>, int> || '
+        f'std::is_same_v<std::remove_cvref_t<{t}>, long long>)' for t in (lt, ht))
+    body = (
+        f'using {bare} = std::remove_cvref_t<{rt}>; '
+        f'if constexpr (requires {{ {native}; }}) return {native}; '
+        f'else if constexpr (kuma_rt::is_plain_vector<{bare}> && {ints}) {{ '
+        f'using Elem = typename {bare}::value_type; '
+        f'if constexpr ({elem}) {{ '
+        f'if ({lo} < 0 || {lo} > {hi} || static_cast<unsigned long long>({hi}) >= {recv}.size()) '
+        'throw std::out_of_range("range_sum: require 0 <= l <= r < prefix size"); '
+        f'return ::range_sum({recv_fwd}, {lo}, {hi}); '
+        f'}} else return {native}; }} else return {native};')
+    if type_probe:
+        return (f'([]<class {rt}, class {lt}, class {ht}>({rt}&& {recv}, {lt}&& {lo}, {ht}&& {hi}) '
+                f'-> decltype(auto) {{ {body} }})({recv_expr}, {lo_expr}, {hi_expr})')
+    return (f'([]<class {rt}>({rt}&& {recv}) {{ '
+            f'return [&{recv}]<class {lt}>({lt}&& {lo}) {{ '
+            f'return [&{recv}, &{lo}]<class {ht}>({ht}&& {hi}) -> decltype(auto) {{ {body} }}; '
+            f'}}; }}({recv_expr}))({lo_expr})({hi_expr})')
 
 
 _POSITIONS_METHODS = frozenset({'positions'})
@@ -2345,7 +2374,7 @@ class CppEmitter:
                                    | _NUMERIC_VECTOR_ZERO_ARG_METHODS
                                    | _POSITIONS_METHODS | _SORTED_BY_METHODS | _BOUND_INDEX_METHODS
                                    | _WINDOW_EXTREMA_METHODS | _PREDICATE_INDEX_METHODS
-                                   | {'to_str', 'in_range', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec'})
+                                   | {'to_str', 'in_range', 'range_sum', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec'})
             args = [self.expr(c, native=(native_args and not (
                         not native and (c.kind == 'method' and c.value in extension_members
                                         or c.kind == 'member' and c.value == 'to_str'))))
@@ -2364,6 +2393,8 @@ class CppEmitter:
                     return emit_mixed_window_extreme(value, *args, self.fresh, type_probe=self.type_probe)
                 if value in _BOUND_INDEX_METHODS and len(args) == 2 and not kw and not node.extra.get('types'):
                     return emit_mixed_bound_index(value, *args, self.fresh, type_probe=self.type_probe)
+                if value == 'range_sum' and len(args) == 3 and not kw and not node.extra.get('types'):
+                    return emit_mixed_range_sum(*args, self.fresh, type_probe=self.type_probe)
                 if value == 'sum_by' and len(args) == 2 and not kw and not node.extra.get('types'):
                     return emit_mixed_sum_by(*args, self.fresh, type_probe=self.type_probe)
                 if value == 'in_range' and len(args) == 2 and not kw and not node.extra.get('types'):
