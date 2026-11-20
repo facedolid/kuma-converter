@@ -1820,9 +1820,16 @@ def emit_mixed_numeric_vector_method(name, recv_expr, fresh):
     forward = f'std::forward<{typ}>({recv})'
     native = f'({forward}).{name}()'
     elem = ' || '.join(f'std::is_same_v<Elem, {t}>' for t in _NUMERIC_VECTOR_ELEMENTS)
+    if name == 'next_greater_indices':
+        elem = 'std::is_same_v<Elem, int> || std::is_same_v<Elem, long long>'
     if name == 'unique_stable':
         elem = _sorted_by_fallback_elem_checks('Elem')
     fallback = f'return ::{name}({forward});'
+    if name == 'next_greater_indices':
+        fallback = (
+            f'if (std::cmp_greater({recv}.size(), std::numeric_limits<int>::max())) '
+            'throw std::length_error("next_greater_indices: too many elements for int indices"); '
+            + fallback)
     kuma_branch = (
         f'if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ '
         f'using Elem = typename {bare}::value_type; '
@@ -2374,7 +2381,7 @@ class CppEmitter:
                                    | _NUMERIC_VECTOR_ZERO_ARG_METHODS
                                    | _POSITIONS_METHODS | _SORTED_BY_METHODS | _BOUND_INDEX_METHODS
                                    | _WINDOW_EXTREMA_METHODS | _PREDICATE_INDEX_METHODS
-                                   | {'to_str', 'in_range', 'range_sum', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec'})
+                                   | {'to_str', 'in_range', 'range_sum', 'next_greater_indices', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec'})
             args = [self.expr(c, native=(native_args and not (
                         not native and (c.kind == 'method' and c.value in extension_members
                                         or c.kind == 'member' and c.value == 'to_str'))))
@@ -2387,6 +2394,10 @@ class CppEmitter:
                         and (len(args) == 2 or value == 'adjacent_find_idx' and len(args) == 1)
                         and not kw and not node.extra.get('types')):
                     return emit_mixed_predicate_index(value, args, self.fresh, type_probe=self.type_probe)
+                if (value == 'next_greater_indices' and len(args) == 1 and not kw
+                        and not node.extra.get('types')
+                        and has_direct_algo_include(self.source_tokens, before_line=node.token.line)):
+                    return emit_mixed_numeric_vector_method(value, args[0], self.fresh)
                 if (value in _WINDOW_EXTREMA_METHODS and len(args) == 2 and not kw
                         and not node.extra.get('types')
                         and has_direct_algo_include(self.source_tokens, before_line=node.token.line)):
