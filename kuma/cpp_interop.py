@@ -12,7 +12,6 @@ from .cpp_bodies import NativeBodies
 from .model import KumaError, Node, Token, safe_sorted_key, sorted_key_captures, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
 from .parser import Parser, _BARE_CALLS
 from .power import CPP_POWER
-from .m10 import CPP_M10, safe_stages, simple_comprehension
 
 
 def _rep_paren_multiline_count_token(tokens, open_index: int, close_index: int):
@@ -1754,9 +1753,10 @@ def emit_mixed_bound_index(name, recv_expr, target_expr, fresh, *, type_probe=Fa
     if type_probe:
         return (f'([]<class {vec_type}, class {target_type}>({vec_type}&& {recv}, {target_type}&& {arg}) '
                 f'-> decltype(auto) {{ {body} }})({recv_expr}, {target_expr})')
-    return (f'([]<class {vec_type}>({vec_type}&& {recv}) {{ '
-            f'return [&{recv}]<class {target_type}>({target_type}&& {arg}) -> decltype(auto) '
-            f'{{ {body} }}; }}({recv_expr}))({target_expr})')
+    outer_t = fresh('bidx_outer_t')
+    return (f'([]<class {outer_t}>({outer_t}&& {recv}) {{ '
+            f'return [&{recv}]<class {target_type}, class {vec_type} = {outer_t}>({target_type}&& {arg}) '
+            f'-> decltype(auto) {{ {body} }}; }}({recv_expr}))({target_expr})')
 
 def emit_mixed_sum_by(recv_expr, projection_expr, fresh, *, type_probe=False):
     recv, arg, vec_type, fn_type = (fresh(s) for s in ('sum_by_vec', 'sum_by_fn', 'sum_by_vt', 'sum_by_ft'))
@@ -1790,7 +1790,7 @@ def emit_mixed_in_range(recv_expr, range_expr, fresh, *, type_probe=False):
         f'else if constexpr ((std::is_same_v<std::remove_cvref_t<{value_type}>, int> '
         f'|| std::is_same_v<std::remove_cvref_t<{value_type}>, long long>) '
         f'&& std::is_same_v<std::remove_cvref_t<{range_type}>, kuma_rt::Range>) {{ '
-        f'const long long v = {recv}; const auto& r = {arg}; '
+        f'const long long v = std::forward<{value_type}>({recv}); const auto& r = {arg}; '
         'if (r.step == 0) throw std::invalid_argument("range step must not be zero"); '
         'using U = unsigned long long; '
         'if (r.step > 0) return r.first <= v && v < r.last '
@@ -1802,8 +1802,9 @@ def emit_mixed_in_range(recv_expr, range_expr, fresh, *, type_probe=False):
         return (f'([]<class {value_type}, class {range_type}>'
                 f'({value_type}&& {recv}, {range_type}&& {arg}) -> decltype(auto) '
                 f'{{ {body} }})({recv_expr}, {range_expr})')
-    return (f'([]<class {value_type}>({value_type}&& {recv}) {{ '
-            f'return [&{recv}]<class {range_type}>({range_type}&& {arg}) '
+    outer_type = fresh('ir_outer_type')
+    return (f'([]<class {outer_type}>({outer_type}&& {recv}) {{ '
+            f'return [&{recv}]<class {range_type}, class {value_type} = {outer_type}>({range_type}&& {arg}) '
             f'-> decltype(auto) {{ {body} }}; }}({recv_expr}))({range_expr})')
 
 
@@ -1842,6 +1843,38 @@ def emit_mixed_numeric_vector_method(name, recv_expr, fresh):
     return f'({invoke})({recv_expr})'
 
 
+def emit_mixed_combinations(name, recv_expr, count_expr, fresh, *, type_probe=False):
+    recv, count, rt, kt = (fresh('ci_' + x) for x in ('recv', 'count', 'rt', 'kt'))
+    fwd_recv = f'std::forward<{rt}>({recv})'
+    native = f'({fwd_recv}).{name}(std::forward<{kt}>({count}))'
+    if name == 'combination_indices':
+        fallback = f'return kuma_rt::CombinationIndicesView(({fwd_recv}).size(), {count});'
+    else:
+        from .compiler import _sorted_by_fallback_elem_checks
+        fallback = (
+            f'using Elem = typename std::remove_cvref_t<{rt}>::value_type; '
+            f'if constexpr ({_sorted_by_fallback_elem_checks("Elem")} '
+            '|| std::is_same_v<Elem, std::pair<char, long long>>) '
+            f'return kuma_rt::CombinationsView<Elem>({fwd_recv}, {count}); '
+            f'else return {native};')
+
+    body = (
+        f'if constexpr (requires {{ {native}; }}) return {native}; '
+        f'else if constexpr (kuma_rt::is_plain_vector<std::remove_cvref_t<{rt}>> '
+        f'&& (std::is_same_v<std::remove_cvref_t<{kt}>, int> '
+        f'|| std::is_same_v<std::remove_cvref_t<{kt}>, long long>)) {{ {fallback} }} '
+        f'else return {native};')
+    if type_probe:
+        return (f'([]<class {rt}, class {kt}>({rt}&& {recv}, {kt}&& {count}) -> decltype(auto) '
+                f'{{ {body} }})({recv_expr}, {count_expr})')
+    # Keep receiver-only fallback expressions dependent on the final lambda
+    # too; Clang otherwise checks them before native overload selection.
+    outer_rt = fresh('ci_outer_rt')
+    return (f'([]<class {outer_rt}>({outer_rt}&& {recv}) {{ '
+            f'return [&{recv}]<class {kt}, class {rt} = {outer_rt}>({kt}&& {count}) -> decltype(auto) '
+            f'{{ {body} }}; }}({recv_expr}))({count_expr})')
+
+
 def emit_mixed_range_sum(recv_expr, lo_expr, hi_expr, fresh, *, type_probe=False):
     recv, lo, hi, rt, lt, ht, bare = (
         fresh('rs_' + x) for x in ('recv', 'lo', 'hi', 'rt', 'lt', 'ht', 'bare'))
@@ -1858,17 +1891,18 @@ def emit_mixed_range_sum(recv_expr, lo_expr, hi_expr, fresh, *, type_probe=False
         f'else if constexpr (kuma_rt::is_plain_vector<{bare}> && {ints}) {{ '
         f'using Elem = typename {bare}::value_type; '
         f'if constexpr ({elem}) {{ '
-        f'if ({lo} < 0 || {lo} > {hi} || static_cast<unsigned long long>({hi}) >= {recv}.size()) '
+        f'if ({lo} < 0 || {lo} > {hi} || static_cast<unsigned long long>({hi}) >= ({recv_fwd}).size()) '
         'throw std::out_of_range("range_sum: require 0 <= l <= r < prefix size"); '
         f'return ::range_sum({recv_fwd}, {lo}, {hi}); '
         f'}} else return {native}; }} else return {native};')
     if type_probe:
         return (f'([]<class {rt}, class {lt}, class {ht}>({rt}&& {recv}, {lt}&& {lo}, {ht}&& {hi}) '
                 f'-> decltype(auto) {{ {body} }})({recv_expr}, {lo_expr}, {hi_expr})')
-    return (f'([]<class {rt}>({rt}&& {recv}) {{ '
+    outer_rt = fresh('rs_outer_rt')
+    return (f'([]<class {outer_rt}>({outer_rt}&& {recv}) {{ '
             f'return [&{recv}]<class {lt}>({lt}&& {lo}) {{ '
-            f'return [&{recv}, &{lo}]<class {ht}>({ht}&& {hi}) -> decltype(auto) {{ {body} }}; '
-            f'}}; }}({recv_expr}))({lo_expr})({hi_expr})')
+            f'return [&{recv}, &{lo}]<class {ht}, class {rt} = {outer_rt}>({ht}&& {hi}) '
+            f'-> decltype(auto) {{ {body} }}; }}; }}({recv_expr}))({lo_expr})({hi_expr})')
 
 
 _POSITIONS_METHODS = frozenset({'positions'})
@@ -1953,7 +1987,6 @@ class CppEmitter:
         self.line_directives = True
         self.compact = False
         self.uses_power = False
-        self.uses_m10 = False
         self.type_probe = False
         self.type_bindings = {}
         self.implicit_marker = '/*kuma_implicit_assignment*/ '
@@ -2048,7 +2081,7 @@ class CppEmitter:
         marked = [self.mark_declare_name(name, node, index) for index, name in enumerate(names)]
         tuple_cpp = 'std::tuple<' + ', '.join('std::vector<' + cpp_type(type_) + '>' for type_ in types) + '>'
         columns = [self.fresh(f'input_col_{index}') for index in range(len(names))]
-        body = [f'const int kuma_gen_limit = kuma_rt::dimension({count_var});']
+        body = [f'const int kuma_gen_limit = kuma_rt::checked_input_dimension({count_var});']
         for column, type_ in zip(columns, types):
             body.append(f'std::vector<{cpp_type(type_)}> {column}; {column}.reserve(kuma_gen_limit);')
         body.append('for (int kuma_gen_i = 0; kuma_gen_i < kuma_gen_limit; ++kuma_gen_i) {')
@@ -2062,7 +2095,7 @@ class CppEmitter:
                    + location.replace('\\', '\\\\').replace('"', '\\"')
                    + '" + std::string(kuma_gen_error.what())); } }())')
         declarations = [f'std::vector<{cpp_type(type_)}> {name};' for name, type_ in zip(marked, types)]
-        return (f'long long {count_var} = {count}; ' + ' '.join(declarations) + ' std::tie('
+        return (f'auto {count_var} = {count}; ' + ' '.join(declarations) + ' std::tie('
                 + ', '.join(marked) + ') = ' + guarded + ';')
 
     def input(self, node, expected):
@@ -2107,9 +2140,16 @@ class CppEmitter:
         if 'mode' in kw:
             if args or kw['mode'].value != '"line"': self.fail(node, '混在モードのmodeは mode="line" の単一行入力です')
             return f'kuma_rt::read_line_as<{type_}>()' if types else 'kuma_rt::read_line()'
-        function = {0: 'read', 1: 'read_vec', 2: 'read_mat'}.get(len(args))
-        if function is None: self.fail(node, '入力の形状は2次元まで対応しています')
-        return f'kuma_rt::{function}<{type_}>({", ".join(args)})'
+        if not args:
+            return f'kuma_rt::read<{type_}>()'
+        if len(args) == 1:
+            return f'kuma_rt::read_vec<{type_}>(kuma_rt::checked_input_dimension(({args[0]})))'
+        if len(args) == 2:
+            # Brace initialization evaluates h then w once, before validation.
+            # Apply the checked pair to the existing native runtime signature.
+            return (f'std::apply(kuma_rt::read_mat<{type_}>, '
+                    f'kuma_rt::checked_input_shape(std::pair{{({args[0]}), ({args[1]})}}))')
+        self.fail(node, '入力の形状は2次元まで対応しています')
 
     def options(self, node, kwargs, allowed=()):
         extra = set(kwargs) - set(allowed)
@@ -2144,7 +2184,7 @@ class CppEmitter:
         finally:
             self.type_bindings = saved
 
-    def comprehension(self, node, *, fused_sum=False):
+    def comprehension(self, node):
         if self.type_probe:
             return self.comprehension_type(node)
         clauses = node.extra['clauses']
@@ -2162,46 +2202,13 @@ class CppEmitter:
             mapper = '[&](const auto& ' + item + ') { ' + bind + ' return ' + (lower(next_) if next_ < len(clauses) else self.expr(node.children[0])) + '; }'
             function = 'cpp_flat_collect' if next_ < len(clauses) else 'cpp_collect'
             return f'kuma_rt::{function}(kuma_rt::mixed_iteration_range({self.expr(clause.children[0])}), {mapper}, {predicate})'
-        if fused_sum:
-            # Single `for` with optional `if` clauses is the only proved case.
-            clause = clauses[0]
-            item = self.fresh('item')
-            bind = self.pattern(clause.extra['pattern'], item)
-            predicates = [self.expr(c.children[0]) for c in clauses[1:]]
-            predicate = '[&](const auto& ' + item + ') { ' + bind + ' return ' + (' && '.join(f'({p})' for p in predicates) or 'true') + '; }'
-            mapper = '[&](const auto& ' + item + ') { ' + bind + ' return ' + self.expr(node.children[0]) + '; }'
-            return f'kuma_rt::cpp_m10_collect_sum(kuma_rt::mixed_iteration_range({self.expr(clause.children[0])}), {mapper}, {predicate})'
         return lower(0)
-
-    def fused_sum(self, node):
-        """Fuse only one complete, syntactically pure eager reduction."""
-        if node.kind != 'method' or node.value != 'sum' or len(node.children) != 1:
-            return None
-        if node.extra.get('kwargs') or node.extra.get('pointer'):
-            return None
-        source = node.children[0]
-        stages = safe_stages(source)
-        if stages is not None:
-            root, steps = stages
-            self.uses_m10 = True
-            args = [self.expr(root)] + [self.expr(arrow) for _, arrow in steps]
-            helper = ('cpp_m10_map_sum' if len(steps) == 1
-                      else 'cpp_m10_filter_map_sum')
-            return 'kuma_rt::' + helper + '(' + ', '.join(args) + ')'
-        if simple_comprehension(source):
-            self.uses_m10 = True
-            return self.comprehension(source, fused_sum=True)
-        return None
 
     def expr(self, node, expected=None, *, native=False):
         kind, value = node.kind, node.value
         if kind == 'cpp_bare_call':
             return self.mark(node.value, node.token) + '(' + ', '.join(
                 self.expr(c, native=True) for c in node.children) + ')'
-        if kind == 'method' and not self.type_probe:
-            fused = self.fused_sum(node)
-            if fused is not None:
-                return fused
         if kind == 'cpp_opaque_sections': return self.native_sections(node)
         if kind in {'name', 'cpp_expr'}:
             if self.type_probe and kind == 'name' and value in self.type_bindings:
@@ -2381,7 +2388,7 @@ class CppEmitter:
                                    | _NUMERIC_VECTOR_ZERO_ARG_METHODS
                                    | _POSITIONS_METHODS | _SORTED_BY_METHODS | _BOUND_INDEX_METHODS
                                    | _WINDOW_EXTREMA_METHODS | _PREDICATE_INDEX_METHODS
-                                   | {'to_str', 'in_range', 'range_sum', 'next_greater_indices', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec'})
+                                   | {'to_str', 'in_range', 'range_sum', 'combination_indices', 'combinations', 'next_greater_indices', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec'})
             args = [self.expr(c, native=(native_args and not (
                         not native and (c.kind == 'method' and c.value in extension_members
                                         or c.kind == 'member' and c.value == 'to_str'))))
@@ -2404,6 +2411,9 @@ class CppEmitter:
                     return emit_mixed_window_extreme(value, *args, self.fresh, type_probe=self.type_probe)
                 if value in _BOUND_INDEX_METHODS and len(args) == 2 and not kw and not node.extra.get('types'):
                     return emit_mixed_bound_index(value, *args, self.fresh, type_probe=self.type_probe)
+                if (value in ('combination_indices', 'combinations') and len(args) == 2
+                        and not kw and not node.extra.get('types')):
+                    return emit_mixed_combinations(value, *args, self.fresh, type_probe=self.type_probe)
                 if value == 'range_sum' and len(args) == 3 and not kw and not node.extra.get('types'):
                     return emit_mixed_range_sum(*args, self.fresh, type_probe=self.type_probe)
                 if value == 'sum_by' and len(args) == 2 and not kw and not node.extra.get('types'):
@@ -3444,7 +3454,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
         # runtime operations. Keep the wrapper's init/exception support otherwise.
         generated = '\n'.join(preamble) + emitted_body
         if (has_main and any(re.match(r'#\s*include\s*[<"]ac\.hpp[>"]', t.text) for t in parser.tokens)
-                and 'kuma_rt::' not in generated and not emitter.uses_power and not emitter.uses_m10):
+                and 'kuma_rt::' not in generated and not emitter.uses_power):
             runtime = ''
     else:
         runtime += '#ifndef KUMA_CPP_INTEROP_ABI\n#error Kuma M6 needs a published M6 runtime header\n#endif\n'
@@ -3452,7 +3462,6 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
               + '\n'.join(directives) + '\n' + runtime
               + ''.join('#ifdef ' + name + '\n#error Kuma key function name is a macro: ' + name + '\n#endif\n' for name in sorted(emitter.sorted_key_used))
               + (CPP_POWER if emitter.uses_power else '')
-              + (CPP_M10 if emitter.uses_m10 else '')
               + '\n'.join(definition for _, definition in aliases) + '\n'
               + ''.join('#ifdef ' + name + '\n#error Kuma generated key name is a macro: ' + name + '\n#endif\n' for name in sorted(emitter.pinned_key_names))
               + '\n'.join(emitter.pinned_key_definitions) + '\n')

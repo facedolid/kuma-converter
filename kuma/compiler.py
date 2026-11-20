@@ -587,8 +587,9 @@ def emit_mixed_find_idx(name, recv_expr, target_expr, fresh, *, type_probe=False
     # The receiver is evaluated in the postfix expression before the target.
     # Keep both operands at the caller so their temporaries last through the
     # enclosing full expression, including for native reference returns.
-    return (f"([]<class {tl}>({tl}&& {rx}) {{ "
-            f"return [&{rx}]<class {tt}>({tt}&& {tx}) -> decltype(auto) "
+    outer_tl = fresh("fidx_outer_tl")
+    return (f"([]<class {outer_tl}>({outer_tl}&& {rx}) {{ "
+            f"return [&{rx}]<class {tt}, class {tl} = {outer_tl}>({tt}&& {tx}) -> decltype(auto) "
             f"{{ {body} }}; }}({recv_expr}))({target_expr})")
 
 
@@ -2160,16 +2161,16 @@ class Compiler(DeclarationSupport):
                     return "([&]() { " + check + ("" if result_type == VOID else "return ") + call + "; }())"
                 result = self.ordered(values, result_type, checked)
                 return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; " + ("" if result_type == VOID else "return ") + result.code + "; }())", result_type)
-        if node.kind == "method" and name in ("add", "remove", "pop", "bisect_left", "bisect_right"):
+        if node.kind == "method" and name in ("add", "remove", "discard", "pop", "bisect_left", "bisect_right"):
             receiver = self.expr(args[0])
             if receiver.type.name == "SortedList":
                 if kwargs or len(args) not in ((1, 2) if name == "pop" else (2,)):
                     self.fail("SortedListの引数を確認してください", node)
-                if name in ("add", "remove", "pop"):
+                if name in ("add", "remove", "discard", "pop"):
                     self.writable(receiver, node)
                 with self.protect(receiver.origins):
                     rest = [self.coerce(self.expr(arg), I64 if name == "pop" else receiver.type.args[0], node) for arg in args[1:]]
-                result = VOID if name in ("add", "remove") else receiver.type.args[0] if name == "pop" else I64
+                result = {"add": VOID, "remove": VOID, "discard": BOOL, "pop": receiver.type.args[0]}.get(name, I64)
                 recv = self.fresh("sortedlist")
                 tail = self.ordered(rest, result, lambda ns: f"{recv}.{name}(" + ", ".join(ns) + ")")
                 return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; " + ("" if result == VOID else "return ") + tail.code + "; }())", result)
