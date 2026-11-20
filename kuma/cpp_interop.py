@@ -1567,6 +1567,18 @@ def cpp_type(text):
     return text
 
 
+def emit_mixed_to_str(recv_expr, fresh, *, attribute):
+    recv, typ, bare = (fresh(part) for part in ('char_vec', 'char_vec_t', 'char_vec_bare'))
+    forward = f'std::forward<{typ}>({recv})'
+    native = f'({forward}).to_str' + ('' if attribute else '()')
+    return (f'([]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ '
+            f'using {bare} = std::remove_cvref_t<{typ}>; '
+            f'if constexpr (requires {{ {native}; }}) return ({native}); '
+            f'else if constexpr (std::is_same_v<{bare}, std::vector<char>>) '
+            f'return std::string({recv}.begin(), {recv}.end()); '
+            f'else return ({native}); }})({recv_expr})')
+
+
 _RUN_LENGTH_METHODS = frozenset({'run_length_encode', 'run_length_decode'})
 
 _RUN_LENGTH_ELEMENTS = (
@@ -1584,7 +1596,8 @@ def emit_mixed_run_length_method(name, recv_expr, fresh):
     native = f'({forward}).{name}()'
     elem = _run_length_element_same_checks('Elem')
     decode_rows = ' || '.join(
-        f'std::is_same_v<Row, std::pair<{element}, int>>' for element in _RUN_LENGTH_ELEMENTS)
+        f'std::is_same_v<Row, std::pair<{element}, {count}>>'
+        for element in _RUN_LENGTH_ELEMENTS for count in ('int', 'long long'))
     encode_fallback = (
         f"if ({forward}.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) "
         f'throw std::out_of_range("run_length_encode: input too large"); '
@@ -1595,10 +1608,15 @@ def emit_mixed_run_length_method(name, recv_expr, fresh):
         f"const auto limit = std::vector<Elem>{{}}.max_size(); "
         f"for (const auto& item : {forward}) {{ "
         f"if (item.second < 0) throw std::invalid_argument(\"run_length_decode: negative count\"); "
-        f"const auto count = static_cast<std::size_t>(item.second); "
-        f"if (count > limit - total) throw std::length_error(\"run_length_decode: output too large\"); "
-        f"total += count; }} "
-        f"return ::run_length_decode({forward}); }})()")
+        f"if (std::cmp_greater(item.second, limit - total)) "
+        f'throw std::length_error("run_length_decode: output too large"); '
+        f"total += static_cast<std::size_t>(item.second); }} "
+        f"if constexpr (std::is_same_v<typename Row::second_type, int>) "
+        f"return ::run_length_decode({forward}); "
+        f"else {{ std::vector<Elem> result; result.reserve(total); "
+        f"for (const auto& item : {forward}) "
+        f"result.insert(result.end(), static_cast<std::size_t>(item.second), item.first); "
+        f"return result; }} }})()")
     if name == 'run_length_encode':
         kuma_branch = (
             f"if constexpr (std::is_same_v<{bare}, std::string>) {{ {encode_fallback} }} "
@@ -2012,6 +2030,8 @@ class CppEmitter:
             return ('kuma_rt::cpp_slice(kuma_rt::CppSliceRequest{' +
                     ', '.join([self.expr(node.children[0]), *bounds]) + '})')
         if kind == 'member':
+            if value == 'to_str' and not native and not node.extra.get('pointer'):
+                return emit_mixed_to_str(self.expr(node.children[0]), self.fresh, attribute=True)
             access = f'({self.expr(node.children[0])})' + ('->' if node.extra.get('pointer') else '.') + self.mark(value, node.token)
             return access + ('()' if node.extra.get('optional_collection_call') else '')
         if kind == 'lambda':
@@ -2125,11 +2145,14 @@ class CppEmitter:
                                    | _SEQUENCE_ARITHMETIC_METHODS | _INTEGER_MASK_METHODS
                                    | _VECTOR_ASSIGN_METHODS | _BETWEEN_METHODS | _COUNT_IF_METHODS
                                    | _FIND_IDX_METHODS | _RUN_LENGTH_METHODS | _FREQUENCIES_METHODS
-                                   | _POSITIONS_METHODS | _SORTED_BY_METHODS)
+                                   | _POSITIONS_METHODS | _SORTED_BY_METHODS | {'to_str'})
             args = [self.expr(c, native=(native_args and not (
-                        not native and c.kind == 'method' and c.value in extension_members)))
+                        not native and (c.kind == 'method' and c.value in extension_members
+                                        or c.kind == 'member' and c.value == 'to_str'))))
                     for c in node.children]
             if not native and kind == 'method' and not node.extra.get('pointer'):
+                if value == 'to_str' and len(args) == 1 and not kw and not node.extra.get('types'):
+                    return emit_mixed_to_str(args[0], self.fresh, attribute=False)
                 if value in _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS:
                     self.options(node, kw)
                     receiver = node.children[0]

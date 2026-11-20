@@ -1975,6 +1975,15 @@ class Compiler(DeclarationSupport):
             return converted
         if node.kind == "call" and name in _COUNT_IF_METHODS:
             self.fail("count_if は a.count_if(条件) と書いてください", node)
+        if node.kind == "method" and name == "to_str":
+            if len(args) != 1 or kwargs or node.extra.get("types"):
+                self.fail("to_str は引数を取りません", node)
+            chars = self.expr(args[0])
+            if chars.type != Type("vec", (CHAR,)):
+                self.fail("to_str は char の配列に使ってください", node)
+            return self.ordered([chars], STRING,
+                                lambda ns: f"std::string({ns[0]}.begin(), {ns[0]}.end())",
+                                borrow=True)
         if node.kind == "method" and name in _SEQUENCE_ARITHMETIC_METHODS:
             if len(args) != 2 or kwargs or node.extra.get("types"):
                 self.fail(f"{name} の引数を1個指定してください", node)

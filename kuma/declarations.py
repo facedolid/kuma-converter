@@ -142,7 +142,8 @@ class DeclarationSupport:
             'set': {'size', 'len', 'empty', 'clear'},
             'dict': {'size', 'len', 'empty', 'clear'},
         }
-        if node.value in zero_arg.get(owner.type.name, ()):
+        if (node.value in zero_arg.get(owner.type.name, ())
+                or owner.type.name == 'vec' and node.value == 'to_str'):
             from .model import Node
             return self.call(Node('method', node.token, node.value,
                                   [Node('resolved_value', node.children[0].token, owner)],
