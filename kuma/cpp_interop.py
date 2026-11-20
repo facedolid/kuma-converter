@@ -1815,10 +1815,13 @@ _NUMERIC_VECTOR_ELEMENTS = (
 
 
 def emit_mixed_numeric_vector_method(name, recv_expr, fresh):
+    from .compiler import _sorted_by_fallback_elem_checks
     recv, typ, bare = (fresh(suffix) for suffix in ('num_vec_recv', 'num_vec_t', 'num_vec_bare'))
     forward = f'std::forward<{typ}>({recv})'
     native = f'({forward}).{name}()'
     elem = ' || '.join(f'std::is_same_v<Elem, {t}>' for t in _NUMERIC_VECTOR_ELEMENTS)
+    if name == 'unique_stable':
+        elem = _sorted_by_fallback_elem_checks('Elem')
     fallback = f'return ::{name}({forward});'
     kuma_branch = (
         f'if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ '
@@ -2334,7 +2337,7 @@ class CppEmitter:
                                    emit_mixed_integer_mask_method, emit_mixed_sequence_method,
                                    emit_mixed_string_pad, emit_mixed_vector_assign_method,
                                    emit_mixed_between, emit_mixed_count_if, emit_mixed_find_idx,
-                                   emit_mixed_sorted_by)
+                                   emit_mixed_key_vector)
             extension_members = (_SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
                                    | _SEQUENCE_ARITHMETIC_METHODS | _INTEGER_MASK_METHODS
                                    | _VECTOR_ASSIGN_METHODS | _BETWEEN_METHODS | _COUNT_IF_METHODS
@@ -2342,7 +2345,7 @@ class CppEmitter:
                                    | _NUMERIC_VECTOR_ZERO_ARG_METHODS
                                    | _POSITIONS_METHODS | _SORTED_BY_METHODS | _BOUND_INDEX_METHODS
                                    | _WINDOW_EXTREMA_METHODS | _PREDICATE_INDEX_METHODS
-                                   | {'to_str', 'in_range', 'sum_by'})
+                                   | {'to_str', 'in_range', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec'})
             args = [self.expr(c, native=(native_args and not (
                         not native and (c.kind == 'method' and c.value in extension_members
                                         or c.kind == 'member' and c.value == 'to_str'))))
@@ -2422,7 +2425,7 @@ class CppEmitter:
                         args[0] = self.expr(receiver)
                     return emit_mixed_frequencies_method(args[0], self.fresh,
                                                          type_probe=self.type_probe)
-                if (value in _NUMERIC_VECTOR_ZERO_ARG_METHODS and len(args) == 1 and not kw
+                if (value in _NUMERIC_VECTOR_ZERO_ARG_METHODS | {'unique_stable'} and len(args) == 1 and not kw
                         and not node.extra.get('types')):
                     self.options(node, kw)
                     return emit_mixed_numeric_vector_method(value, args[0], self.fresh)
@@ -2435,14 +2438,14 @@ class CppEmitter:
                     return emit_mixed_positions_method(
                         args[0], args[1] if len(args) == 2 else None, self.fresh,
                         has_start=len(args) == 2, type_probe=self.type_probe)
-                if (value in _SORTED_BY_METHODS and len(args) == 2 and not kw
+                if (value in _SORTED_BY_METHODS | {'group_by', 'unique_by', 'partition_vec'} and len(args) == 2 and not kw
                         and not node.extra.get('types')):
                     self.options(node, kw)
                     receiver = node.children[0]
                     if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
                         args[0] = self.expr(receiver)
-                    return emit_mixed_sorted_by(args[0], args[1], self.fresh,
-                                                type_probe=self.type_probe)
+                    return emit_mixed_key_vector(value, args[0], args[1], self.fresh,
+                                                 type_probe=self.type_probe)
             if value in {'sort', 'sorted', 'reverse', 'reversed'} and not node.extra.get('pointer'):
                 sorting = value in {'sort', 'sorted'}
                 self.options(node, kw, {'start', 'end', 'compare'} if sorting else {'start', 'end'})

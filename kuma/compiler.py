@@ -598,14 +598,18 @@ def _sorted_by_fallback_elem_checks(var: str) -> str:
     return f"({scalars} || {pair})"
 
 
-def emit_mixed_sorted_by(recv_expr, key_expr, fresh, *, type_probe=False):
+def emit_mixed_key_vector(member, recv_expr, key_expr, fresh, *, type_probe=False):
     rx, kx = (fresh(suffix) for suffix in ("sby_rx", "sby_kx"))
     tl, tk = (fresh(suffix) for suffix in ("sby_tl", "sby_tk"))
     bare = fresh("sby_bl")
     fwd_r, fwd_k = f"std::forward<{tl}>({rx})", f"std::forward<{tk}>({kx})"
-    native = f"({fwd_r}).sorted_by({fwd_k})"
-    fallback = f"return ::sorted_by({fwd_r}, {fwd_k});"
+    native = f"({fwd_r}).{member}({fwd_k})"
+    fallback = f"return ::{member}({fwd_r}, {fwd_k});"
     elem = _sorted_by_fallback_elem_checks("Elem")
+    if member in ("group_by", "unique_by", "partition_vec"):
+        elem += " || std::is_same_v<Elem, std::pair<char, long long>>"
+    if member == "unique_by":
+        elem += " || std::is_same_v<Elem, std::pair<std::string, long long>>"
     kuma_branch = (
         f"if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ "
         f"using Elem = typename {bare}::value_type; "
