@@ -1638,6 +1638,109 @@ def emit_mixed_run_length_method(name, recv_expr, fresh):
 
 
 _FREQUENCIES_METHODS = frozenset({'frequencies'})
+_BOUND_INDEX_METHODS = frozenset({'lower_bound_idx', 'upper_bound_idx', 'equal_range_idx'})
+
+
+def emit_mixed_bound_index(name, recv_expr, target_expr, fresh, *, type_probe=False):
+    recv, arg, vec_type, target_type = (fresh(s) for s in ('bidx_vec', 'bidx_arg', 'bidx_vt', 'bidx_at'))
+    forward_vec = f'std::forward<{vec_type}>({recv})'
+    forward_arg = f'std::forward<{target_type}>({arg})'
+    native = f'({forward_vec}).{name}({forward_arg})'
+    body = (
+        f'using Vec = std::remove_cvref_t<{vec_type}>; '
+        f'using Target = std::remove_cvref_t<{target_type}>; '
+        f'if constexpr (requires {{ {native}; }}) return {native}; '
+        'else if constexpr (kuma_rt::is_plain_vector<Vec>) { using Elem = typename Vec::value_type; '
+        'if constexpr ((std::is_same_v<Elem, int> || std::is_same_v<Elem, long long>) && '
+        '(std::is_same_v<Target, int> || std::is_same_v<Target, long long>)) '
+        f'return ::{name}({forward_vec}, {forward_arg}); '
+        f'else return {native}; }} else return {native};')
+    if type_probe:
+        return (f'([]<class {vec_type}, class {target_type}>({vec_type}&& {recv}, {target_type}&& {arg}) '
+                f'-> decltype(auto) {{ {body} }})({recv_expr}, {target_expr})')
+    return (f'([]<class {vec_type}>({vec_type}&& {recv}) {{ '
+            f'return [&{recv}]<class {target_type}>({target_type}&& {arg}) -> decltype(auto) '
+            f'{{ {body} }}; }}({recv_expr}))({target_expr})')
+
+def emit_mixed_sum_by(recv_expr, projection_expr, fresh, *, type_probe=False):
+    recv, arg, vec_type, fn_type = (fresh(s) for s in ('sum_by_vec', 'sum_by_fn', 'sum_by_vt', 'sum_by_ft'))
+    forward_vec, forward_fn = f'std::forward<{vec_type}>({recv})', f'std::forward<{fn_type}>({arg})'
+    native = f'({forward_vec}).sum_by({forward_fn})'
+    element_types = ('int', 'long long', 'double', 'std::pair<char, long long>')
+    supported = ' || '.join(f'std::is_same_v<Elem, {t}>' for t in element_types)
+    body = (
+        f'using Vec = std::remove_cvref_t<{vec_type}>; '
+        f'if constexpr (requires {{ {native}; }}) return {native}; '
+        'else if constexpr (kuma_rt::is_plain_vector<Vec>) { using Elem = typename Vec::value_type; '
+        f'if constexpr ({supported}) return ::sum_by({forward_vec}, {forward_fn}); '
+        f'else return {native}; }} else return {native};')
+    if type_probe:
+        return (f'([]<class {vec_type}, class {fn_type}>({vec_type}&& {recv}, {fn_type}&& {arg}) '
+                f'-> decltype(auto) {{ {body} }})({recv_expr}, {projection_expr})')
+    # Preserve receiver-before-projection evaluation and native reference lifetimes.
+    return (f'([]<class {vec_type}>({vec_type}&& {recv}) {{ '
+            f'return [&{recv}]<class {fn_type}>({fn_type}&& {arg}) -> decltype(auto) '
+            f'{{ {body} }}; }}({recv_expr}))({projection_expr})')
+
+
+def emit_mixed_in_range(recv_expr, range_expr, fresh, *, type_probe=False):
+    recv, arg, value_type, range_type = (fresh(s) for s in ('ir_value', 'ir_range', 'ir_vt', 'ir_rt'))
+    native = (f'(std::forward<{value_type}>({recv})).in_range'
+              f'(std::forward<{range_type}>({arg}))')
+    # Bounds establish a nonnegative difference. Unsigned subtraction represents
+    # the full signed-64 span exactly, even for an LLONG_MIN negative step.
+    body = (
+        f'if constexpr (requires {{ {native}; }}) return {native}; '
+        f'else if constexpr ((std::is_same_v<std::remove_cvref_t<{value_type}>, int> '
+        f'|| std::is_same_v<std::remove_cvref_t<{value_type}>, long long>) '
+        f'&& std::is_same_v<std::remove_cvref_t<{range_type}>, kuma_rt::Range>) {{ '
+        f'const long long v = {recv}; const auto& r = {arg}; '
+        'if (r.step == 0) throw std::invalid_argument("range step must not be zero"); '
+        'using U = unsigned long long; '
+        'if (r.step > 0) return r.first <= v && v < r.last '
+        '&& (U(v) - U(r.first)) % U(r.step) == 0; '
+        'return r.last < v && v <= r.first '
+        '&& (U(r.first) - U(v)) % (0ULL - U(r.step)) == 0; '
+        f'}} else return {native};')
+    if type_probe:
+        return (f'([]<class {value_type}, class {range_type}>'
+                f'({value_type}&& {recv}, {range_type}&& {arg}) -> decltype(auto) '
+                f'{{ {body} }})({recv_expr}, {range_expr})')
+    return (f'([]<class {value_type}>({value_type}&& {recv}) {{ '
+            f'return [&{recv}]<class {range_type}>({range_type}&& {arg}) '
+            f'-> decltype(auto) {{ {body} }}; }}({recv_expr}))({range_expr})')
+
+
+_PREFIX_SUM_METHODS = frozenset({'prefix_sum'})
+
+_PREFIX_SUM_ELEMENTS = (
+    'int', 'long long', 'double',
+)
+
+
+def _prefix_sum_element_checks(var: str) -> str:
+    return ' || '.join(f'std::is_same_v<{var}, {elem}>' for elem in _PREFIX_SUM_ELEMENTS)
+
+
+def emit_mixed_prefix_sum_method(recv_expr, fresh, *, type_probe=False):
+    recv, typ, bare = (fresh(suffix) for suffix in ('psum_recv', 'psum_t', 'psum_bare'))
+    forward = f'std::forward<{typ}>({recv})'
+    native = f'({forward}).prefix_sum()'
+    elem = _prefix_sum_element_checks('Elem')
+    fallback = f'return ::prefix_sum({forward});'
+    kuma_branch = (
+        f'if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ '
+        f'using Elem = typename {bare}::value_type; '
+        f'if constexpr ({elem}) {{ {fallback} }} '
+        f'else return {native}; }} '
+        f'else return {native};')
+    body = (f'using {bare} = std::remove_cvref_t<{typ}>; '
+            f'if constexpr (requires {{ {native}; }}) return {native}; else {kuma_branch}')
+    invoke = f'[]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ {body} }}'
+    if type_probe:
+        return f'({invoke})({recv_expr})'
+    return f'({invoke})({recv_expr})'
+
 
 _POSITIONS_METHODS = frozenset({'positions'})
 
@@ -2144,13 +2247,25 @@ class CppEmitter:
             extension_members = (_SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
                                    | _SEQUENCE_ARITHMETIC_METHODS | _INTEGER_MASK_METHODS
                                    | _VECTOR_ASSIGN_METHODS | _BETWEEN_METHODS | _COUNT_IF_METHODS
-                                   | _FIND_IDX_METHODS | _RUN_LENGTH_METHODS | _FREQUENCIES_METHODS
-                                   | _POSITIONS_METHODS | _SORTED_BY_METHODS | {'to_str'})
+                                   | _FIND_IDX_METHODS                                    | _RUN_LENGTH_METHODS | _FREQUENCIES_METHODS | _PREFIX_SUM_METHODS
+                                   | _POSITIONS_METHODS | _SORTED_BY_METHODS | _BOUND_INDEX_METHODS
+                                   | {'to_str', 'in_range', 'sum_by'})
             args = [self.expr(c, native=(native_args and not (
                         not native and (c.kind == 'method' and c.value in extension_members
                                         or c.kind == 'member' and c.value == 'to_str'))))
                     for c in node.children]
             if not native and kind == 'method' and not node.extra.get('pointer'):
+                if value in _BOUND_INDEX_METHODS and len(args) == 2 and not kw and not node.extra.get('types'):
+                    return emit_mixed_bound_index(value, *args, self.fresh, type_probe=self.type_probe)
+                if value == 'sum_by' and len(args) == 2 and not kw and not node.extra.get('types'):
+                    return emit_mixed_sum_by(*args, self.fresh, type_probe=self.type_probe)
+                if value == 'in_range' and len(args) == 2 and not kw and not node.extra.get('types'):
+                    interval = node.children[1]
+                    if interval.kind == 'binary' and interval.value == '..':
+                        bounds = ', '.join('kuma_rt::range_bound(' + self.expr(bound) + ')'
+                                           for bound in interval.children)
+                        args[1] = 'kuma_rt::range_args({' + bounds + '})'
+                    return emit_mixed_in_range(*args, self.fresh, type_probe=self.type_probe)
                 if value == 'to_str' and len(args) == 1 and not kw and not node.extra.get('types'):
                     return emit_mixed_to_str(args[0], self.fresh, attribute=False)
                 if value in _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS:
@@ -2203,6 +2318,11 @@ class CppEmitter:
                         args[0] = self.expr(receiver)
                     return emit_mixed_frequencies_method(args[0], self.fresh,
                                                          type_probe=self.type_probe)
+                if (value in _PREFIX_SUM_METHODS and len(args) == 1 and not kw
+                        and not node.extra.get('types')):
+                    self.options(node, kw)
+                    return emit_mixed_prefix_sum_method(args[0], self.fresh,
+                                                        type_probe=self.type_probe)
                 if (value in _POSITIONS_METHODS and len(args) in (1, 2) and not kw
                         and not node.extra.get('types')):
                     self.options(node, kw)
