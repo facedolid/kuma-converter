@@ -232,7 +232,7 @@ class CppParser(InitializerSupport, Parser):
             return super().type_name()
         start = self.current
         while self.current.text in {'const', 'volatile'}: self.take()
-        builtin = {'signed', 'unsigned', 'short', 'long', 'int', 'char', 'double', 'float', 'bool', 'void'}
+        builtin = {'signed', 'unsigned', 'short', 'long', 'int', '__int128', 'char', 'double', 'float', 'bool', 'void'}
         if self.current.text in builtin:
             while self.current.text in builtin: self.take()
         else:
@@ -2246,7 +2246,15 @@ class CppEmitter:
             return 'std::vector{' + ', '.join(self.expr(c) for c in node.children) + '}'
         if kind == 'tuple': return 'std::tuple{' + ', '.join(self.expr(c) for c in node.children) + '}'
         if kind in {'unary', 'postfix'}:
-            x = self.expr(node.children[0], native=native)
+            child = node.children[0]
+            if (not native and kind == 'unary' and value == '-'
+                    and child.kind == 'literal' and child.extra.get('type') == 'i64'
+                    and child.value.replace("'", '') == '9223372036854775808'):
+                # The positive magnitude has no signed C++ literal spelling.
+                # Only the original minus, not generated digits, maps back.
+                minus = self.mark(value, node.token)
+                return f'({minus}9223372036854775807LL - 1LL)'
+            x = self.expr(child, native=native)
             return f'({value}({x}))' if kind == 'unary' else f'(({x}){value})'
         if kind == 'binary':
             a, b = (self.expr(c, native=native) for c in node.children)
