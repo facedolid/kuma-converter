@@ -1287,7 +1287,13 @@ class CppParser(InitializerSupport, Parser):
             if start.kind == 'IDENT' and self.tokens[self.position + 1].text not in {':=', ',', '=>'}:
                 result = self.cpp_declaration()
                 if result is not None: return result
-        return super().statement()
+        statement = super().statement()
+        if (statement.kind == 'exprstmt' and self.current.text != ';'
+                and statement.children[0].kind == 'method'
+                and statement.children[0].value == 'sort_by'
+                and statement.children[0].children[0].kind == 'name'):
+            statement.children[0].extra['kuma_sort_by_statement'] = True
+        return statement
 
     def primary(self) -> Node:
         self.reject_ambiguous_local_input()
@@ -1438,12 +1444,12 @@ def _lexer_double_colon_slice_bounds(inner) -> bool:
 
 
 def _simple_vector_assign_missing_semicolon(tokens) -> bool:
-    """``recv.add_assign(arg)`` / ``recv.sub_assign(arg)`` without an explicit ``;``."""
+    """A known vector mutation on a simple name without an explicit semicolon."""
     from .compiler import _VECTOR_ASSIGN_METHODS
 
     compact = [t for t in tokens if t.kind not in {'NEWLINE', 'EOF'}]
     if (len(compact) < 6 or compact[0].kind != 'IDENT' or compact[1].text != '.'
-            or compact[2].text not in _VECTOR_ASSIGN_METHODS or compact[3].text != '('):
+            or compact[2].text not in _VECTOR_ASSIGN_METHODS | {'sort_by'} or compact[3].text != '('):
         return False
     depth = 0
     for i, token in enumerate(compact[3:], 3):
@@ -1641,6 +1647,96 @@ _FREQUENCIES_METHODS = frozenset({'frequencies'})
 _BOUND_INDEX_METHODS = frozenset({'lower_bound_idx', 'upper_bound_idx', 'equal_range_idx'})
 
 
+def emit_mixed_sort_by(recv_expr, key_expr, fresh):
+    from .compiler import _sorted_by_fallback_elem_checks
+
+    recv, key, vt, kt = (fresh(s) for s in ('sort_by_vec', 'sort_by_key', 'sort_by_vt', 'sort_by_kt'))
+    forward_vec = f'std::forward<{vt}>({recv})'
+    forward_key = f'std::forward<{kt}>({key})'
+    native = f'({forward_vec}).sort_by({forward_key})'
+    body = (
+        f'using Vec = std::remove_cvref_t<{vt}>; '
+        f'if constexpr (requires {{ {native}; }}) return {native}; '
+        'else if constexpr (kuma_rt::is_plain_vector<Vec> && '
+        f'std::is_lvalue_reference_v<{vt}> && !std::is_const_v<std::remove_reference_t<{vt}>> '
+        f'&& !std::is_volatile_v<std::remove_reference_t<{vt}>>) {{ '
+        'using Elem = typename Vec::value_type; '
+        f'if constexpr ({_sorted_by_fallback_elem_checks("Elem")}) {{ '
+        f'auto ordered = ::sorted_by(std::as_const({recv}), {forward_key}); '
+        f'std::move(ordered.begin(), ordered.end(), {recv}.begin()); '
+        f'}} else return {native}; }} else return {native};')
+    return (f'([]<class {vt}>({vt}&& {recv}) {{ '
+            f'return [&{recv}]<class {kt}>({kt}&& {key}) -> decltype(auto) '
+            f'{{ {body} }}; }}({recv_expr}))({key_expr})')
+_WINDOW_EXTREMA_METHODS = frozenset({'sliding_window_min', 'sliding_window_max'})
+_PREDICATE_INDEX_METHODS = frozenset({'find_if_idx', 'adjacent_find_idx'})
+
+
+def emit_mixed_predicate_index(name, args, fresh, *, type_probe=False):
+    recv, arg, vt, pt = (fresh(s) for s in ('pidx_vec', 'pidx_pred', 'pidx_vt', 'pidx_pt'))
+    forward_vec = f'std::forward<{vt}>({recv})'
+    predicate = len(args) == 2
+    forward_arg = f'std::forward<{pt}>({arg})' if predicate else ''
+    native = f'({forward_vec}).{name}({forward_arg})'
+    fallback = f'::{name}({forward_vec}' + (', ' + forward_arg if predicate else '') + ')'
+    body = (
+        f'using Vec = std::remove_cvref_t<{vt}>; '
+        f'if constexpr (requires {{ {native}; }}) return {native}; '
+        'else if constexpr (kuma_rt::is_plain_vector<Vec>) { using Elem = typename Vec::value_type; '
+        'if constexpr (std::is_same_v<Elem, int> || std::is_same_v<Elem, long long>) '
+        f'return {fallback}; else return {native}; }} else return {native};')
+    if not predicate:
+        return f'([]<class {vt}>({vt}&& {recv}) -> decltype(auto) {{ {body} }})({args[0]})'
+    if type_probe:
+        return (f'([]<class {vt}, class {pt}>({vt}&& {recv}, {pt}&& {arg}) '
+                f'-> decltype(auto) {{ {body} }})({args[0]}, {args[1]})')
+    return (f'([]<class {vt}>({vt}&& {recv}) {{ '
+            f'return [&{recv}]<class {pt}>({pt}&& {arg}) -> decltype(auto) '
+            f'{{ {body} }}; }}({args[0]}))({args[1]})')
+
+
+def has_direct_algo_include(tokens, *, before_line=None):
+    conditional_depth = 0
+    for token in tokens:
+        if before_line is not None and token.line >= before_line:
+            break
+        if token.kind != 'CPP_DIRECTIVE':
+            continue
+        if re.match(r'#\s*(?:if|ifdef|ifndef)\b', token.text):
+            conditional_depth += 1
+        elif re.match(r'#\s*endif\b', token.text):
+            conditional_depth = max(0, conditional_depth - 1)
+        elif not conditional_depth and re.fullmatch(
+                r'#\s*include\s*(?:"ac_algo\.hpp"|<ac_algo\.hpp>)[ \t]*(?://[^\r\n]*)?', token.text):
+            return True
+    return False
+
+
+def emit_mixed_window_extreme(name, recv_expr, width_expr, fresh, *, type_probe=False):
+    recv, width, vt, wt = (fresh(s) for s in ('win_vec', 'win_width', 'win_vt', 'win_wt'))
+    forward_vec = f'std::forward<{vt}>({recv})'
+    forward_width = f'std::forward<{wt}>({width})'
+    native = f'({forward_vec}).{name}({forward_width})'
+    body = (
+        f'using Vec = std::remove_cvref_t<{vt}>; using Width = std::remove_cvref_t<{wt}>; '
+        f'if constexpr (requires {{ {native}; }}) return {native}; '
+        'else if constexpr (kuma_rt::is_plain_vector<Vec>) { using Elem = typename Vec::value_type; '
+        'if constexpr ((std::is_same_v<Elem, int> || std::is_same_v<Elem, long long>) && '
+        '(std::is_same_v<Width, int> || std::is_same_v<Width, long long>)) { '
+        f'const auto n = {recv}.size(); '
+        'if (std::cmp_greater(n, std::numeric_limits<int>::max())) '
+        f'throw std::out_of_range("{name}: too many elements"); '
+        f'if ({width} <= 0 || std::cmp_greater({width}, n)) return Vec{{}}; '
+        f'return ::{name}({recv}, static_cast<int>({width})); '
+        f'}} else return {native}; }} else return {native};')
+    if type_probe:
+        return (f'([]<class {vt}, class {wt}>({vt}&& {recv}, {wt}&& {width}) '
+                f'-> decltype(auto) {{ {body} }})({recv_expr}, {width_expr})')
+    return (f'([]<class {vt}>({vt}&& {recv}) {{ '
+            f'return [&{recv}]<class {wt}>({wt}&& {width}) -> decltype(auto) '
+            f'{{ {body} }}; }}({recv_expr}))({width_expr})')
+
+
 def emit_mixed_bound_index(name, recv_expr, target_expr, fresh, *, type_probe=False):
     recv, arg, vec_type, target_type = (fresh(s) for s in ('bidx_vec', 'bidx_arg', 'bidx_vt', 'bidx_at'))
     forward_vec = f'std::forward<{vec_type}>({recv})'
@@ -1711,23 +1807,19 @@ def emit_mixed_in_range(recv_expr, range_expr, fresh, *, type_probe=False):
             f'-> decltype(auto) {{ {body} }}; }}({recv_expr}))({range_expr})')
 
 
-_PREFIX_SUM_METHODS = frozenset({'prefix_sum'})
+_NUMERIC_VECTOR_ZERO_ARG_METHODS = frozenset({'prefix_sum', 'min_element_idx', 'max_element_idx'})
 
-_PREFIX_SUM_ELEMENTS = (
+_NUMERIC_VECTOR_ELEMENTS = (
     'int', 'long long', 'double',
 )
 
 
-def _prefix_sum_element_checks(var: str) -> str:
-    return ' || '.join(f'std::is_same_v<{var}, {elem}>' for elem in _PREFIX_SUM_ELEMENTS)
-
-
-def emit_mixed_prefix_sum_method(recv_expr, fresh, *, type_probe=False):
-    recv, typ, bare = (fresh(suffix) for suffix in ('psum_recv', 'psum_t', 'psum_bare'))
+def emit_mixed_numeric_vector_method(name, recv_expr, fresh):
+    recv, typ, bare = (fresh(suffix) for suffix in ('num_vec_recv', 'num_vec_t', 'num_vec_bare'))
     forward = f'std::forward<{typ}>({recv})'
-    native = f'({forward}).prefix_sum()'
-    elem = _prefix_sum_element_checks('Elem')
-    fallback = f'return ::prefix_sum({forward});'
+    native = f'({forward}).{name}()'
+    elem = ' || '.join(f'std::is_same_v<Elem, {t}>' for t in _NUMERIC_VECTOR_ELEMENTS)
+    fallback = f'return ::{name}({forward});'
     kuma_branch = (
         f'if constexpr (kuma_rt::is_plain_vector<{bare}>) {{ '
         f'using Elem = typename {bare}::value_type; '
@@ -1737,8 +1829,6 @@ def emit_mixed_prefix_sum_method(recv_expr, fresh, *, type_probe=False):
     body = (f'using {bare} = std::remove_cvref_t<{typ}>; '
             f'if constexpr (requires {{ {native}; }}) return {native}; else {kuma_branch}')
     invoke = f'[]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ {body} }}'
-    if type_probe:
-        return f'({invoke})({recv_expr})'
     return f'({invoke})({recv_expr})'
 
 
@@ -1819,6 +1909,7 @@ def emit_mixed_frequencies_method(recv_expr, fresh, *, type_probe=False):
 class CppEmitter:
     def __init__(self, filename):
         self.filename = filename
+        self.source_tokens = ()
         self.sequence = 0
         self.line_directives = True
         self.compact = False
@@ -2247,14 +2338,27 @@ class CppEmitter:
             extension_members = (_SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
                                    | _SEQUENCE_ARITHMETIC_METHODS | _INTEGER_MASK_METHODS
                                    | _VECTOR_ASSIGN_METHODS | _BETWEEN_METHODS | _COUNT_IF_METHODS
-                                   | _FIND_IDX_METHODS                                    | _RUN_LENGTH_METHODS | _FREQUENCIES_METHODS | _PREFIX_SUM_METHODS
+                                   | _FIND_IDX_METHODS | _RUN_LENGTH_METHODS | _FREQUENCIES_METHODS
+                                   | _NUMERIC_VECTOR_ZERO_ARG_METHODS
                                    | _POSITIONS_METHODS | _SORTED_BY_METHODS | _BOUND_INDEX_METHODS
+                                   | _WINDOW_EXTREMA_METHODS | _PREDICATE_INDEX_METHODS
                                    | {'to_str', 'in_range', 'sum_by'})
             args = [self.expr(c, native=(native_args and not (
                         not native and (c.kind == 'method' and c.value in extension_members
                                         or c.kind == 'member' and c.value == 'to_str'))))
                     for c in node.children]
             if not native and kind == 'method' and not node.extra.get('pointer'):
+                if (value == 'sort_by' and node.extra.get('kuma_sort_by_statement')
+                        and len(args) == 2 and not kw and not node.extra.get('types')):
+                    return emit_mixed_sort_by(*args, self.fresh)
+                if (value in _PREDICATE_INDEX_METHODS
+                        and (len(args) == 2 or value == 'adjacent_find_idx' and len(args) == 1)
+                        and not kw and not node.extra.get('types')):
+                    return emit_mixed_predicate_index(value, args, self.fresh, type_probe=self.type_probe)
+                if (value in _WINDOW_EXTREMA_METHODS and len(args) == 2 and not kw
+                        and not node.extra.get('types')
+                        and has_direct_algo_include(self.source_tokens, before_line=node.token.line)):
+                    return emit_mixed_window_extreme(value, *args, self.fresh, type_probe=self.type_probe)
                 if value in _BOUND_INDEX_METHODS and len(args) == 2 and not kw and not node.extra.get('types'):
                     return emit_mixed_bound_index(value, *args, self.fresh, type_probe=self.type_probe)
                 if value == 'sum_by' and len(args) == 2 and not kw and not node.extra.get('types'):
@@ -2318,11 +2422,10 @@ class CppEmitter:
                         args[0] = self.expr(receiver)
                     return emit_mixed_frequencies_method(args[0], self.fresh,
                                                          type_probe=self.type_probe)
-                if (value in _PREFIX_SUM_METHODS and len(args) == 1 and not kw
+                if (value in _NUMERIC_VECTOR_ZERO_ARG_METHODS and len(args) == 1 and not kw
                         and not node.extra.get('types')):
                     self.options(node, kw)
-                    return emit_mixed_prefix_sum_method(args[0], self.fresh,
-                                                        type_probe=self.type_probe)
+                    return emit_mixed_numeric_vector_method(value, args[0], self.fresh)
                 if (value in _POSITIONS_METHODS and len(args) in (1, 2) and not kw
                         and not node.extra.get('types')):
                     self.options(node, kw)
@@ -3208,6 +3311,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     mark_optional_collection_calls(nodes,
                                   masked_members=_cpp_stmt_masked_members(parser.tokens))
     emitter = emitter or CppEmitter(filename)
+    emitter.source_tokens = parser.tokens
     functions = [node for node in nodes if node.kind == 'function']
     emitter.sorted_key_record_types = {node.value for node in nodes if node.kind == 'record'}
     emitter.sorted_key_functions = {node.value: node for node in functions}
