@@ -331,6 +331,20 @@ def numeric_vec_type(type_: Type) -> bool:
     return type_.name == "vec" and type_.args[0] in NUMBER
 
 
+def _emit_mixed_ordered_pair(fresh, left_expr, right_expr, left, right, tl, tr, body, *, type_probe):
+    if type_probe:
+        return (f"([]<class {tl}, class {tr}>({tl}&& {left}, {tr}&& {right}) -> decltype(auto) "
+                f"{{ {body} }}({left_expr}, {right_expr}))")
+    # The receiver is evaluated in the postfix expression before the RHS.
+    # Both operands still belong to the caller's full expression; a native
+    # reference return may observe, or refer to, either operand's temporary.
+    # Keep lookup in the final lambda dependent on both operand types.
+    outer_t = fresh("ordered_pair_outer_t")
+    return (f"([]<class {outer_t}>({outer_t}&& {left}) {{ "
+            f"return [&{left}]<class {tr}, class {tl} = {outer_t}>({tr}&& {right}) -> decltype(auto) "
+            f"{{ {body} }}; }}({left_expr}))({right_expr})")
+
+
 def emit_mixed_binary(op: str, left_expr, right_expr, fresh, *, type_probe=False):
     left, right = (fresh(suffix) for suffix in ("bin_l", "bin_r"))
     typ_l, typ_r = (fresh(suffix) for suffix in ("bin_tl", "bin_tr"))
@@ -365,12 +379,8 @@ def emit_mixed_binary(op: str, left_expr, right_expr, fresh, *, type_probe=False
                         f"kuma_rt::kuma_vector_divisor_ok({left}, {right}); return {native}; }} else "
                         f"return kuma_rt::kuma_vector_div({forward_l}, {forward_r}); }} else ")
     body = setup + "".join(branches) + f"return {native};"
-    if type_probe:
-        return (f"([]<class {typ_l}, class {typ_r}>({typ_l}&& {left}, {typ_r}&& {right}) -> decltype(auto) "
-                f"{{ {body} }}({left_expr}, {right_expr}))")
-    return (f"([&]<class {typ_l}>({typ_l}&& {left}) -> decltype(auto) {{ "
-            f"return ([&]<class {typ_r}>({typ_r}&& {right}) -> decltype(auto) "
-            f"{{ {body} }}({right_expr})); }}({left_expr}))")
+    return _emit_mixed_ordered_pair(fresh, left_expr, right_expr, left, right, typ_l, typ_r, body,
+                                    type_probe=type_probe)
 
 
 _SEQUENCE_ARITHMETIC_METHODS = frozenset({"dot", "mul_each", "concat", "repeat"})
@@ -401,12 +411,8 @@ def emit_mixed_sequence_method(name, recv_expr, arg_expr, fresh, *, type_probe=F
                  f"if constexpr ({integral} && kuma_rt::is_plain_vector<{bare_l}>) "
                  f"return kuma_rt::vector_repeat({left}, {right}); else ")
     body += f"return {native};"
-    if type_probe:
-        return (f"([]<class {tl}, class {tr}>({tl}&& {left}, {tr}&& {right}) -> decltype(auto) "
-                f"{{ {body} }}({recv_expr}, {arg_expr}))")
-    return (f"([&]<class {tl}>({tl}&& {left}) -> decltype(auto) {{ "
-            f"return ([&]<class {tr}>({tr}&& {right}) -> decltype(auto) "
-            f"{{ {body} }}({arg_expr})); }}({recv_expr}))")
+    return _emit_mixed_ordered_pair(fresh, recv_expr, arg_expr, left, right, tl, tr, body,
+                                    type_probe=type_probe)
 
 
 def emit_mixed_vector_assign_method(method, recv_expr, arg_expr, fresh, *, type_probe=False):

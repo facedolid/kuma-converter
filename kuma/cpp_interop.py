@@ -2268,7 +2268,9 @@ class CppEmitter:
             if value in ('+', '-', '*', '/') and not native and forwardable:
                 from .compiler import emit_mixed_binary
                 return emit_mixed_binary(value, a, b, self.fresh, type_probe=self.type_probe)
-            return f'kuma_rt::range({a}, {b})' if value == '..' else f'({a} {value} {b})'
+            if value == '..':
+                return f'kuma_rt::range_args({{kuma_rt::range_bound({a}), kuma_rt::range_bound({b})}})'
+            return f'({a} {value} {b})'
         if kind == 'ternary':
             c, a, b = (self.expr(c, native=native) for c in node.children)
             return f'({c} ? {a} : {b})'
