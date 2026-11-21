@@ -110,7 +110,7 @@ class CppParser(InitializerSupport, Parser):
         self.macro_names = set()
         self.object_macro_names = set()
         self.prefix_body_preprocessing_known = True
-        self.stock_loop_header_line = None
+        self.stock_ac_header_line = None
         stock_loop_preprocessing = True
         directive_space = r'(?:\s|/\*.*?\*/)'
         for index, tok in enumerate(self.tokens):
@@ -124,8 +124,8 @@ class CppParser(InitializerSupport, Parser):
                         self.prefix_body_preprocessing_known = False
                     if not include or include[1] not in _STOCK_LOOP_HEADERS:
                         stock_loop_preprocessing = False
-                    elif include[1] == '"ac.hpp"' and self.stock_loop_header_line is None:
-                        self.stock_loop_header_line = tok.line
+                    elif include[1] == '"ac.hpp"' and self.stock_ac_header_line is None:
+                        self.stock_ac_header_line = tok.line
                 elif not re.fullmatch(r'#[ \t]*define[ \t]+(?:'
                                       + '|'.join(sorted(_STOCK_LOOP_FLAGS)) + r')[ \t]*(?://[^\r\n]*)?', logical):
                     # Do not assume an include hidden by conditionals or a
@@ -150,7 +150,7 @@ class CppParser(InitializerSupport, Parser):
                     self.prefix_body_preprocessing_known = False
                     stock_loop_preprocessing = False
         if not stock_loop_preprocessing:
-            self.stock_loop_header_line = None
+            self.stock_ac_header_line = None
         self.native_bodies = NativeBodies(self.tokens, self.macro_names)
         self.input_parameter_bodies = set()
         # Do not interpret macro-dependent declarations as C++ binding names.
@@ -620,8 +620,8 @@ class CppParser(InitializerSupport, Parser):
     def template_loop_body(self, start_index: int, *, stock_only=False) -> bool:
         start = self.tokens[start_index]
         if (start.text not in _TEMPLATE_LOOP_MACROS or self.tokens[start_index + 1].text != '('
-                or stock_only and (self.stock_loop_header_line is None
-                                   or start.line <= self.stock_loop_header_line)):
+                or stock_only and (self.stock_ac_header_line is None
+                                   or start.line <= self.stock_ac_header_line)):
             return False
         closing = self.native_bodies.pairs.get(start_index + 1)
         if closing is None:
@@ -1849,6 +1849,16 @@ def emit_mixed_bound_index(name, recv_expr, target_expr, fresh, *, type_probe=Fa
             f'return [&{recv}]<class {target_type}, class {vec_type} = {outer_t}>({target_type}&& {arg}) '
             f'-> decltype(auto) {{ {body} }}; }}({recv_expr}))({target_expr})')
 
+def emit_mixed_kth(member, expressions, fresh):
+    recv, rank = (fresh('kth_' + t) for t in ('recv', 'rank'))
+    fallback = f'::kuma_rt::{member}({recv}, {rank}'
+    fallback += f', {expressions[2]})' if len(expressions) == 3 else ')'
+    # Only called on a named, proven vector, never an unknown C++ receiver.
+    # Snapshot the integer rank before evaluating the optional key expression.
+    return (f'([&]() {{ const auto& {recv} = {expressions[0]}; '
+            f'const auto {rank} = {expressions[1]}; return {fallback}; }}())')
+
+
 def emit_mixed_sum_by(recv_expr, projection_expr, fresh, *, type_probe=False):
     recv, arg, vec_type, fn_type = (fresh(s) for s in ('sum_by_vec', 'sum_by_fn', 'sum_by_vt', 'sum_by_ft'))
     forward_vec, forward_fn = f'std::forward<{vec_type}>({recv})', f'std::forward<{fn_type}>({arg})'
@@ -2506,7 +2516,8 @@ class CppEmitter:
                                    | _WINDOW_EXTREMA_METHODS | _PREDICATE_INDEX_METHODS
                                    | {'to_str', 'in_range', 'range_sum', 'combination_indices', 'combinations', 'next_greater_indices', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec'})
             args = [self.expr(c, native=(native_args and not (
-                        not native and (c.kind == 'method' and c.value in extension_members
+                        not native and (c.kind == 'method' and (c.value in extension_members
+                                                                or c.extra.get('kuma_kth_proven'))
                                         or c.kind == 'member' and c.value == 'to_str'))))
                     for c in node.children]
             if not native and kind == 'method' and not node.extra.get('pointer'):
@@ -2532,6 +2543,8 @@ class CppEmitter:
                     return emit_mixed_combinations(value, *args, self.fresh, type_probe=self.type_probe)
                 if value == 'range_sum' and len(args) == 3 and not kw and not node.extra.get('types'):
                     return emit_mixed_range_sum(*args, self.fresh, type_probe=self.type_probe)
+                if not self.type_probe and node.extra.get('kuma_kth_proven'):
+                    return emit_mixed_kth(value, args, self.fresh)
                 if value == 'sum_by' and len(args) == 2 and not kw and not node.extra.get('types'):
                     return emit_mixed_sum_by(*args, self.fresh, type_probe=self.type_probe)
                 if value == 'in_range' and len(args) == 2 and not kw and not node.extra.get('types'):
@@ -3367,6 +3380,116 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None,
                                            masked_members=masked_members)
 
 
+def mark_mixed_kth(nodes, parser, *, source_parser=None):
+    """Mark only checked calls with a local, ordinary vector provenance."""
+    from .compiler import _KTH_KEY_METHODS, _KTH_SCALAR_METHODS
+    source_parser = source_parser or parser
+    header = source_parser.stock_ac_header_line
+    if header is None:
+        return []
+    tokens = source_parser.tokens
+    # A local using/typedef, an arbitrary same-named declaration, or a C++
+    # namespace other than the standard entry context can change the alias.
+    def known_pll(i):
+        before = [t.text for t in tokens[max(0, i - 2):i]]
+        after = [t.text for t in tokens[i + 1:i + 5]]
+        return (before == ['input', '<'] and after[:1] == ['>']
+                or len(before) == 2 and before == ['(', 'const'] and len(after) == 4
+                and after[0] == '&' and tokens[i + 2].kind == 'IDENT'
+                and after[2:] == [')', '=>'])
+    pll = all(known_pll(i) for i, t in enumerate(tokens) if t.text == 'pll')
+    # The existing mixed RLE fallback calls ::run_length_encode, whose
+    # overload set can include a user declaration with a different result.
+    stock_rle = all(i > 0 and tokens[i - 1].text == '.' and tokens[i + 1].text == '('
+                    for i, t in enumerate(tokens[:-1]) if t.text == 'run_length_encode')
+    # Existing vector/input emission spells std:: and kuma_rt:: without
+    # a leading ::. Decline if a source declaration could shadow either.
+    if any(t.text == 'kuma_rt' or t.text == 'std' and tokens[i + 1].text != '::'
+           for i, t in enumerate(tokens[:-1])):
+        return []
+    integer = re.compile(r"(0|[1-9](?:'?[0-9])*)(?:LL|ll)?")
+    sites = []
+
+    def integer_literal(value):
+        if value.kind == 'unary' and value.value in ('+', '-') and len(value.children) == 1:
+            value = value.children[0]
+        if value.kind != 'literal' or value.extra.get('type') != 'i64':
+            return False
+        match = integer.fullmatch(value.value)
+        digits = match[1].replace("'", '') if match else ''
+        return bool(digits and len(digits) <= 19 and int(digits) <= (1 << 63) - 1)
+
+    def bare_name(value, names):
+        return (names.get(value.value) if value.kind == 'name' and value.value == value.token.text
+                else None)
+
+    def plain_method(value):
+        return not any(value.extra.get(k) for k in ('pointer', 'kwargs', 'types'))
+
+    def vector(value, names):
+        if value.kind == 'array' and value.children and all(map(integer_literal, value.children)):
+            return 'scalar'
+        if (value.kind == 'call' and value.value == 'input' and len(value.children) == 1
+                and not value.extra.get('kwargs')):
+            types = value.extra.get('types') or []
+            if not types or len(types) == 1 and cpp_type(types[0]) in ('int', 'long long'):
+                return 'scalar'
+            if len(types) == 1 and types[0] == 'pll' and pll:
+                return 'row'
+        if (stock_rle and value.kind == 'method' and value.value == 'run_length_encode'
+                and len(value.children) == 1 and plain_method(value)
+                and bare_name(value.children[0], names) == 'scalar'):
+            return 'row'
+        return None
+
+    def expression(value, names):
+        if value.kind in {'lambda', 'comprehension', 'cpp_opaque_sections'}:
+            return
+        if value.kind == 'method' and plain_method(value) and value.children:
+            keyed = value.value in _KTH_KEY_METHODS and len(value.children) == 3
+            scalar = value.value in _KTH_SCALAR_METHODS and len(value.children) == 2
+            if keyed or scalar:
+                owner = bare_name(value.children[0], names)
+                if owner and (keyed or owner == 'scalar') and not any(
+                        child.kind == 'cpp_expr' and child.value.lstrip().startswith('{')
+                        for child in value.children[1:]):
+                    value.extra['kuma_kth_proven'] = True
+                    sites.append(value)
+        for child in value.children:
+            expression(child, names)
+
+    def block(statements):
+        names = {}
+        for stmt in statements:
+            if stmt.kind.startswith('cpp_'):
+                names.clear()
+                continue
+            if stmt.token.line > header:
+                for child in stmt.children:
+                    expression(child, names)
+            if stmt.kind == 'declare':
+                proved = (stmt.token.line > header and len(stmt.value) == 1
+                          and not stmt.extra.get('type') and vector(stmt.children[0], names))
+                for name in stmt.value:
+                    names.pop(name, None)
+                if proved:
+                    names[stmt.value[0]] = proved
+            if stmt.kind in {'if', 'while'}:
+                for key in ('body', 'else'):
+                    block(stmt.extra.get(key, ()))
+
+    if not parser.has_native_main and not any(n.kind == 'main_entry' for n in nodes):
+        block(nodes)
+    for node in nodes:
+        if node.kind in {'main_entry', 'cpp_main'}:
+            block(node.extra.get('body', ()))
+        if node.kind == 'cpp_opaque_sections' and node.extra.get('main'):
+            sections = [s for s in node.extra['sections'] if s[0] == 'function']
+            if len(sections) == 1:
+                block(sections[0][1])
+    return sites
+
+
 def mark_iter_collect(nodes, tokens):
     """V1 proof: checked main: value expressions over explicitly proven vectors."""
     if any(t.kind == 'CPP_DIRECTIVE' and not re.match(r'#\s*include\b', t.text)
@@ -3582,6 +3705,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     mixed_main = validate_mixed_main_entries(nodes, parser)
     checked_tuple_key_functions(nodes, parser.tokens, source, filename)
     mark_iter_collect(nodes, parser.tokens)
+    mark_mixed_kth(nodes, parser)
     mark_optional_collection_calls(nodes,
                                   masked_members=_cpp_stmt_masked_members(parser.tokens))
     emitter = emitter or CppEmitter(filename)

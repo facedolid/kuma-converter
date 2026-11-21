@@ -251,6 +251,23 @@ _FIND_IDX_METHODS = frozenset({"find_idx", "rfind_idx"})
 
 _SORTED_BY_METHODS = frozenset({"sorted_by"})
 
+_KTH_SCALAR_METHODS = frozenset({"kth_largest", "kth_smallest"})
+_KTH_KEY_METHODS = frozenset({"kth_largest_by", "kth_smallest_by"})
+KTH_METHODS = _KTH_SCALAR_METHODS | _KTH_KEY_METHODS
+KTH_SCALARS = (I32, I64, F64, BOOL, CHAR, STRING)
+
+
+def kth_element_supported(element, keyed):
+    return element in KTH_SCALARS or keyed and element.name == "pair" and (
+        element.args == (I64, I64) or len(element.args) == 2
+        and element.args[0] in KTH_SCALARS and element.args[1] == I32)
+
+
+def kth_key_supported(key):
+    return key in KTH_SCALARS or key.name in ("tuple", "pair") and all(
+        kth_key_supported(part) for part in key.args)
+
+
 _FIND_IDX_ELEMENTS = (
     "int", "long long", "double", "bool", "char", "std::string",
 )
@@ -2605,6 +2622,28 @@ class Compiler(DeclarationSupport):
             output = Type("pair", (sequence.type, sequence.type))
             source_name = self.fresh("partition_source")
             return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; return ::partition_vec({source_name}, {code}); }}())", output)
+        if name in KTH_METHODS and node.kind == "method":
+            keyed = name in _KTH_KEY_METHODS
+            if kwargs or node.extra.get("types") or len(args) != (3 if keyed else 2):
+                self.fail(name + ("(k, key)" if keyed else "(k)") + " と書いてください", node)
+            sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if sequence.type.name != "vec" or not kth_element_supported(sequence.type.args[0], keyed):
+                self.fail(name + " は対応する要素型の配列に使ってください", node)
+            element = sequence.type.args[0]
+            rank = self.expr(args[1])
+            if rank.type not in INTEGER:
+                self.fail(name + " の順位は整数にしてください", node)
+            if not keyed:
+                return self.ordered([sequence, rank], element, lambda ns: f"::kuma_rt::{name}({', '.join(ns)})", borrow=True)
+            callback = self.expr(args[2])
+            if not callback.function:
+                self.fail(name + " のキーには1引数の関数を指定してください", node)
+            with self.protect(sequence.origins):
+                code, key_type = self.lower_function(callback.function, [element])
+            if not kth_key_supported(key_type):
+                self.fail(name + " のキーはスカラー値かそのペア・タプルにしてください", node)
+            return self.ordered([sequence, rank], element,
+                                lambda ns: f"::kuma_rt::{name}({', '.join(ns)}, {code})", borrow=True)
         if name == "sorted_by" and node.kind in ("call", "method"):
             if kwargs or node.extra.get("types") or len(args) != 2:
                 self.fail("sorted_by(配列, 関数) または 配列.sorted_by(関数) と書いてください", node)
