@@ -2719,6 +2719,23 @@ class Compiler(DeclarationSupport):
                 self.fail(name + " のキーはスカラー値かそのペア・タプルにしてください", node)
             return self.ordered([sequence, rank], element,
                                 lambda ns: f"::kuma_rt::{name}({', '.join(ns)}, {code})", borrow=True)
+        if name == "sum_by" and node.kind == "method":
+            if kwargs or node.extra.get("types") or len(args) != 2:
+                self.fail("辞書.sum_by(関数) と書いてください", node)
+            dictionary = self.expr(args[0])
+            if dictionary.type.name != "dict":
+                self.fail("純Kumaの sum_by は辞書に対応しています", node)
+            callback = self.expr(args[1])
+            if not callback.function:
+                self.fail("sum_by には1引数の関数を指定してください", node)
+            element = Type("pair", dictionary.type.args)
+            with self.protect(dictionary.origins):
+                code, result = self.lower_function(callback.function, [element], observe=True)
+            if result not in NUMBER:
+                self.fail("sum_by の変換結果は数値にしてください", node)
+            source = self.fresh("sum_by_source")
+            return Value(f"([&]() {{ const auto& {source} = {dictionary.code}; "
+                         f"return ::sum_by({source}, {code}); }}())", result)
         if name == "sorted_by" and node.kind in ("call", "method"):
             if kwargs or node.extra.get("types") or len(args) != 2:
                 self.fail("sorted_by(配列, 関数) または 配列.sorted_by(関数) と書いてください", node)

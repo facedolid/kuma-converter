@@ -12,7 +12,7 @@ import sys
 from .lexer import lex
 from .cpp_bodies import NativeBodies
 from .model import KumaError, Node, Token, safe_sorted_key, sorted_key_captures, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
-from .parser import QUEUE_STACK, Parser, _BARE_CALLS
+from .parser import QUEUE_STACK, Parser, _BARE_CALLS, parse_interpolation
 from .power import CPP_POWER
 
 
@@ -1869,6 +1869,9 @@ def emit_mixed_sum_by(recv_expr, projection_expr, fresh, *, type_probe=False):
     body = (
         f'using Vec = std::remove_cvref_t<{vec_type}>; '
         f'if constexpr (requires {{ {native}; }}) return {native}; '
+        # Exact standard associative specializations with mapped values only.
+        'else if constexpr (::kuma_rt::is_associative<Vec>::value && requires { typename Vec::mapped_type; }) '
+        f'return ::sum_by({forward_vec}, {forward_fn}); '
         'else if constexpr (kuma_rt::is_plain_vector<Vec>) { using Elem = typename Vec::value_type; '
         f'if constexpr ({supported}) return ::sum_by({forward_vec}, {forward_fn}); '
         f'else return {native}; }} else return {native};')
@@ -2085,6 +2088,7 @@ class CppEmitter:
     def __init__(self, filename):
         self.filename = filename
         self.source_tokens = ()
+        self.uses_stdout_finish = False
         self.sequence = 0
         self.line_directives = True
         self.compact = False
@@ -2684,7 +2688,12 @@ class CppEmitter:
                 for arg in args:
                     name = self.fresh('arg'); names.append(name); prefix += f'auto {name} = {arg}; '
                 helper = 'debug_print' if value == 'debug' else 'print'
-                return '([&]() { ' + prefix + f'(kuma_rt::{helper})({options}' + (', ' + ', '.join(names) if names else '') + '); }())'
+                # Use the stock interactive policy only for implicit stdout flush.
+                finish = ''
+                if value == 'print' and 'flush' not in kw:
+                    self.uses_stdout_finish = True
+                    finish = ' (::kuma_gen_finish_stdout)();'
+                return '([&]() { ' + prefix + f'(kuma_rt::{helper})({options}' + (', ' + ', '.join(names) if names else '') + ');' + finish + ' }())'
             if value in {'zip', 'enumerate'}:
                 allowed = {'strict'} if value == 'zip' else {'start'}
                 self.options(node, kw, allowed)
@@ -3443,49 +3452,56 @@ def mark_mixed_adaptors(nodes, parser, *, source_parser=None):
     return sites
 
 
-def lower_implicit_adaptor_write(nodes, parser):
-    """Recover an unambiguous `write name` on a checked mixed adaptor."""
-    if re.search(r'\\[ \t]*\n', parser.source):
+def lower_implicit_write(nodes, parser):
+    """Recover physical-line writes on previously declared simple Kuma locals."""
+    if parser.stock_ac_header_line is None or re.search(r'\\[ \t]*\n', parser.source):
         return
     tokens = parser.tokens
     output_tokens = {node.token for node in nodes if node.kind == 'write'}
     bindings = set()
     writes = []
     for node in nodes:
+        i = parser.native_token_indices.get(node.token)
         if node.kind == 'declare':
             bindings.difference_update(node.value)
-            if (len(node.value) == len(node.children) == 1
-                    and node.children[0].extra.get('kuma_mixed_adaptor')):
+            if (i is not None and len(node.value) == 1 and node.value[0] == node.token.text
+                    and not node.extra.get('type') and node.token.text != 'input'
+                    and tokens[i + 1].text == ':='):
                 bindings.add(node.value[0])
-        if node.kind != 'cpp_stmt' or node.token.text != 'write':
+        if node.kind != 'cpp_stmt' or node.token.text != 'write' or i is None:
             continue
-        i = parser.native_token_indices.get(node.token)
-        if i is None or i + 2 >= len(tokens):
+        end = i + 1
+        while (tokens[end].kind not in {'NEWLINE', 'EOF'} and tokens[end].line == node.token.line):
+            end += 1
+        arguments = tokens[i + 1:end]
+        if (not arguments or len(arguments) % 2 == 0
+                or arguments[0].kind != 'IDENT' or arguments[0].text not in bindings
+                or tokens[end].kind not in {'NEWLINE', 'EOF'}
+                or node.value != parser.source_range(node.token, arguments[-1]) + ';'):
             continue
-        operand, ending = tokens[i + 1:i + 3]
-        if (operand.kind != 'IDENT' or operand.text not in bindings
-                or operand.line != node.token.line or ending.kind not in {'NEWLINE', 'EOF'}
-                or node.value != parser.source_range(node.token, operand) + ';'):
+        if (any(t.text != ',' for t in arguments[1::2])
+                or any(t.kind != 'STRING' and (t.kind != 'IDENT' or t.text not in bindings)
+                       for t in arguments[2::2])):
             continue
-        after = i + 2
+        after = end
         while tokens[after].kind == 'NEWLINE':
             after += 1
-        # Do not consume a native declaration with a later semicolon or a
-        # continued expression. Preserve other ambiguous native layouts too.
+        # Do not take a native declaration with a later semicolon or prefix
+        # of a continued declaration/expression.
         following = tokens[after]
         if (following.kind != 'EOF' and (following.kind != 'IDENT' or following.text in {
                 'and', 'and_eq', 'bitand', 'bitor', 'not', 'not_eq', 'or', 'or_eq', 'xor', 'xor_eq'})):
             continue
-        writes.append((node, operand))
+        writes.append((node, arguments[::2]))
         output_tokens.add(node.token)
-    # Stock includes and the ctor marker exclude unknown preprocessing. Do
-    # not claim write when the source uses that name outside known output.
+    # Preserve conflicting names such as a C++ type alias named write.
     if any(token.text == 'write' and token.kind == 'IDENT' and token not in output_tokens
            for token in tokens):
         return
-    for node, operand in writes:
+    for node, operands in writes:
         node.kind, node.value = 'write', None
-        node.children = [Node('name', operand, operand.text)]
+        node.children = [parse_interpolation(parser, t) if t.kind == 'STRING' else Node('name', t, t.text)
+                         for t in operands]
 
 
 def mark_mixed_kth(nodes, parser, *, source_parser=None):
@@ -3814,8 +3830,8 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     checked_tuple_key_functions(nodes, parser.tokens, source, filename)
     mark_iter_collect(nodes, parser.tokens)
     uses_adaptors = bool(mark_mixed_adaptors(nodes, parser))
-    if uses_adaptors and not mixed_main and not parser.has_native_main:
-        lower_implicit_adaptor_write(nodes, parser)
+    if not mixed_main and not parser.has_native_main:
+        lower_implicit_write(nodes, parser)
     mark_mixed_kth(nodes, parser)
     mark_optional_collection_calls(nodes,
                                   masked_members=_cpp_stmt_masked_members(parser.tokens))
@@ -3915,6 +3931,15 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
             runtime = ''
     else:
         runtime += '#ifndef KUMA_CPP_INTEROP_ABI\n#error Kuma M6 needs a published M6 runtime header\n#endif\n'
+    if emitter.uses_stdout_finish:
+        # Bind the stock policy before later user declarations can define macros.
+        # Leading includes can already define these names: keep explicit flush
+        # available without expanding their macros or affecting native code.
+        runtime += ('static inline void kuma_gen_finish_stdout() {\n'
+                    '#if !defined(ac_detail) && !defined(output) && !defined(finish)\n'
+                    '    (::ac_detail::output::finish)();\n'
+                    '#endif\n'
+                    '}\n')
     header = (('' if emitter.compact else '// Generated by Kuma M7 C++ interop.\n')
               + '\n'.join(directives) + '\n' + runtime
               + ''.join('#ifdef ' + name + '\n#error Kuma key function name is a macro: ' + name + '\n#endif\n' for name in sorted(emitter.sorted_key_used))
