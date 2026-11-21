@@ -12,7 +12,7 @@ import sys
 from .lexer import lex
 from .cpp_bodies import NativeBodies
 from .model import KumaError, Node, Token, safe_sorted_key, sorted_key_captures, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
-from .parser import Parser, _BARE_CALLS
+from .parser import QUEUE_STACK, Parser, _BARE_CALLS
 from .power import CPP_POWER
 
 
@@ -2409,6 +2409,8 @@ class CppEmitter:
                 self.options(node, kw)
                 return f'({self.expr(node.children[0])})(' + ', '.join(self.expr(c, native=True) for c in node.children[1:]) + ')'
             if kind == 'call' and value == 'input': return self.input(node, expected)
+            if kind == 'call' and not native and node.extra.get('kuma_mixed_adaptor'):
+                return ('::kuma_rt::MixedQueue{}' if value == 'queue' else '::kuma_rt::MixedStack{}')
             if kind == 'call' and value == 'SortedList' and not native:
                 self.options(node, kw, {'key'})
                 if node.extra.get('types') or len(node.children) > 1:
@@ -3380,6 +3382,67 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None,
                                            masked_members=masked_members)
 
 
+def mark_mixed_adaptors(nodes, parser, *, source_parser=None):
+    """Recognize only stock, unqualified zero-argument named declarations."""
+    full = source_parser or parser
+    header = full.stock_ac_header_line
+    if header is None:
+        return []
+
+    def ctor_spelling(tokens, i):
+        if (i < 2 or i + 3 >= len(tokens) or tokens[i - 2].kind != 'IDENT'
+                or tokens[i - 1].text != ':='
+                or tokens[i + 1].text != '(' or tokens[i + 2].text != ')'
+                or any(t.line != tokens[i].line for t in tokens[i - 2:i + 3])):
+            return False
+        before = tokens[i - 3] if i >= 3 else None
+        after = tokens[i + 3]
+        return ((before is None or before.kind == 'NEWLINE' or before.text in ('{', ';'))
+                and (after.kind in ('NEWLINE', 'EOF') or after.text in (';', '}')))
+
+    allowed = set(QUEUE_STACK)
+    tokens = full.tokens
+    for i, token in enumerate(tokens[:-1]):
+        if token.kind != 'IDENT' or token.text not in allowed:
+            continue
+        # A qualified type does not introduce an unqualified candidate.
+        # Using declarations/imports and other spellings conservatively veto.
+        if (i >= 2 and [t.text for t in tokens[i - 2:i]] == ['std', '::']
+                and tokens[i + 1].text == '<'):
+            continue
+        if not ctor_spelling(tokens, i):
+            allowed.discard(token.text)
+    if not allowed:
+        return []
+
+    groups = []
+    if not parser.has_native_main and not any(node.kind == 'main_entry' for node in nodes):
+        groups.append(nodes)
+    for node in nodes:
+        if node.kind in ('main_entry', 'cpp_main'):
+            groups.append(node.extra.get('body', ()))
+        elif node.kind == 'cpp_opaque_sections' and node.extra.get('main'):
+            sections = [part[1] for part in node.extra['sections'] if part[0] == 'function']
+            if len(sections) == 1:
+                groups.extend(sections)
+    sites = []
+    for group in groups:
+        for stmt in group:
+            if (stmt.kind != 'declare' or stmt.extra.get('type') or len(stmt.value) != 1
+                    or stmt.token.text != stmt.value[0] or stmt.token.line <= header
+                    or len(stmt.children) != 1):
+                continue
+            value = stmt.children[0]
+            if (value.kind != 'call' or value.value not in allowed or value.children
+                    or value.extra.get('types') or value.extra.get('kwargs')):
+                continue
+            i = parser.native_token_indices.get(value.token)
+            if i is not None and ctor_spelling(parser.tokens, i) and parser.tokens[i - 2] == stmt.token:
+                value.extra['kuma_mixed_adaptor'] = True
+                sites.append(value)
+    return sites
+
+
 def mark_mixed_kth(nodes, parser, *, source_parser=None):
     """Mark only checked calls with a local, ordinary vector provenance."""
     from .compiler import _KTH_KEY_METHODS, _KTH_SCALAR_METHODS
@@ -3705,6 +3768,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     mixed_main = validate_mixed_main_entries(nodes, parser)
     checked_tuple_key_functions(nodes, parser.tokens, source, filename)
     mark_iter_collect(nodes, parser.tokens)
+    uses_adaptors = bool(mark_mixed_adaptors(nodes, parser))
     mark_mixed_kth(nodes, parser)
     mark_optional_collection_calls(nodes,
                                   masked_members=_cpp_stmt_masked_members(parser.tokens))
@@ -3786,6 +3850,9 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     runtime = ('#pragma push_macro("print")\n#pragma push_macro("println")\n'
                '#undef print\n#undef println\n#include "kuma.hpp"\n'
                '#pragma pop_macro("println")\n#pragma pop_macro("print")\n')
+    if uses_adaptors:
+        runtime = ('#define kuma_gen_enable_mixed_adaptors 1\n' + runtime
+                   + '#undef kuma_gen_enable_mixed_adaptors\n')
     aliases = [('i64', 'using i64 = long long;'), ('i32', 'using i32 = int;'),
                ('f64', 'using f64 = double;'),
                ('vec', 'template<class T> using vec = std::vector<T>;'),
