@@ -85,6 +85,14 @@ _PREFIX_BODY_HEADERS = {
 }
 
 
+_TEMPLATE_LOOP_MACROS = frozenset({'rep', 'rrep', 'repi', 'repl', 'repit', 'repeach'})
+_STOCK_LOOP_HEADERS = _PREFIX_BODY_HEADERS | {
+    '"ac_math.hpp"', '"ac_algo.hpp"', '"ac_geometry.hpp"', '"ac_visual.hpp"',
+}
+_STOCK_LOOP_FLAGS = {'LOCAL', 'AC_NO_ACL', 'AC_YES_UPPER', 'AC_YES_LOWER',
+                     'AC_NO_PRINT_MACROS', 'AC_INTERACTIVE'}
+
+
 class CppParser(InitializerSupport, Parser):
     def __init__(self, source: str):
         super().__init__(source, cpp=True)
@@ -102,6 +110,8 @@ class CppParser(InitializerSupport, Parser):
         self.macro_names = set()
         self.object_macro_names = set()
         self.prefix_body_preprocessing_known = True
+        self.stock_loop_header_line = None
+        stock_loop_preprocessing = True
         directive_space = r'(?:\s|/\*.*?\*/)'
         for index, tok in enumerate(self.tokens):
             if tok.kind == 'CPP_DIRECTIVE':
@@ -112,7 +122,16 @@ class CppParser(InitializerSupport, Parser):
                     include = re.fullmatch(r'#[ \t]*include[ \t]*(\S+?)[ \t]*', tok.text)
                     if not include or include[1] not in _PREFIX_BODY_HEADERS:
                         self.prefix_body_preprocessing_known = False
-                elif keyword not in {'define', 'undef', 'if', 'ifdef', 'ifndef', 'else', 'elif', 'endif'}:
+                    if not include or include[1] not in _STOCK_LOOP_HEADERS:
+                        stock_loop_preprocessing = False
+                    elif include[1] == '"ac.hpp"' and self.stock_loop_header_line is None:
+                        self.stock_loop_header_line = tok.line
+                elif not re.fullmatch(r'#[ \t]*define[ \t]+(?:'
+                                      + '|'.join(sorted(_STOCK_LOOP_FLAGS)) + r')[ \t]*(?://[^\r\n]*)?', logical):
+                    # Do not assume an include hidden by conditionals or a
+                    # macro/pragma that can change the loop names or bodies.
+                    stock_loop_preprocessing = False
+                if keyword not in {'include', 'define', 'undef', 'if', 'ifdef', 'ifndef', 'else', 'elif', 'endif'}:
                     self.prefix_body_preprocessing_known = False
                 match = function_macro_definition(tok.text)
                 if match:
@@ -129,6 +148,9 @@ class CppParser(InitializerSupport, Parser):
                     # Digraph directives can survive as raw C++, but this
                     # lexer does not describe their macro definitions.
                     self.prefix_body_preprocessing_known = False
+                    stock_loop_preprocessing = False
+        if not stock_loop_preprocessing:
+            self.stock_loop_header_line = None
         self.native_bodies = NativeBodies(self.tokens, self.macro_names)
         self.input_parameter_bodies = set()
         # Do not interpret macro-dependent declarations as C++ binding names.
@@ -595,6 +617,27 @@ class CppParser(InitializerSupport, Parser):
     def native_braced_function(self, opening: int, lower_bound: int) -> bool:
         return opening >= lower_bound and opening in self.native_bodies.bodies
 
+    def template_loop_body(self, start_index: int, *, stock_only=False) -> bool:
+        start = self.tokens[start_index]
+        if (start.text not in _TEMPLATE_LOOP_MACROS or self.tokens[start_index + 1].text != '('
+                or stock_only and (self.stock_loop_header_line is None
+                                   or start.line <= self.stock_loop_header_line)):
+            return False
+        closing = self.native_bodies.pairs.get(start_index + 1)
+        if closing is None:
+            return False
+        following = closing + 1
+        if self.tokens[following].text == '{':
+            return True
+        if self.tokens[following].kind != 'NEWLINE':
+            return False
+        while self.tokens[following].kind == 'NEWLINE':
+            following += 1
+        body = self.tokens[following]
+        # Stock macros can have a standalone brace on the next line too.
+        return (stock_only and body.text == '{'
+                or body.kind != 'EOF' and body.indent > start.indent)
+
     def native_definition(self) -> Node | None:
         """Keep the full declarator, including constraints/initializers, raw."""
         start = self.position
@@ -602,6 +645,11 @@ class CppParser(InitializerSupport, Parser):
         layout = self.native_bodies
         while cursor < len(self.tokens):
             text = self.tokens[cursor].text
+            if (cursor > start and self.tokens[cursor - 1].kind == 'NEWLINE'
+                    and self.template_loop_body(cursor, stock_only=True)):
+                # This is a later executable statement, not the end of the
+                # current C++ declarator. Delimited arguments are skipped below.
+                return None
             if cursor in layout.functions:
                 opening = layout.functions[cursor]
                 end = layout.definition_end(opening)
@@ -1211,24 +1259,15 @@ class CppParser(InitializerSupport, Parser):
                        and self.tokens[self.position + 3].text not in {'{', ':', 'final'}
                        and self.tokens[self.position + 3].indent > start.indent)
         kuma_named = start.text == 'fn' or (start.text == 'def' and self.looks_like_kuma_named_function())
-        if not self.depth and not kuma_record and start.text not in {'if', 'while', 'for', 'rep'} | ({'fn', 'def'} if kuma_named else set()):
+        stock_loop = not self.depth and self.template_loop_body(self.position, stock_only=True)
+        if (not self.depth and not kuma_record and not stock_loop
+                and start.text not in {'if', 'while', 'for', 'rep'} | ({'fn', 'def'} if kuma_named else set())):
             definition = self.native_definition()
             if definition is not None:
                 return definition
         # Known template loop macros retain their native C++ macro arguments;
         # only the controlled body is parsed for Kuma sugar.
-        template_macro_body = False
-        if start.text in {'rrep', 'repi', 'repl', 'repit', 'repeach'} and self.tokens[self.position + 1].text == '(':
-            opening = self.position + 1
-            closing = self.native_bodies.pairs.get(opening)
-            if closing is not None:
-                following = self.tokens[closing + 1]
-                template_macro_body = following.text == '{'
-                if following.kind == 'NEWLINE':
-                    look = closing + 1
-                    while self.tokens[look].kind == 'NEWLINE':
-                        look += 1
-                    template_macro_body = self.tokens[look].indent > start.indent
+        template_macro_body = stock_loop or self.template_loop_body(self.position)
         if (start.text == 'rep' or template_macro_body) and self.tokens[self.position + 1].text == '(':
             self.take()
             open_index = self.position
