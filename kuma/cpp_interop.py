@@ -3443,6 +3443,51 @@ def mark_mixed_adaptors(nodes, parser, *, source_parser=None):
     return sites
 
 
+def lower_implicit_adaptor_write(nodes, parser):
+    """Recover an unambiguous `write name` on a checked mixed adaptor."""
+    if re.search(r'\\[ \t]*\n', parser.source):
+        return
+    tokens = parser.tokens
+    output_tokens = {node.token for node in nodes if node.kind == 'write'}
+    bindings = set()
+    writes = []
+    for node in nodes:
+        if node.kind == 'declare':
+            bindings.difference_update(node.value)
+            if (len(node.value) == len(node.children) == 1
+                    and node.children[0].extra.get('kuma_mixed_adaptor')):
+                bindings.add(node.value[0])
+        if node.kind != 'cpp_stmt' or node.token.text != 'write':
+            continue
+        i = parser.native_token_indices.get(node.token)
+        if i is None or i + 2 >= len(tokens):
+            continue
+        operand, ending = tokens[i + 1:i + 3]
+        if (operand.kind != 'IDENT' or operand.text not in bindings
+                or operand.line != node.token.line or ending.kind not in {'NEWLINE', 'EOF'}
+                or node.value != parser.source_range(node.token, operand) + ';'):
+            continue
+        after = i + 2
+        while tokens[after].kind == 'NEWLINE':
+            after += 1
+        # Do not consume a native declaration with a later semicolon or a
+        # continued expression. Preserve other ambiguous native layouts too.
+        following = tokens[after]
+        if (following.kind != 'EOF' and (following.kind != 'IDENT' or following.text in {
+                'and', 'and_eq', 'bitand', 'bitor', 'not', 'not_eq', 'or', 'or_eq', 'xor', 'xor_eq'})):
+            continue
+        writes.append((node, operand))
+        output_tokens.add(node.token)
+    # Stock includes and the ctor marker exclude unknown preprocessing. Do
+    # not claim write when the source uses that name outside known output.
+    if any(token.text == 'write' and token.kind == 'IDENT' and token not in output_tokens
+           for token in tokens):
+        return
+    for node, operand in writes:
+        node.kind, node.value = 'write', None
+        node.children = [Node('name', operand, operand.text)]
+
+
 def mark_mixed_kth(nodes, parser, *, source_parser=None):
     """Mark only checked calls with a local, ordinary vector provenance."""
     from .compiler import _KTH_KEY_METHODS, _KTH_SCALAR_METHODS
@@ -3769,6 +3814,8 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     checked_tuple_key_functions(nodes, parser.tokens, source, filename)
     mark_iter_collect(nodes, parser.tokens)
     uses_adaptors = bool(mark_mixed_adaptors(nodes, parser))
+    if uses_adaptors and not mixed_main and not parser.has_native_main:
+        lower_implicit_adaptor_write(nodes, parser)
     mark_mixed_kth(nodes, parser)
     mark_optional_collection_calls(nodes,
                                   masked_members=_cpp_stmt_masked_members(parser.tokens))
