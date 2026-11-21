@@ -17,7 +17,7 @@ import re
 from .pipelines import lazy_root, lower_pipeline, pure_expression
 from .declarations import DeclarationSupport
 from .model import KumaError, Node, Token, safe_sorted_key, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
-from .parser import parse
+from .parser import QUEUE_STACK, parse
 from .runtime import CPP_RUNTIME
 from .power import CPP_POWER
 
@@ -61,6 +61,8 @@ class Type:
             return f"std::bitset<{self.args[0].name}>"
         if self.name == "descending_integral_key":
             return f"ac::descending_integral_key<{self.args[0].cpp()}>"
+        if self.name in QUEUE_STACK:
+            return f"std::{self.name}<{self.args[0].cpp()}>"
         template = {"vec": "std::vector", "tuple": "std::tuple", "pair": "std::pair",
                     "set": "std::set", "dict": "std::map", "deque": "std::deque", "SortedList": "kuma_rt::SortedList", "prefix2d": "kuma_rt::Prefix2D"}[self.name]
         return template + "<" + ", ".join(t.cpp() for t in self.args) + ">"
@@ -87,6 +89,7 @@ RESERVED = {
     "template", "abs", "flush", "reduce", "any", "all", "count", "some", "every",
 }
 BUILTINS = {
+    *QUEUE_STACK,
     "range", "SortedList", "deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "prefix_sum", "prefix_sum2d", "prefix2d", "range_sum", "lower_bound_idx", "upper_bound_idx", "equal_range_idx", "has_bit", "bit_count", "bit_ctz", "rotate90", "transpose", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices", "frequencies", "read_graph", "read_weighted_graph", "bfs_dist", "dijkstra_dist", "bfs_path", "dijkstra_path",
     "input", "print", "len", "size", "sum", "sort", "sorted", "reverse",
     "reversed", "min", "max", "discard_line", "map", "filter",
@@ -141,7 +144,7 @@ def parse_type(text: str, token: Token, *, records=None, allow_owned_heaps=False
             return Type("prefix2d", tuple(args))
         if name in ("vec", "set") and len(args) == 1 and args[0] != VOID:
             return Type(name, tuple(args))
-        if name == "deque" and len(args) == 1 and args[0] != VOID and not (records and name in records):
+        if name in ({"deque"} | QUEUE_STACK) and len(args) == 1 and args[0] != VOID and not (records and name in records):
             return Type(name, tuple(args))
         if name in ("dict", "pair") and len(args) == 2 and VOID not in args:
             return Type(name, tuple(args))
@@ -678,8 +681,8 @@ class Compiler(DeclarationSupport):
     def parse_type(self, text, token):
         type_ = parse_type(text, token, records=self.records, allow_owned_heaps=True)
         def validate_heap_type(current):
-            if current.name == "deque" and not self.ordered_owned_type_supported(current.args[0]):
-                raise KumaError("deque には対応する所有値を使ってください", token)
+            if current.name in ({"deque"} | QUEUE_STACK) and not self.ordered_owned_type_supported(current.args[0]):
+                raise KumaError(f"{current.name} には対応する所有値を使ってください", token)
             if current.name in ("min_heap", "max_heap"):
                 element = current.args[0]
                 if not self.heap_owned_type_supported(element):
@@ -1117,7 +1120,7 @@ class Compiler(DeclarationSupport):
                 self.parameter(annotation, None, node)
 
         def use(name: str, at: Node, local: set[str], *, callee=False) -> None:
-            if name in local or (callee and (name in BUILTINS or name in self.records) and not (name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices") and name in available)):
+            if name in local or (callee and (name in BUILTINS or name in self.records) and not ((name in QUEUE_STACK or name in ("deque", "count_by", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")) and name in available)):
                 return
             if name not in available:
                 self.fail(f"定義位置から参照できない名前です: {name}。後方参照・再帰は未対応です", at)
@@ -1983,9 +1986,79 @@ class Compiler(DeclarationSupport):
         statements.append(f"return {expression};")
         return Value("([&]() { " + " ".join(statements) + " }())", I64)
 
+    def queue_stack_call(self, node: Node) -> Value:
+        name, args = node.value, node.children
+        symbol = next((scope[name] for scope in reversed(self.scopes) if name in scope), None)
+        if symbol is not None:
+            if not symbol.function:
+                self.fail(name + " は関数として呼び出せません", node)
+            if node.extra.get("kwargs"):
+                self.fail("通常の関数やアロー関数には名前付き引数を指定できません", node)
+            return self.invoke(Value(symbol.code, FUNCTION, function=symbol.function), args, node)
+        if node.extra.get("kwargs") or len(args) > 1:
+            self.fail(f"{name}() または {name}(配列) と書いてください", node)
+        if not args:
+            result = Type(name, (I64,))
+            return Value(result.cpp() + "{}", result)
+        initial = Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None
+        value = self.expr(args[0], initial)
+        if value.type.name != "vec" or not self.ordered_owned_type_supported(value.type.args[0]):
+            self.fail(f"{name} には対応する所有値の配列を使ってください", node)
+        element = value.type.args[0]
+        result = Type(name, (element,))
+        return self.ordered([value], result,
+                            lambda ns: (f"{result.cpp()}(std::deque<{element.cpp()}>"
+                                        f"({ns[0]}.begin(), {ns[0]}.end()))"), borrow=True)
+
+    def queue_stack_method(self, node: Node) -> Value | None:
+        name, args = node.value, node.children
+        if node.kind != "method" or name not in ("push", "pop", "popv", "empty", "size", "front", "top"):
+            return None
+        value = self.expr(args[0])
+        kind = value.type.name
+        if kind not in QUEUE_STACK:
+            return None
+        peek = "front" if kind == "queue" else "top"
+        if (name not in ("push", "pop", "popv", "empty", "size", peek)
+                or len(args) != (2 if name == "push" else 1)
+                or node.extra.get("kwargs") or node.extra.get("types")):
+            self.fail(f"{kind} の {name} の呼び出しを確認してください", node)
+        element = value.type.args[0]
+        recv = self.fresh(kind)
+        if name in ("push", "pop", "popv"):
+            self.writable(value, node)
+        body = f"auto&& {recv} = {value.code}; "
+        if name in ("pop", "popv", peek):
+            body += f'if ({recv}.empty()) throw std::out_of_range("{kind}: empty"); '
+        if name == "push":
+            with self.protect(value.origins):
+                new = self.coerce(self.expr(args[1], element), element, node)
+            arg = self.fresh("element")
+            body += f"{element.cpp()} {arg} = {new.code}; {recv}.push(std::move({arg}));"
+            result = VOID
+        elif name == "pop":
+            body += f"{recv}.pop();"
+            result = VOID
+        elif name == "popv":
+            out = self.fresh("element")
+            body += f"{element.cpp()} {out} = {recv}.{peek}(); {recv}.pop(); return {out};"
+            result = element
+        elif name == "size":
+            body += (f'if (std::cmp_greater({recv}.size(), std::numeric_limits<long long>::max())) '
+                     f'throw std::length_error("{kind}: size too large"); '
+                     f'return static_cast<long long>({recv}.size());')
+            result = I64
+        else:
+            body += f"return {recv}.{name}();"
+            result = BOOL if name == "empty" else element
+        return Value(f"([&]() -> {result.cpp()} {{ {body} }}())", result)
+
     def call(self, node: Node, expected: Type | None) -> Value:
         name, args = node.value, node.children
         kwargs = node.extra.get("kwargs", {})
+        converted = self.queue_stack_method(node)
+        if converted is not None:
+            return converted
         converted = self.lower_integer_mask_method(node)
         if converted is not None:
             return converted
@@ -2401,6 +2474,8 @@ class Compiler(DeclarationSupport):
             return self.ordered(values, Type("range"), lambda ns: "kuma_rt::range(" + ", ".join(ns) + ")")
         if node.kind == "call" and name in self.records:
             return self.construct_record(node)
+        if node.kind == "call" and name in QUEUE_STACK:
+            return self.queue_stack_call(node)
         if name == "input" and node.kind == "call":
             return self.input_call(node, expected)
         if node.kind == "call" and (name in ("set", "dict", "pair") or name == "map" and node.extra.get("types")):

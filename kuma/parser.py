@@ -13,6 +13,7 @@ _SCALARS = {
     "str", "string", "char", "void",
 }
 _CONSTRUCTORS = {"set", "dict", "map", "pair"}
+QUEUE_STACK = frozenset({"queue", "stack"})
 _TYPE_NAMES = _SCALARS | {"vec", "vector", "tuple", "auto", "prefix2d", *_CONSTRUCTORS}
 _BARE_CALLS = {
     "input", "print", "debug", "sort", "reverse", "sum", "len", "size",
@@ -39,6 +40,7 @@ _BINDING_POWER = {
 class Parser:
     def __init__(self, source: str, *, cpp: bool = False):
         self.cpp = cpp
+        self.queue_stack_types = QUEUE_STACK if not cpp else frozenset()
         self.tokens = lex(source, cpp=cpp)
         self.position = 0
         self.group_depth = 0
@@ -297,13 +299,17 @@ class Parser:
                 return Node("declare", start, names, [value], extra)
             self.position = position
 
+        adaptor_type_head = (self.current.text in self.queue_stack_types
+                             and self.queue_stack_type_head(self.current, self.tokens[self.position + 1]))
         if ((self.current.text in _TYPE_NAMES | self.user_types and self.tokens[self.position + 1].text != "(")
                 or (self.current.text == "bitset" and self.current.text not in self.user_types
                     and self.tokens[self.position + 1].text == "<"
                     and self.tokens[self.position + 2].kind == "NUMBER")
-                or (self.current.text in {"min_heap", "max_heap", "deque"} and self.current.text not in self.user_types
+                or (self.current.text in {"min_heap", "max_heap", "deque"}
+                    and self.current.text not in self.user_types
                     and self.tokens[self.position + 1].text == "<"
                     and (self.tokens[self.position + 2].text in _TYPE_NAMES | self.user_types or self.tokens[self.position + 2].text == "("))
+                or adaptor_type_head
                 or (self.current.text in {"max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"} and self.tokens[self.position + 1].kind == "IDENT"
                     and self.tokens[self.position + 2].text in {"=", "{"})
                 or self.current.text == "("):
@@ -313,12 +319,15 @@ class Parser:
             try:
                 declared_type = self.type_name()
             except KumaError:
-                # A parenthesized expression is not necessarily a tuple type.
-                if start.text != "(":
+                # A tuple or contextual adaptor prefix may instead be an expression.
+                if start.text != "(" and not adaptor_type_head:
                     raise
                 self.restore_type_trial(position, depth, split_mark)
             else:
-                if self.current.kind == "IDENT":
+                # For these new contextual spellings a declaration needs a
+                # named initializer; queue<T>value alone can be a comparison.
+                if (self.current.kind == "IDENT" and (not adaptor_type_head
+                        or self.tokens[self.position + 1].text in {"=", "{"})):
                     name = self.take()
                     if self.current.text == "(":
                         params = self.parameters(typed=True)
@@ -558,6 +567,14 @@ class Parser:
             self.tokens[index] = token
         del self.type_splits[split_mark:]
 
+    @staticmethod
+    def joined(left: Token, right: Token) -> bool:
+        return left.line == right.line and left.column + len(left.text) == right.column
+
+    def queue_stack_type_head(self, name: Token, following: Token) -> bool:
+        return (name.text in self.queue_stack_types and name.text not in self.user_types
+                and following.text == "<" and self.joined(name, following))
+
     def type_name(self) -> str:
         self.soft_newlines()
         if self.accept("("):
@@ -577,7 +594,8 @@ class Parser:
         if name.text == "long":
             self.expect("long", "64bit 整数には long long または ll を使ってください")
             return "long long"
-        if name.text in {"min_heap", "max_heap", "deque"} and name.text not in self.user_types and self.current.text == "<":
+        if ((name.text in {"min_heap", "max_heap", "deque"} and name.text not in self.user_types
+                and self.current.text == "<") or self.queue_stack_type_head(name, self.current)):
             self.expect("<")
             arguments = self.type_arguments_after_open()
             if len(arguments) != 1:
@@ -886,7 +904,10 @@ class Parser:
         while self.current.text != ")":
             annotation = None
             const = bool(self.accept("const"))
-            if self.current.text in _TYPE_NAMES | self.user_types | {"deque", "bitset", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"} or self.current.text == "(":
+            if (self.current.text in _TYPE_NAMES | self.user_types | {"deque", "bitset", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"}
+                    or self.current.text == "("
+                    or (self.current.text in self.queue_stack_types
+                        and self.queue_stack_type_head(self.current, self.tokens[self.position + 1]))):
                 annotation = self.type_name()
                 if annotation == "auto":
                     annotation = None
