@@ -220,7 +220,7 @@ class Parser:
             return self.if_statement()
         if start.text == "while":
             self.take()
-            condition = self.expression()
+            condition = self.control_condition()
             return Node("while", start, children=[condition], extra={"body": self.block(start)})
         if start.text == "rep":
             return self.rep_statement()
@@ -409,9 +409,12 @@ class Parser:
                 break
         return body
 
+    def control_condition(self) -> Node:
+        return self.expression()
+
     def if_statement(self) -> Node:
         start = self.expect("if")
-        condition = self.expression()
+        condition = self.control_condition()
         body = self.block(start)
         after_body = self.position
         self.newlines()

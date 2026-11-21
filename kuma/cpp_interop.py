@@ -79,6 +79,12 @@ def uses_cpp(source: str) -> bool:
 from .cpp_initializers import InitializerSupport, captureless_lambda_return, member_ranges
 
 
+# Match literal include spellings, not basenames or macro-expanded operands.
+_PREFIX_BODY_HEADERS = {
+    '"ac.hpp"', '"ac_io.hpp"', '"ac_graph.hpp"', '<bits/stdc++.h>', '<iostream>', '<vector>',
+}
+
+
 class CppParser(InitializerSupport, Parser):
     def __init__(self, source: str):
         super().__init__(source, cpp=True)
@@ -94,11 +100,35 @@ class CppParser(InitializerSupport, Parser):
             tok.kind == 'CPP_DIRECTIVE' and re.match(r'#\s*(?:if|ifdef|ifndef|elif|else|endif)\b|#\s*(?:define|undef)\s+input\b', tok.text)
             for tok in self.tokens)
         self.macro_names = set()
-        for tok in self.tokens:
+        self.object_macro_names = set()
+        self.prefix_body_preprocessing_known = True
+        directive_space = r'(?:\s|/\*.*?\*/)'
+        for index, tok in enumerate(self.tokens):
             if tok.kind == 'CPP_DIRECTIVE':
+                logical = re.sub(r'\\[ \t]*\n', '', tok.text)
+                directive = re.match(r'#' + directive_space + r'*([A-Za-z_]\w*)\b', logical, re.S)
+                keyword = directive[1] if directive else ''
+                if keyword == 'include':
+                    include = re.fullmatch(r'#[ \t]*include[ \t]*(\S+?)[ \t]*', tok.text)
+                    if not include or include[1] not in _PREFIX_BODY_HEADERS:
+                        self.prefix_body_preprocessing_known = False
+                elif keyword not in {'define', 'undef', 'if', 'ifdef', 'ifndef', 'else', 'elif', 'endif'}:
+                    self.prefix_body_preprocessing_known = False
                 match = function_macro_definition(tok.text)
                 if match:
                     self.macro_names.add(match[1])
+                elif keyword == 'define':
+                    # Object-like macros can expand to a whole statement.
+                    definition = re.match(directive_space + r'+([A-Za-z_]\w*)\b',
+                                          logical[directive.end():], re.S)
+                    if definition:
+                        self.object_macro_names.add(definition[1])
+            elif tok.text == '%' and (not index or self.tokens[index - 1].kind == 'NEWLINE'):
+                colon = self.tokens[index + 1]
+                if colon.text == ':' and colon.line == tok.line and colon.column == tok.column + 1:
+                    # Digraph directives can survive as raw C++, but this
+                    # lexer does not describe their macro definitions.
+                    self.prefix_body_preprocessing_known = False
         self.native_bodies = NativeBodies(self.tokens, self.macro_names)
         self.input_parameter_bodies = set()
         # Do not interpret macro-dependent declarations as C++ binding names.
@@ -848,6 +878,26 @@ class CppParser(InitializerSupport, Parser):
         return Node('cpp_for', start, '(' + header + ')',
                     extra={'body': self.block(start), 'm11_header': header,
                            'm11_header_token': self.tokens[begin + 1]})
+
+    def control_condition(self) -> Node:
+        opening = self.position
+        closing = self.native_bodies.pairs.get(opening)
+        if (self.prefix_body_preprocessing_known and self.current.text == '('
+                and closing is not None and closing + 3 < len(self.tokens)):
+            close, op, operand, end = self.tokens[closing:closing + 4]
+            # In `if (cond) ++x;`, the prefix operator belongs to the
+            # statement, not to the condition. Require a separate, tight
+            # prefix expression; keep compact legacy postfix conditions.
+            if (op.text in {'++', '--'} and operand.kind == 'IDENT' and end.text == ';'
+                    and close.line == op.line == operand.line == end.line
+                    and op.column > close.column + len(close.text)
+                    and operand.column == op.column + len(op.text)
+                    and operand.text not in {'break', 'continue', 'return', 'co_return', 'throw'}
+                    and operand.text not in _BARE_CALLS
+                    and operand.text not in self.native_bare_functions
+                    and operand.text not in self.object_macro_names):
+                return self.primary()
+        return super().control_condition()
 
     def native_cpp_if(self) -> Node:
         """Keep C++ constexpr-if and init-statements as native syntax."""
@@ -1764,7 +1814,8 @@ def emit_mixed_sum_by(recv_expr, projection_expr, fresh, *, type_probe=False):
     recv, arg, vec_type, fn_type = (fresh(s) for s in ('sum_by_vec', 'sum_by_fn', 'sum_by_vt', 'sum_by_ft'))
     forward_vec, forward_fn = f'std::forward<{vec_type}>({recv})', f'std::forward<{fn_type}>({arg})'
     native = f'({forward_vec}).sum_by({forward_fn})'
-    element_types = ('int', 'long long', 'double', 'std::pair<char, long long>')
+    element_types = ('int', 'long long', 'double', 'std::pair<char, long long>',
+                     'std::pair<long long, long long>')
     supported = ' || '.join(f'std::is_same_v<Elem, {t}>' for t in element_types)
     body = (
         f'using Vec = std::remove_cvref_t<{vec_type}>; '
