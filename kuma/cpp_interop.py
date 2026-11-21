@@ -2906,6 +2906,8 @@ class CppEmitter:
                                       + probe_target + '*/long long>', 1)
             return prefix + marker + target + ' ' + node.value + ' ' + value + ';'
         if kind == 'read':
+            if node.extra.get('index1'):
+                return prefix + f'kuma_rt::read_index1_into({self.expr(node.children[0])});'
             targets = []
             for child in node.children:
                 if child.kind not in {'name', 'index', 'member'}:

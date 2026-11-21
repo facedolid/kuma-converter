@@ -3806,6 +3806,12 @@ class Compiler(DeclarationSupport):
             target, source = self.fresh(), self.fresh()
             return prefix + f"{{ auto&& {target} = {left.code}; {right.type.cpp()} {source} = {right.code}; {target} {node.value} {source}; }}"
         if kind == "read":
+            if node.extra.get("index1"):
+                target = self.expr(node.children[0])
+                self.writable(target, node)
+                if target.type not in (I32, I64):
+                    self.fail("read : index1 の対象は i32 または i64 です", node)
+                return prefix + f"kuma_rt::read_index1_into({target.code});"
             targets: list[Value] = []
             for child in node.children:
                 if child.kind not in {"name", "index", "member"}:

@@ -232,10 +232,18 @@ class Parser:
             return Node(start.text, start)
         if start.text == "read":
             self.take()
+            first = self.current
             targets = [self.rhs()]
             while self.accept(","):
                 self.newlines()
                 targets.append(self.rhs())
+            if self.accept(":"):
+                marker = self.expect("index1", "read の : の後に指定できるのは index1 だけです")
+                if (len(targets) != 1 or targets[0].kind != "name"
+                        or targets[0].token != first or targets[0].value != first.text):
+                    raise KumaError("read : index1 の対象は宣言済みの変数名1つです", marker)
+                self.end_statement()
+                return Node("read", start, children=targets, extra={"index1": True})
             self.end_statement()
             return Node("read", start, children=targets)
         if start.text == "write":
