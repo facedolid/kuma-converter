@@ -2859,17 +2859,17 @@ class CppEmitter:
                 member = 'true' if kind == 'method' else 'false'
                 return (f'::kuma_rt::cpp_map_filter_tuple_arrow<{tuple_arrow_arity}, {filtering}, {member}>'
                         f'({args[0]}, {args[1]})')
-            if windows_reduce_arity:
-                # The receiver is evaluated before the seed, and a native
-                # method retains the original flat callback and value category.
+            integer_literal = False
+            if not native and kind == 'method' and value == 'reduce' and len(children) == 3:
                 seed = children[2]
                 if seed.kind == 'unary' and seed.value == '-':
                     seed = seed.children[0]
-                # Unadorned integer literals are i64 in Kuma, but native
-                # methods must see the original C++ seed type.
+                # Only stock windows widens an unadorned seed to Kuma i64.
                 integer_literal = (seed.kind == 'literal' and seed.extra.get('type') == 'i64'
                                    and re.fullmatch(r"[0-9][0-9']*", seed.value) is not None
                                    and tuple_get_literal(seed) >= 0)
+            if windows_reduce_arity:
+                # Native members receive the original flat callback and seed.
                 return (f'::kuma_rt::windows_reduce_receiver<{windows_reduce_arity}, '
                         f'{str(integer_literal).lower()}>({args[0]}).reduce({args[1]}, {args[2]})')
             # Forwarding an unproven native callback or a braced argument can
@@ -3064,7 +3064,8 @@ class CppEmitter:
                                                            type_probe=self.type_probe)
             if kind == 'method' and value in member_helpers and not node.extra.get('pointer'):
                 self.options(node, kw)
-                return f'kuma_rt::cpp_member_{value}(' + ', '.join(args) + ')'
+                helper = f'cpp_member_{value}' + ('<true>' if integer_literal else '')
+                return f'kuma_rt::{helper}(' + ', '.join(args) + ')'
             if kind == 'method' and (node.extra.get('pointer') or value not in {'map', 'filter', 'sum', 'sorted', 'sort', 'reversed', 'reverse', 'len', 'reduce', 'zip', 'enumerate', 'any', 'all', 'some', 'every'}):
                 self.options(node, kw)
                 return '(' + args[0] + ')' + ('->' if node.extra.get('pointer') else '.') + value + '(' + ', '.join(args[1:]) + ')'
@@ -4060,12 +4061,38 @@ def mark_mixed_local_arrows(nodes, parser):
         return  # Untracked preprocessing can replace these tokens.
     macros = parser.macro_names | parser.object_macro_names
 
+    safe_member = all(re.fullmatch(
+        r'#[ \t]*include[ \t]+(?:"(?:ac|ac_io|kuma)\.hpp"|<(?:vector|string|bits/stdc\+\+\.h)>)[ \t]*',
+        token.text.strip()) for token in parser.tokens if token.kind == 'CPP_DIRECTIVE')
+
+    # The direct typed Kuma input spelling yields a stock vector. Do not
+    # extend this proof in a file that can bind or call a native input name.
+    safe_input = safe_member and 'input' not in macros and all(
+        index > 0 and parser.tokens[index - 1].text == ':='
+        and (parser.tokens[index + 1].text == '<' or parser.tokens[index + 1].kind in {'NEWLINE', 'EOF'})
+        for index, token in enumerate(parser.tokens) if token.text == 'input')
+
+    def stock_input(value):
+        return (safe_input and value.kind == 'call' and value.value == value.token.text == 'input'
+                and len(value.children) == 1 and not value.extra.get('kwargs')
+                and value.extra.get('types') in (['ll'], ['i64'], ['long long'], ['int'], ['i32'],
+                                                 ['double'], ['f64'], ['bool'], ['char']))
+
+    def stock_literal(value):
+        if value.kind == 'literal':
+            return value.extra.get('type') == 'string'
+        if value.kind != 'array' or not value.children:
+            return False
+        scalar = value.children[0].extra.get('type')
+        return scalar in {'i64', 'f64', 'bool', 'char', 'string'} and all(
+            child.kind == 'literal' and child.extra.get('type') == scalar for child in value.children)
+
     def plain_name(value):
         if value.kind == 'name' and value.value == value.token.text:
             return value.value
         return None
 
-    def expression(value, names):
+    def expression(value, names, stock):
         if value.kind in {'lambda', 'comprehension'} or value.kind.startswith('cpp_'):
             return
         if (value.kind in ('call', 'method') and value.value in PROJECTED_EXTREMA - macros
@@ -4074,9 +4101,18 @@ def mark_mixed_local_arrows(nodes, parser):
             if (plain_name(key) in names
                     and not (source.kind == 'cpp_expr' and source.value.lstrip().startswith('{'))):
                 value.extra['kuma_extrema_key_proven'] = True
+        if value.kind == 'method' and 'lazy' not in macros and safe_member:
+            root = value
+            while root.kind == 'method' and root.value != 'lazy':
+                root = root.children[0]
+            if (root.kind == 'method' and root.value == 'lazy' and len(root.children) == 1
+                    and not any(root.extra.get(k) for k in ('kwargs', 'types', 'pointer'))):
+                receiver = root.children[0]
+                if plain_name(receiver) in stock or stock_literal(receiver):
+                    root.extra['kuma_lazy_member_proven'] = True
         if value.kind == 'method' and 'lazy' not in macros and mixed_lazy_chain(value):
             stage = value
-            while stage.kind == 'method':
+            while stage.kind == 'method' and stage.value != 'lazy':
                 index = 2 if stage.value == 'fold' else 1
                 if (stage.value in {'map', 'filter', 'fold', 'min_by', 'max_by'} - macros
                         and len(stage.children) == index + 1
@@ -4084,39 +4120,51 @@ def mark_mixed_local_arrows(nodes, parser):
                         and (arity := names.get(plain_name(stage.children[index]))) in (index, index + 1)):
                     stage.extra['kuma_lazy_callback_proven'] = arity
                 for operand in stage.children[1:]:
-                    expression(operand, names)
+                    expression(operand, names, stock)
                 stage = stage.children[0]
-            expression(stage, names)
+            for operand in stage.children:
+                expression(operand, names, stock)
             return
         for child in value.children:
-            expression(child, names)
+            expression(child, names, stock)
 
     def block(statements):
         names = {}
+        stock = set()
         for stmt in statements:
             if stmt.kind.startswith('cpp_'):
                 names.clear()
+                stock.clear()
                 continue
             # Initializers use earlier bindings; introduce the new name after.
             for child in stmt.children:
-                expression(child, names)
+                expression(child, names, stock)
             if stmt.kind == 'declare':
                 for name in stmt.value:
                     names.pop(name, None)
+                    stock.discard(name)
                 if (len(stmt.value) == len(stmt.children) == 1
                         and not (stmt.extra.get('type') or stmt.extra.get('types'))
                         and stmt.children[0].kind == 'lambda' and stmt.value[0] not in macros):
                     arrow = stmt.children[0]
                     names[stmt.value[0]] = (len(arrow.extra.get('params', ()))
                                               if not arrow.extra.get('param_pattern') else -1)
+                if (len(stmt.value) == len(stmt.children) == 1
+                        and not (stmt.extra.get('type') or stmt.extra.get('types'))
+                        and stmt.value[0] not in macros
+                        and (stock_literal(stmt.children[0]) or stock_input(stmt.children[0]))):
+                    stock.add(stmt.value[0])
             elif stmt.kind == 'assign':
                 names.pop(plain_name(stmt.children[0]), None)
+                stock.discard(plain_name(stmt.children[0]))
             if stmt.kind in {'if', 'while', 'for', 'rep'}:
                 for field in ('body', 'else'):
                     block(stmt.extra.get(field, ()))
                 names.clear()
+                stock.clear()
             elif stmt.kind == 'try':
                 names.clear()
+                stock.clear()
 
     if not parser.has_native_main and not any(node.kind == 'main_entry' for node in nodes):
         block(nodes)

@@ -6,15 +6,17 @@ from .fusion import readonly_arrow, iteration_source, unpack_source, observing
 
 
 def lazy_root(node):
-    while node.kind == 'method':
+    while node.kind == 'method' and node.value != 'lazy':
         node = node.children[0]
-    return node.kind == 'call' and node.value == 'lazy'
+    return node.kind in ('call', 'method') and node.value == 'lazy'
 
 
 def mixed_lazy_chain(node):
-    """Only an inline Kuma arrow opts a mixed lazy chain into this lowering."""
+    """A proven stock member or a bare call with an inline arrow opts in."""
     marked = False
     while node.kind == 'method':
+        if node.value == 'lazy':
+            return bool(node.extra.get('kuma_lazy_member_proven'))
         marked |= any(child.kind == 'lambda' for child in node.children[1:])
         node = node.children[0]
     return marked and node.kind == 'call' and node.value == 'lazy'
@@ -26,7 +28,7 @@ def lower_mixed_lazy(emitter, node):
 
     stages = []
     root = node
-    while root.kind == 'method':
+    while root.kind == 'method' and root.value != 'lazy':
         if any(root.extra.get(k) for k in ('kwargs', 'types', 'pointer')):
             emitter.fail(root, '混在lazyチェーンは位置引数だけに対応しています')
         stages.append(root)
@@ -34,6 +36,8 @@ def lower_mixed_lazy(emitter, node):
     stages.reverse()
     if root.extra.get('kwargs') or root.extra.get('types') or len(root.children) != 1:
         emitter.fail(root, 'lazy(配列・文字列・range) と書いてください')
+    if not stages:
+        emitter.fail(root, 'a.lazy() は終端操作まで1つの式で使ってください。保存・返却はできません')
     terminal = stages.pop()
     pairwise = pairwise_view_operand(root.children[0])
     if terminal.value == 'fold':
@@ -228,13 +232,14 @@ def lower_pipeline(compiler, node):
                            extrema_element_supported, pairwise_view_operand)
     stages = []
     root = node
-    while root.kind == 'method':
+    while root.kind == 'method' and root.value != 'lazy':
         if root.extra.get('kwargs'):
             compiler.fail('lazyチェーンは位置引数だけに対応しています', root)
         stages.append(root)
         root = root.children[0]
     stages.reverse()
-    if root.kind != 'call' or root.value != 'lazy' or len(root.children) != 1 or root.extra.get('kwargs'):
+    if (root.kind not in ('call', 'method') or root.value != 'lazy' or len(root.children) != 1
+            or any(root.extra.get(k) for k in ('kwargs', 'types', 'pointer'))):
         compiler.fail('lazy(a).map(f).sum() など、終端操作まで1つの式で書いてください', node)
     if not stages or stages[-1].value not in {'collect', 'sum', 'count', 'any', 'all', 'fold'} | VALUE_EXTREMA:
         compiler.fail('lazyはcollect/sum/count/any/all/fold/min_by/max_byまで1つの式で使ってください。保存・返却はできません', node)
