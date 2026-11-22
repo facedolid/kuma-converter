@@ -12,7 +12,7 @@ import sys
 from .lexer import lex
 from .cpp_bodies import NativeBodies
 from .model import KumaError, Node, Token, safe_sorted_key, sorted_key_captures, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
-from .parser import QUEUE_STACK, Parser, _BARE_CALLS, parse_interpolation
+from .parser import QUEUE_STACK, RELATIONAL_OPERATORS, Parser, _BARE_CALLS, parse_interpolation
 from .power import CPP_POWER
 
 
@@ -689,6 +689,8 @@ class CppParser(InitializerSupport, Parser):
         acquire a made-up editable span.
         """
         saved = self.position
+        previous_comparisons = self.chain_comparisons
+        self.chain_comparisons = False
         pieces = []
         lowerings = []
         cursor = start
@@ -768,6 +770,7 @@ class CppParser(InitializerSupport, Parser):
             return Node('cpp_opaque_sections', self.tokens[start], extra={'sections': pieces})
         finally:
             self.position = saved
+            self.chain_comparisons = previous_comparisons
 
     def raw_declaration(self) -> Node:
         start = self.current
@@ -876,6 +879,27 @@ class CppParser(InitializerSupport, Parser):
         # Native C++ declarations/expressions use their normal semicolon. Also
         # permit a complete call on a physical line, as in the M6 examples.
         terminated = self.tokens[end].text == ';'
+        # Only explicit Kuma return or a semicolon-free plain assignment in
+        # a Kuma scope can opt out of native preservation. Confirm a real
+        # parsed chain first so C++ template spellings keep their old path.
+        owned_return = start.text == 'return' and self.chain_comparisons
+        owned_assign = (not terminated and start.kind == 'IDENT' and texts[1:2] == ['=']
+                        and (self.main_entry_depth or self.chain_comparisons))
+        if (owned_return or owned_assign) and sum(t in RELATIONAL_OPERATORS for t in texts) >= 2:
+            saved = self.position, self.group_depth, len(self.type_splits)
+            previous = self.chain_comparisons
+            self.chain_comparisons = True
+            try:
+                trial = super().statement()
+                def has_chain(node):
+                    return node.kind == 'compare_chain' or any(has_chain(child) for child in node.children)
+                if trial.kind in ('return', 'assign') and has_chain(trial):
+                    return trial
+            except KumaError:
+                pass
+            finally:
+                self.chain_comparisons = previous
+            self.restore_type_trial(*saved)
         complete_call = len(texts) > 1 and texts[-1] == ')'
         partial_member = len(texts) >= 2 and (texts[-1] in {'.', '->', '::'} or texts[-2] in {'.', '->', '::'})
         # Missing semicolons are legal when the expression/declaration is
@@ -936,6 +960,13 @@ class CppParser(InitializerSupport, Parser):
                            'm11_header_token': self.tokens[begin + 1]})
 
     def control_condition(self) -> Node:
+        if self.current.text != '(':
+            previous = self.chain_comparisons
+            self.chain_comparisons = True
+            try:
+                return super().control_condition()
+            finally:
+                self.chain_comparisons = previous
         opening = self.position
         closing = self.native_bodies.pairs.get(opening)
         if (self.prefix_body_preprocessing_known and self.current.text == '('
@@ -1106,11 +1137,15 @@ class CppParser(InitializerSupport, Parser):
             while self.tokens[target].text == '(':
                 target += 1
         saved = getattr(self, '_brace_rhs_position', None)
+        previous_comparisons = self.chain_comparisons
         self._brace_rhs_position = target
+        if target is not None:
+            self.chain_comparisons = True
         try:
             return self._cpp_rhs()
         finally:
             self._brace_rhs_position = saved
+            self.chain_comparisons = previous_comparisons
 
     def _cpp_rhs(self) -> Node:
         if (self.current.kind == 'IDENT'
@@ -1444,6 +1479,24 @@ class CppParser(InitializerSupport, Parser):
                 t.kind != 'NEWLINE' for t in self.tokens[position + 1:capture_end])
             return result
         return super().primary()
+
+    def function_body(self, start, name, params, result):
+        previous = self.chain_comparisons
+        self.chain_comparisons |= start.text in ('fn', 'def')
+        try:
+            return super().function_body(start, name, params, result)
+        finally:
+            self.chain_comparisons = previous
+
+    def lambda_body(self, start, parameters):
+        # An arrow is an explicit Kuma expression. Native functions/lambdas
+        # and other mixed operands retain ordinary C++ relational semantics.
+        previous = self.chain_comparisons
+        self.chain_comparisons = True
+        try:
+            return super().lambda_body(start, parameters)
+        finally:
+            self.chain_comparisons = previous
 
     def arguments(self):
         # Only this explicit call's argument expressions have this depth.
@@ -1943,6 +1996,41 @@ _NUMERIC_VECTOR_ELEMENTS = (
 )
 
 
+def tuple_get_literal(node):
+    if node.kind != 'literal' or node.extra.get('type') != 'i64':
+        return -1
+    match = re.fullmatch(r"(0[xX][0-9a-fA-F']+|0[bB][01']+|0|[1-9][0-9']*)(?:[lL]{1,2})?", node.value)
+    if not match:
+        return -1
+    digits = match[1].replace("'", '')
+    if len(digits) > 66:
+        return -1
+    try:
+        number = int(digits, 0)
+    except ValueError:
+        return -1
+    return number if number <= (1 << 63) - 1 else -1
+
+
+def emit_mixed_projected_extreme(name, recv_expr, key_expr, fresh, *, member, type_probe=False):
+    recv, key, rt, kt = (fresh('extreme_' + x) for x in ('recv', 'key', 'recv_type', 'key_type'))
+    r, k = f'std::forward<{rt}>({recv})', f'std::forward<{kt}>({key})'
+    native = f'({r}).{name}({k})' if member else f'{name}({r}, {k})'
+    maximum = 'true' if name in ('argmax', 'max_by') else 'false'
+    helper = 'projected_extreme_value' if name in ('min_by', 'max_by') else 'projected_extreme_index'
+    fallback = f'::kuma_rt::{helper}<{maximum}>({r}, {k})'
+    body = (
+        f'if constexpr (requires {{ {native}; }}) return {native}; '
+        f'else return {fallback};')
+    if type_probe or not member:
+        cap = '&' if not member and not type_probe else ''
+        return (f'([{cap}]<class {rt}, class {kt}>({rt}&& {recv}, {kt}&& {key}) -> decltype(auto) '
+                f'{{ {body} }})({recv_expr}, {key_expr})')
+    return (f'([]<class {rt}>({rt}&& {recv}) {{ '
+            f'return [&{recv}]<class {kt}>({kt}&& {key}) -> decltype(auto) '
+            f'{{ {body} }}; }}({recv_expr}))({key_expr})')
+
+
 def emit_mixed_numeric_vector_method(name, recv_expr, fresh):
     from .compiler import _sorted_by_fallback_elem_checks
     recv, typ, bare = (fresh(suffix) for suffix in ('num_vec_recv', 'num_vec_t', 'num_vec_bare'))
@@ -2433,6 +2521,10 @@ class CppEmitter:
                 return f'({minus}9223372036854775807LL - 1LL)'
             x = self.expr(child, native=native)
             return f'({value}({x}))' if kind == 'unary' else f'(({x}){value})'
+        if kind == 'compare_chain':
+            from .compiler import emit_comparison_chain
+            return emit_comparison_chain([('auto', self.expr(child, native=native)) for child in node.children],
+                                         node.extra['operators'], self.fresh)
         if kind == 'binary':
             a, b = (self.expr(c, native=native) for c in node.children)
             if value == '**':
@@ -2473,12 +2565,54 @@ class CppEmitter:
             return ('kuma_rt::cpp_slice(kuma_rt::CppSliceRequest{' +
                     ', '.join([self.expr(node.children[0]), *bounds]) + '})')
         if kind == 'member':
+            if node.extra.get('kuma_tuple_alias'):
+                slot = 0 if value == 'first' else 1
+                return f'::kuma_rt::tuple_alias<{slot}>({self.expr(node.children[0])})'
             if value == 'to_str' and not native and not node.extra.get('pointer'):
                 return emit_mixed_to_str(self.expr(node.children[0]), self.fresh, attribute=True)
             access = f'({self.expr(node.children[0])})' + ('->' if node.extra.get('pointer') else '.') + self.mark(value, node.token)
             return access + ('()' if node.extra.get('optional_collection_call') else '')
         if kind == 'lambda':
-            return self.callback(node.extra['params'], self.expr(node.children[0]) if node.extra.get('expression') else self.statements(node.extra['body']), bool(node.extra.get('expression')))
+            params = node.extra['params']
+            if pattern := node.extra.get('param_pattern'):
+                if not node.extra.get('kuma_map_filter_arrow'):
+                    self.fail(node, '混在では ((f, s)) => ... を map/filter に直接渡してください')
+                arg = self.fresh('arrow_tuple')
+                body = (f'return {self.expr(node.children[0])};' if node.extra.get('expression')
+                        else self.statements(node.extra['body']))
+                bindings = '\n'.join(
+                    f'auto {self.mark(child.value, child.token)} = std::get<{i}>(std::move({arg}));'
+                    for i, child in enumerate(pattern.children))
+                condition = (f'::kuma_rt::arrow_tuple_arity<{len(pattern.children)}, '
+                             f'std::remove_cvref_t<decltype({arg})>>()')
+                checked = (f'if constexpr ({condition}) {{\n{bindings}\n{body}\n}} else {{\n'
+                           f'static_assert({condition}, "arrow pattern: expected a pair or tuple with matching arity");\n}}')
+                return self.callback([(arg, None)], checked, False)
+            if node.extra.get('kuma_map_filter_arrow') and node.extra.get('expression') and len(params) == 1 and params[0][1] is None:
+                name = params[0][0]
+                body = node.children[0]
+
+                def tuple_reads(expr):
+                    if expr.kind in {'lambda', 'comprehension'} or expr.kind.startswith('cpp_'):
+                        return expr
+                    children = [tuple_reads(child) for child in expr.children]
+                    if (expr.kind == 'member' and expr.value in ('first', 'second')
+                            and not expr.extra.get('pointer') and children[0].kind == 'name'
+                            and children[0].value == name):
+                        return Node(expr.kind, expr.token, expr.value, children, {**expr.extra, 'kuma_tuple_alias': True})
+                    if any(a is not b for a, b in zip(children, expr.children)):
+                        return Node(expr.kind, expr.token, expr.value, children, expr.extra)
+                    return expr
+
+                resolved = tuple_reads(body)
+                if resolved is not body:
+                    # Keep ordinary native member reads, including bit-fields,
+                    # in an untouched branch. Only a two-element std::tuple
+                    # gets the indexing aliases.
+                    returns = (f'if constexpr (::kuma_rt::is_two_tuple<std::remove_cvref_t<decltype({name})>>) '
+                               f'return {self.expr(resolved)}; else return {self.expr(body)};')
+                    return self.callback(params, returns, False)
+            return self.callback(params, self.expr(node.children[0]) if node.extra.get('expression') else self.statements(node.extra['body']), bool(node.extra.get('expression')))
         if kind == 'comprehension': return self.comprehension(node)
         if kind in {'call', 'method', 'invoke'}:
             kw = node.extra.get('kwargs', {})
@@ -2580,7 +2714,7 @@ class CppEmitter:
             from .compiler import (_SCALAR_CONVERSION_METHODS, _SEQUENCE_ARITHMETIC_METHODS,
                                    _STRING_PAD_METHODS, _INTEGER_MASK_METHODS, _VECTOR_ASSIGN_METHODS,
                                    _BETWEEN_METHODS, _COUNT_IF_METHODS, _FIND_IDX_METHODS,
-                                   _SORTED_BY_METHODS,
+                                   PROJECTED_EXTREMA, _SORTED_BY_METHODS,
                                    emit_mixed_scalar_conversion, emit_scalar_conversion,
                                    emit_mixed_integer_mask_method, emit_mixed_sequence_method,
                                    emit_mixed_string_pad, emit_mixed_vector_assign_method,
@@ -2590,21 +2724,97 @@ class CppEmitter:
                                    | _SEQUENCE_ARITHMETIC_METHODS | _INTEGER_MASK_METHODS
                                    | _VECTOR_ASSIGN_METHODS | _BETWEEN_METHODS | _COUNT_IF_METHODS
                                    | _FIND_IDX_METHODS | _RUN_LENGTH_METHODS | _FREQUENCIES_METHODS
-                                   | _NUMERIC_VECTOR_ZERO_ARG_METHODS
+                                   | _NUMERIC_VECTOR_ZERO_ARG_METHODS | PROJECTED_EXTREMA
                                    | _POSITIONS_METHODS | _SORTED_BY_METHODS | _BOUND_INDEX_METHODS
                                    | _WINDOW_EXTREMA_METHODS | _PREDICATE_INDEX_METHODS
-                                   | {'to_str', 'in_range', 'range_sum', 'combination_indices', 'combinations', 'next_greater_indices', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec'})
+                                   | {'get', 'to_str', 'in_range', 'range_sum', 'combination_indices', 'combinations', 'next_greater_indices', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec', 'pairwise', 'chunks'})
+            extension_members = extension_members | {'windows'}
+
+            def windows_index(child):
+                if child.kind != 'index':
+                    return False
+                while child.kind == 'index':
+                    child = child.children[0]
+                return child.kind == 'method' and child.value == 'windows' and not child.extra.get('pointer')
+
+            def adjacent_chain(child):
+                # Keep pairwise/windows sugar active under nested transforms.
+                while (child.kind == 'method' and child.value in ('map', 'filter')
+                       and len(child.children) == 2 and not any(child.extra.get(k) for k in ('pointer', 'kwargs', 'types'))):
+                    child = child.children[0]
+                return (child.kind == 'method'
+                        and (child.value == 'pairwise' and len(child.children) == 1
+                             or child.value == 'windows' and len(child.children) == 2)
+                        and not any(child.extra.get(k) for k in ('pointer', 'kwargs', 'types')))
+
+            children = node.children
+            if (value in ('map', 'filter') and len(children) == 2 and children[1].kind == 'lambda'
+                    and not node.extra.get('pointer') and not node.extra.get('types') and not kw):
+                key = children[1]
+                children = [children[0], Node(key.kind, key.token, key.value, key.children,
+                                             {**key.extra, 'kuma_map_filter_arrow': True})]
+
+            tuple_arrow_arity = 0
+            if (value in ('map', 'filter') and len(children) == 2
+                    and children[1].extra.get('kuma_map_filter_arrow') and not children[1].extra.get('param_pattern')):
+                params = children[1].extra['params']
+                if len(params) > 1 and all(annotation is None for _, annotation in params):
+                    tuple_arrow_arity = len(params)
+                    if kind == 'method':
+                        from .compiler import direct_windows_width
+                        owner = children[0]
+                        width = direct_windows_width(owner, mixed=True)
+                        literal = tuple_get_literal(width) if width is not None else -1
+                        if literal > 0:
+                            owner = Node(owner.kind, owner.token, owner.value, owner.children,
+                                         {**owner.extra, 'kuma_windows_binding': (tuple_arrow_arity, literal)})
+                            children = [owner, children[1]]
+
             args = [self.expr(c, native=(native_args and not (
                         not native and (c.kind == 'method' and (c.value in extension_members
+                                                                or adjacent_chain(c)
                                                                 or c.extra.get('kuma_kth_proven')
                                                                 or c.extra.get('kuma_transpose_proven'))
+                                        or c.kind == 'call' and c.value in PROJECTED_EXTREMA
                                         or c.kind == 'member' and c.value == 'to_str'
+                                        or windows_index(c)
                                         or c.extra.get('kuma_set_from_vector')
                                         or c.extra.get('kuma_byte_conversion')
                                         or c.extra.get('kuma_to_f64')
                                         or c.extra.get('kuma_vector_index_type')))))
-                    for c in node.children]
+                    for c in children]
+            if tuple_arrow_arity:
+                filtering = 'true' if value == 'filter' else 'false'
+                member = 'true' if kind == 'method' else 'false'
+                return (f'::kuma_rt::cpp_map_filter_tuple_arrow<{tuple_arrow_arity}, {filtering}, {member}>'
+                        f'({args[0]}, {args[1]})')
+            # Forwarding an unproven native callback or a braced argument can
+            # change deduction. Only an inline or locally proved Kuma arrow
+            # opts into projected extrema fallback.
+            if (not native and value in PROJECTED_EXTREMA and len(args) == 2 and not kw
+                    and (node.children[1].kind == 'lambda' or node.extra.get('kuma_extrema_key_proven'))
+                    and not node.extra.get('types') and not node.extra.get('pointer')):
+                return emit_mixed_projected_extreme(value, *args, self.fresh, member=kind == 'method',
+                                                     type_probe=self.type_probe)
             if not native and kind == 'method' and not node.extra.get('pointer'):
+                if value == 'chunks' and len(args) == 2 and not kw and not node.extra.get('types'):
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return f'::kuma_rt::chunks_receiver({args[0]}).chunks({args[1]})'
+                if value == 'windows' and len(args) == 2 and not kw and not node.extra.get('types'):
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    if 'kuma_windows_binding' in node.extra:
+                        arity, width = node.extra['kuma_windows_binding']
+                        return f'::kuma_rt::windows_binding_receiver<{arity}, {width}>({args[0]}).windows({args[1]})'
+                    return f'::kuma_rt::windows_receiver({args[0]}).windows({args[1]})'
+                if value == 'pairwise' and len(args) == 1 and not kw and not node.extra.get('types'):
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return f'::kuma_rt::cpp_member_pairwise({args[0]})'
                 if (value == 'sort_by' and node.extra.get('kuma_sort_by_statement')
                         and len(args) == 2 and not kw and not node.extra.get('types')):
                     return emit_mixed_sort_by(*args, self.fresh)
@@ -2625,6 +2835,13 @@ class CppEmitter:
                 if (value in ('combination_indices', 'combinations') and len(args) == 2
                         and not kw and not node.extra.get('types')):
                     return emit_mixed_combinations(value, *args, self.fresh, type_probe=self.type_probe)
+                if value == 'get' and len(args) == 2 and not kw and not node.extra.get('types'):
+                    recv, index = args
+                    position = tuple_get_literal(node.children[1])
+                    return f'::kuma_rt::tuple_get_receiver<{position}>({recv}).get({index})'
+                if value == 'get' and len(args) == 3 and not kw and not node.extra.get('types'):
+                    recv, key, default = args
+                    return f'::kuma_rt::dict_get_receiver({recv}).get({key}, {default})'
                 if value == 'range_sum' and len(args) == 3 and not kw and not node.extra.get('types'):
                     return emit_mixed_range_sum(*args, self.fresh, type_probe=self.type_probe)
                 if node.extra.get('kuma_transpose_proven'):
@@ -2978,7 +3195,10 @@ class CppEmitter:
                             self.fail(init, '分割宣言では行入力は使えません。文字列を1つずつ読むか、行EOF入力を1つの変数に束縛してください')
                         self.fail(init, '分割宣言ではこの input オプションは使えません')
                 expected = 'std::tuple<' + ', '.join('long long' for _ in names) + '>'
-                return prefix + 'auto [' + ', '.join(names) + '] = ' + self.expr(node.children[0], expected) + ';'
+                value = self.expr(init, expected)
+                if node.extra.get('kuma_window_row_binding'):
+                    value = f'::kuma_rt::window_binding_values<{len(names)}>({value})'
+                return prefix + 'auto [' + ', '.join(names) + '] = ' + value + ';'
             return prefix + target + ' ' + self.mark(names[0], node.token) + ' = ' + self.expr(node.children[0], annotation) + ';'
         if kind == 'assign':
             def has_slice(target):
@@ -3087,9 +3307,30 @@ class CppEmitter:
                 header = 'for ' + node.value
             return prefix + header + ' {\n' + self.statements(node.extra['body']) + '\n}'
         if kind == 'for':
+            from .compiler import direct_windows_width
             item = self.fresh('item')
             pattern = node.extra['pattern']
-            return prefix + f'for (auto {item} : kuma_rt::mixed_iteration_range({self.expr(node.children[0])})) {{\n' + self.pattern(pattern, item) + '\n' + self.statements(node.extra['body']) + '\n}'
+            source = node.children[0]
+            body = node.extra['body']
+            width = direct_windows_width(source, mixed=True)
+            if width is not None and pattern.kind == 'bind_name':
+                body = window_body_bindings(body, pattern.value)
+            if width is not None and pattern.kind == 'bind_tuple':
+                # Prove only positive decimal integer literals here. Other
+                # widths use the actual row size; native tuple rows are untouched.
+                literal = (width.value if width.kind == 'literal' and width.extra.get('type') == 'i64'
+                           and re.fullmatch(r"[1-9][0-9']*(?:ll|LL)?", width.value) else '0')
+                arity = len(pattern.children)
+                # Reuse windows' native-first receiver adapter. Only the
+                # fallback adapter may infer its row width from the argument.
+                source = Node(source.kind, source.token, source.value, source.children,
+                              {**source.extra, 'kuma_windows_binding': (arity, literal)})
+                bindings = f'::kuma_rt::check_window_binding<{arity}>({item});\n'
+                bindings += '\n'.join(self.pattern(child, f'::kuma_rt::window_binding_element<{i}>({item})')
+                                      for i, child in enumerate(pattern.children))
+            else:
+                bindings = self.pattern(pattern, item)
+            return prefix + f'for (auto {item} : kuma_rt::mixed_iteration_range({self.expr(source)})) {{\n' + bindings + '\n' + self.statements(body) + '\n}'
         if kind == 'rep':
             limit = self.fresh('limit'); name = node.value
             return prefix + f'for (long long {name}=0, {limit}=kuma_rt::count({self.expr(node.children[0])}); {name}<{limit}; ++{name}) {{\n' + self.statements(node.extra['body']) + '\n}'
@@ -3112,6 +3353,28 @@ class CppEmitter:
                     + '\nbool operator==(const ' + node.value + '&) const = default;'
                     + '\nauto operator<=>(const ' + node.value + '&) const = default;\n};')
         self.fail(node, '混在モードで未対応の文です: ' + kind)
+
+
+def window_body_bindings(body, row_name):
+    """Annotate direct, unshadowed uses of this loop's row in split declarations."""
+    result = []
+    known = True
+    for stmt in body:
+        if known and stmt.kind == 'declare':
+            init = stmt.children[0]
+            if (len(stmt.value) > 1 and not stmt.extra.get('type')
+                    and init.kind == 'name' and init.value == init.token.text == row_name):
+                stmt = Node(stmt.kind, stmt.token, stmt.value, stmt.children,
+                            {**stmt.extra, 'kuma_window_row_binding': True})
+            if row_name in stmt.value:
+                known = False
+        elif stmt.kind.startswith('cpp_') or (stmt.kind == 'assign'
+                and stmt.children[0].kind == 'name' and stmt.children[0].value == row_name):
+            # An opaque C++ statement can introduce a declaration or alter
+            # preprocessing. Do not track the name past this boundary.
+            known = False
+        result.append(stmt)
+    return result
 
 
 def split_shaped_input_init(init, name_count: int) -> bool:
@@ -3707,6 +3970,65 @@ def mark_mixed_kth(nodes, parser, *, source_parser=None):
             if len(sections) == 1:
                 block(sections[0][1])
     return sites
+
+
+def mark_mixed_extrema_keys(nodes, parser):
+    """Recognize an earlier, unambiguous Kuma arrow in the same block."""
+    from .compiler import PROJECTED_EXTREMA
+    if not any(token.text in PROJECTED_EXTREMA for token in parser.tokens):
+        return
+    if re.search(r'(?m)^[ \t]*%:|\\[ \t]*\n', parser.source):
+        return  # Untracked preprocessing can replace these tokens.
+    macros = parser.macro_names | parser.object_macro_names
+
+    def plain_name(value):
+        if value.kind == 'name' and value.value == value.token.text:
+            return value.value
+        return None
+
+    def expression(value, names):
+        if value.kind in {'lambda', 'comprehension'} or value.kind.startswith('cpp_'):
+            return
+        if (value.kind in ('call', 'method') and value.value in PROJECTED_EXTREMA - macros
+                and len(value.children) == 2 and not any(value.extra.get(k) for k in ('kwargs', 'types', 'pointer'))):
+            source, key = value.children
+            if (plain_name(key) in names
+                    and not (source.kind == 'cpp_expr' and source.value.lstrip().startswith('{'))):
+                value.extra['kuma_extrema_key_proven'] = True
+        for child in value.children:
+            expression(child, names)
+
+    def block(statements):
+        names = set()
+        for stmt in statements:
+            if stmt.kind.startswith('cpp_'):
+                names.clear()
+                continue
+            # Initializers use earlier bindings; introduce the new name after.
+            for child in stmt.children:
+                expression(child, names)
+            if stmt.kind == 'declare':
+                names.difference_update(stmt.value)
+                if (len(stmt.value) == len(stmt.children) == 1
+                        and not (stmt.extra.get('type') or stmt.extra.get('types'))
+                        and stmt.children[0].kind == 'lambda' and stmt.value[0] not in macros):
+                    names.add(stmt.value[0])
+            elif stmt.kind == 'assign':
+                names.discard(plain_name(stmt.children[0]))
+            if stmt.kind in {'if', 'while', 'for', 'rep'}:
+                for field in ('body', 'else'):
+                    block(stmt.extra.get(field, ()))
+                names.clear()
+
+    if not parser.has_native_main and not any(node.kind == 'main_entry' for node in nodes):
+        block(nodes)
+    for node in nodes:
+        if node.kind in {'main_entry', 'cpp_main', 'function'}:
+            block(node.extra.get('body', ()))
+        if node.kind == 'cpp_opaque_sections' and (node.extra.get('main') or node.extra.get('independent_function')):
+            for section in node.extra['sections']:
+                if section[0] == 'function':
+                    block(section[1])
 
 
 def mark_mixed_transpose(nodes, parser):
@@ -4608,6 +4930,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     if not mixed_main and not parser.has_native_main:
         lower_implicit_write(nodes, parser)
     mark_mixed_kth(nodes, parser)
+    mark_mixed_extrema_keys(nodes, parser)
     mark_mixed_transpose(nodes, parser)
     mark_mixed_set_conversions(nodes, parser)
     mark_mixed_byte_conversions(nodes, parser)

@@ -127,6 +127,15 @@ class DeclarationSupport:
     def member(self, node):
         from .compiler import Value
         owner = self.expr(node.children[0])
+        if (owner.type.name in ('pair', 'tuple') and len(owner.type.args) == 2
+                and node.value in ('first', 'second')):
+            i = 0 if node.value == 'first' else 1
+            field = owner.type.args[i]
+            code = f'std::get<{i}>({owner.code})'
+            if not owner.lvalue:
+                code = f'static_cast<{field.cpp()}>({code})'
+            return Value(code, field, lvalue=owner.lvalue,
+                         origins=owner.origins if owner.lvalue else frozenset(), readonly=owner.readonly)
         if owner.type.name == 'dfs_result':
             if node.value not in {'preorder', 'postorder', 'parent', 'depth', 'root', 'component', 'entry_time', 'exit_time', 'roots'}:
                 self.fail('DFS結果のフィールドがありません: ' + node.value, node)

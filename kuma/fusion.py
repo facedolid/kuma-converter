@@ -96,7 +96,8 @@ def readonly_arrow(compiler, node, element):
         names = {n: s.type for n, s in fn.captures.items()}
     else:
         return None
-    if fn.code is not None or not fn.node.extra.get('expression') or len(fn.node.extra['params']) != 1:
+    if (fn.code is not None or not fn.node.extra.get('expression')
+            or fn.node.extra.get('param_pattern') or len(fn.node.extra['params']) != 1):
         return None
     name, annotation = fn.node.extra['params'][0]
     target, mode = compiler.parameter(annotation, element, fn.node)

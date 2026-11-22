@@ -21,6 +21,7 @@ _BARE_CALLS = {
 }
 _LATER_CALLS: set[str] = set()
 _ASSIGNMENTS = {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "**="}
+RELATIONAL_OPERATORS = frozenset(("<", "<=", ">", ">="))
 _BINDING_POWER = {
     "..": 2,
     "||": 3,
@@ -45,6 +46,7 @@ class Parser:
         self.position = 0
         self.group_depth = 0
         self.lambda_depth = 0
+        self.chain_comparisons = not cpp
         self.record_depth = 0
         self.main_entry_depth = 0
         # Recognize type spellings before parsing; the resolver validates their definitions.
@@ -769,6 +771,17 @@ class Parser:
             self.take()
             self.newlines()
             right = self.expression(power if token.text == "**" else power + 1)
+            if self.chain_comparisons and token.text in RELATIONAL_OPERATORS:
+                self.soft_newlines()
+                if self.current.text in RELATIONAL_OPERATORS:
+                    operands, operators = [left, right], [token]
+                    while self.current.text in RELATIONAL_OPERATORS:
+                        operators.append(self.take())
+                        self.newlines()
+                        operands.append(self.expression(power + 1))
+                        self.soft_newlines()
+                    left = Node("compare_chain", token, children=operands, extra={"operators": operators})
+                    continue
             left = Node("binary", token, token.text, [left, right])
         return left
 
@@ -946,6 +959,44 @@ class Parser:
 
     def lambda_parameters(self) -> Node:
         start = self.current
+        look = self.position + 1
+        while self.tokens[look].kind == "NEWLINE":
+            look += 1
+        if self.tokens[look].text == "[":
+            raise KumaError("分割引数は ((f, s)) => ... と書いてください", self.tokens[look])
+        patterned = False
+        if self.tokens[look].text == "(":
+            # A typed tuple parameter has a name after its inner ')'.
+            # Without that name an extra parenthesis pair denotes unpacking.
+            depth = 0
+            for i in range(look, len(self.tokens)):
+                token = self.tokens[i]
+                if token.text == "(":
+                    depth += 1
+                elif token.text == ")":
+                    depth -= 1
+                    if depth == 0:
+                        after = i + 1
+                        while self.tokens[after].kind == "NEWLINE":
+                            after += 1
+                        patterned = self.tokens[after].text in {")", ","}
+                        break
+        if patterned:
+            self.expect("(")
+            self.group_depth += 1
+            self.soft_newlines()
+            pattern = self.binding_pattern()
+            self.expect(")", "分割引数は ((f, s)) => ... のように1つだけ指定してください")
+            self.group_depth -= 1
+            if pattern.kind != "bind_tuple" or any(child.kind != "bind_name" for child in pattern.children):
+                raise KumaError("分割引数は ((f, s)) のように名前を2つ以上並べてください", pattern.token)
+            names = [child.value for child in pattern.children]
+            if len(names) != len(set(names)):
+                raise KumaError("アロー関数の分割引数名が重複しています", pattern.token)
+            self.expect("=>")
+            result = self.lambda_body(start, [("", None)])
+            result.extra["param_pattern"] = pattern
+            return result
         parameters = self.parameters(typed=False)
         self.expect("=>")
         return self.lambda_body(start, parameters)
