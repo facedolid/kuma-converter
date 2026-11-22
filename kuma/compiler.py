@@ -238,13 +238,15 @@ def emit_string(texts, specs, expressions, quote):
     return "([&]() { " + " ".join(lines) + " }())"
 
 
+_TO_F64_METHODS = frozenset({"to_f64", "to_double"})
+
 _SCALAR_CONVERSION_METHODS = frozenset({
     "to_string", "to_int", "to_ll", "ctoi", "stoi", "stoll", "to_num",
 })
 
 _STRING_PAD_METHODS = frozenset({"zfill", "pad_start", "pad_end"})
 
-_SCALAR_METHOD_DISPATCH = _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
+_SCALAR_METHOD_DISPATCH = _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS | _TO_F64_METHODS
 
 _BETWEEN_METHODS = frozenset({"between"})
 
@@ -282,6 +284,10 @@ def emit_scalar_conversion(method, receiver, base="10"):
     targets = {"to_int": "int", "to_ll": "long long"}
     if method in targets:
         return f"kuma_rt::numeric_cast<{targets[method]}>({receiver})"
+    if method in _TO_F64_METHODS or method == "stod":
+        if method == "stod":
+            receiver = f"::std::stod({receiver})"
+        return f"::kuma_rt::numeric_cast<double>({receiver})"
     if method == "ctoi":
         return f"::ctoi({receiver})"
     if method in {"stoi", "stoll"}:
@@ -1911,15 +1917,19 @@ class Compiler(DeclarationSupport):
             method = {"char": "ctoi", "string": "stoi"}.get(receiver.type.name, name)
         elif name == "to_ll":
             method = {"string": "stoll"}.get(receiver.type.name, name)
+        elif name in _TO_F64_METHODS and receiver.type == STRING:
+            method = "stod"
         else:
             method = name
         specs = {
             "to_string": (NUMBER, 0, STRING),
             "to_int": (NUMBER, 0, I32),
             "to_ll": (NUMBER, 0, I64),
+            **{alias: (NUMBER, 0, F64) for alias in _TO_F64_METHODS},
             "ctoi": ((CHAR,), 0, I32),
             "stoi": ((STRING,), 1, I32),
             "stoll": ((STRING,), 1, I64),
+            "stod": ((STRING,), 0, F64),
         }
         if method not in specs or receiver.type not in specs[method][0]:
             self.fail(f"{receiver.type} には {name} を使えません", node, code="KUMA_API")

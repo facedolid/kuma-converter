@@ -102,6 +102,7 @@ class CppParser(InitializerSupport, Parser):
             self.offsets.append(self.offsets[-1] + len(line))
         self.depth = 0
         self.layout_headers = []
+        self.indented_control_bodies = set()
         self.local_input_scopes = []
         # Conditional preprocessing or input macros can change binding visibility.
         self.local_input_tracking_safe = not any(
@@ -334,7 +335,10 @@ class CppParser(InitializerSupport, Parser):
         try:
             if self.current.kind != 'NEWLINE' and self.current.text != '{':
                 return [self.statement()]
-            return super().block(header)
+            body = super().block(header)
+            if layout and header.text in {'if', 'while', 'else', 'for'}:
+                self.indented_control_bodies.add(body[0].token)
+            return body
         finally:
             if layout:
                 self.layout_headers.pop()
@@ -887,8 +891,12 @@ class CppParser(InitializerSupport, Parser):
         if not terminated and _simple_vector_assign_missing_semicolon(visible):
             return None
         self.position = end
-        return Node('cpp_stmt', start, self.source_range(start, part[-1]) + ';',
-                    extra={'bare_identifier': not terminated and len(part) == 1 and start.kind == 'IDENT'})
+        extra = {'bare_identifier': not terminated and len(part) == 1 and start.kind == 'IDENT'}
+        if (not terminated and self.layout_headers and self.stock_ac_header_line is not None
+                and not self.has_native_main and self.tokens[end].kind in ('NEWLINE', 'EOF')
+                and len(texts) >= 4 and texts[-1] == ')'):
+            extra['implicit_call_end'] = part[-1]
+        return Node('cpp_stmt', start, self.source_range(start, part[-1]) + ';', extra=extra)
 
     def cpp_range_for(self) -> Node | None:
         """Allow `for auto& x : values { ... }` without changing C++ for headers.
@@ -1497,6 +1505,21 @@ _LINE_EOF_STRING_SPELLINGS = {'string', 'str', 'std::string'}
 
 
 _DECIMAL_SLICE_INTEGER = re.compile(r"^[0-9]+(?:'[0-9]+)*[uUlL]*$")
+
+
+_MIXED_SET_SCALARS = frozenset({'int', 'long long', 'double', 'bool', 'char', 'std::string'})
+
+
+def _mixed_set_input_element(types):
+    if len(types) == 1:
+        match = re.fullmatch(r'set\s*<\s*(.+?)\s*>', types[0])
+        if match:
+            return match[1]
+    return None
+
+
+def _mixed_set_scalar(spelling):
+    return ' '.join(cpp_type(spelling).split()).removeprefix('::')
 
 
 def _integer_number_token(token) -> bool:
@@ -2209,6 +2232,20 @@ class CppEmitter:
         args = [self.expr(c) for c in node.children]
         kw = node.extra.get('kwargs', {})
         self.options(node, kw, {'until', 'mode'})
+        set_element = _mixed_set_input_element(types)
+        if set_element is not None:
+            if len(args) != 1 or kw:
+                self.fail(node, '集合入力は個数を1つ指定し input<set<T>>(N) と書いてください')
+            spelling = re.sub(r'\s*::\s*', '::', set_element)
+            if spelling == 'std::string':
+                self.fail(node, '集合入力の文字列型は string または str と書いてください')
+            type_ = _mixed_set_scalar(spelling)
+            if type_ not in _MIXED_SET_SCALARS:
+                self.fail(node, '集合入力の要素型は i32・i64・f64・bool・char・string に限ります')
+            if type_ == 'std::string':
+                # A user may have a real local C++ type named std.
+                type_ = '::std::string'
+            return f'::kuma_rt::read_set<{type_}>(::kuma_rt::checked_input_dimension(({args[0]})))'
         # Placeholder declarations acquire their type from the generated input
         # expression; they are not concrete types usable inside decltype helpers.
         expected_tokens = expected.strip() if expected else ''
@@ -2326,6 +2363,34 @@ class CppEmitter:
                     f'std::move({snapshot}), {predicate}, {transform}, ({self.expr(count)})); '
                     f'}})(({self.expr(mapper)})); }})(({self.expr(pred)})); '
                     f'}})(({self.expr(source)}))')
+        if not native and node.extra.get('kuma_vector_index_type'):
+            recv, index = (self.fresh('idx_' + part) for part in ('recv', 'index'))
+            receiver, position = (self.expr(child) for child in node.children[:2])
+            prefix = f'([&]() {{ auto& {recv} = ({receiver}); const auto {index} = ({position}); '
+            arguments = f'{recv}, {index}'
+            if value == 'insert_at':
+                item = self.fresh('idx_item')
+                expression = self.expr(node.children[2])
+                # Directly materialize the element: bit-fields, proxies and
+                # references still bind correctly even if insertion reallocates.
+                prefix += (f'typename ::std::remove_reference_t<decltype({recv})>::value_type '
+                           f'{item}(({expression})); ')
+                arguments += f', ::std::move({item})'
+            elif value == 'erase_range':
+                right = self.fresh('idx_right')
+                prefix += f'const auto {right} = ({self.expr(node.children[2])}); '
+                arguments += f', {right}'
+            return prefix + f'return ::kuma_rt::vector_{value}({arguments}); }}())'
+        if not native and node.extra.get('kuma_byte_conversion'):
+            direction = node.extra['kuma_byte_conversion']
+            # Explicit reference type selects the stock range template, not
+            # a native non-template overload on the same standard container.
+            operand = self.expr(node.children[0])
+            if direction == 'chars':
+                return f'::to_vec<const ::std::string&>({operand})'
+            return f'::to_str<const ::std::vector<char>&>({operand})'
+        if not native and node.extra.get('kuma_set_from_vector'):
+            return '::kuma_rt::set_from_vector(' + self.expr(node.children[0]) + ')'
         if kind == 'cpp_bare_call':
             return self.mark(node.value, node.token) + '(' + ', '.join(
                 self.expr(c, native=True) for c in node.children) + ')'
@@ -2347,6 +2412,14 @@ class CppEmitter:
             if not node.children:
                 if expected and expected != 'auto': return cpp_type(expected) + '{}'
                 self.fail(node, '空配列には vec<T> などの型を明示してください')
+            if len(node.children) == 1:
+                # Vector CTAD selects its copy deduction candidate for a
+                # singleton vector element. Deduce the element type from a
+                # list instead, preserving decay and evaluating it only once.
+                element, values = self.fresh('element'), self.fresh('values')
+                return (f'[]<class {element}>(std::initializer_list<{element}> {values}) {{ '
+                        f'return std::vector<{element}>({values}); }}'
+                        f'({{{self.expr(node.children[0])}}})')
             return 'std::vector{' + ', '.join(self.expr(c) for c in node.children) + '}'
         if kind == 'tuple': return 'std::tuple{' + ', '.join(self.expr(c) for c in node.children) + '}'
         if kind in {'unary', 'postfix'}:
@@ -2508,7 +2581,7 @@ class CppEmitter:
                                    _STRING_PAD_METHODS, _INTEGER_MASK_METHODS, _VECTOR_ASSIGN_METHODS,
                                    _BETWEEN_METHODS, _COUNT_IF_METHODS, _FIND_IDX_METHODS,
                                    _SORTED_BY_METHODS,
-                                   emit_mixed_scalar_conversion,
+                                   emit_mixed_scalar_conversion, emit_scalar_conversion,
                                    emit_mixed_integer_mask_method, emit_mixed_sequence_method,
                                    emit_mixed_string_pad, emit_mixed_vector_assign_method,
                                    emit_mixed_between, emit_mixed_count_if, emit_mixed_find_idx,
@@ -2523,8 +2596,13 @@ class CppEmitter:
                                    | {'to_str', 'in_range', 'range_sum', 'combination_indices', 'combinations', 'next_greater_indices', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec'})
             args = [self.expr(c, native=(native_args and not (
                         not native and (c.kind == 'method' and (c.value in extension_members
-                                                                or c.extra.get('kuma_kth_proven'))
-                                        or c.kind == 'member' and c.value == 'to_str'))))
+                                                                or c.extra.get('kuma_kth_proven')
+                                                                or c.extra.get('kuma_transpose_proven'))
+                                        or c.kind == 'member' and c.value == 'to_str'
+                                        or c.extra.get('kuma_set_from_vector')
+                                        or c.extra.get('kuma_byte_conversion')
+                                        or c.extra.get('kuma_to_f64')
+                                        or c.extra.get('kuma_vector_index_type')))))
                     for c in node.children]
             if not native and kind == 'method' and not node.extra.get('pointer'):
                 if (value == 'sort_by' and node.extra.get('kuma_sort_by_statement')
@@ -2549,6 +2627,12 @@ class CppEmitter:
                     return emit_mixed_combinations(value, *args, self.fresh, type_probe=self.type_probe)
                 if value == 'range_sum' and len(args) == 3 and not kw and not node.extra.get('types'):
                     return emit_mixed_range_sum(*args, self.fresh, type_probe=self.type_probe)
+                if node.extra.get('kuma_transpose_proven'):
+                    # Select the shipped overload even if the source adds
+                    # an overload taking a mutable vector, or a template.
+                    grid = '::std::vector<::std::string>'
+                    return (f'static_cast<{grid} (*)(const {grid}&)>'
+                            f'(&::transpose)({args[0]})')
                 if not self.type_probe and node.extra.get('kuma_kth_proven'):
                     return emit_mixed_kth(value, args, self.fresh)
                 if value == 'sum_by' and len(args) == 2 and not kw and not node.extra.get('types'):
@@ -2562,6 +2646,11 @@ class CppEmitter:
                     return emit_mixed_in_range(*args, self.fresh, type_probe=self.type_probe)
                 if value == 'to_str' and len(args) == 1 and not kw and not node.extra.get('types'):
                     return emit_mixed_to_str(args[0], self.fresh, attribute=False)
+                if operand := node.extra.get('kuma_to_f64'):
+                    receiver = node.children[0]
+                    if operand == 'string' and receiver.kind == 'literal':
+                        args[0] = self.expr(receiver)
+                    return emit_scalar_conversion('stod' if operand == 'string' else value, args[0])
                 if value in _SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS:
                     self.options(node, kw)
                     receiver = node.children[0]
@@ -2869,6 +2958,8 @@ class CppEmitter:
             if len(names) > 1:
                 init = node.children[0]
                 if init.kind == 'call' and init.value == 'input':
+                    if _mixed_set_input_element(init.extra.get('types', [])) is not None:
+                        self.fail(init, 'input<set<T>>(N) の結果は1つの変数へ束縛してください')
                     kwargs = init.extra.get('kwargs', {})
                     if init.children:
                         if not kwargs and len(init.children) == 1 and len(names) > 1:
@@ -3115,8 +3206,8 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None,
         if value.kind == 'name':
             return value.value in nested
         if value.kind == 'array' and value.children:
-            # A single nested vector may select vector's copy deduction guide,
-            # making the result a vector of scalars instead of a matrix.
+            # This conservative proof for optional calls only tracks
+            # syntactic multirow arrays; it does not control array lowering.
             strings = all(c.kind == 'literal' and c.extra.get('type') == 'string'
                           for c in value.children)
             arrays = len(value.children) > 1 and all(c.kind == 'array' and c.children
@@ -3218,6 +3309,10 @@ def mark_optional_collection_calls(nodes, known=None, nested=None, ranges=None,
         if value.kind == 'call' and value.value == 'input':
             options = value.extra.get('kwargs', {})
             types = value.extra.get('types', [])
+            if _mixed_set_input_element(types) is not None:
+                # A counted set is not a shaped vector: the old proof also
+                # enables pop_back(), which a standard set does not have.
+                return False
             # These modes return std::string and std::vector respectively,
             # even without an explicit input element type.
             if not value.children and set(options) == {'until', 'mode'}:
@@ -3614,6 +3709,686 @@ def mark_mixed_kth(nodes, parser, *, source_parser=None):
     return sites
 
 
+def mark_mixed_transpose(nodes, parser):
+    """Find checked, zero-argument calls on proven local string grids."""
+    header = parser.stock_ac_header_line
+    if header is None or re.search(r'\\[ \t]*\n', parser.source):
+        return []
+    tokens = parser.tokens
+    if any(t.text == 'std' and tokens[i + 1].text != '::' for i, t in enumerate(tokens[:-1])):
+        return []
+    input_safe = not any(t.text == 'kuma_rt' for t in tokens)
+    # The shipped header provides unqualified vector and string. Only trust
+    # the unqualified form when the source cannot supply alternative types.
+    unqualified = not any(t.text in {'using', 'namespace', 'typedef', 'struct', 'class',
+                                     'union', 'enum', 'template', 'concept'}
+                          for t in tokens)
+    string = r'"(?:[^"\\\r\n]|\\[^\r\n])*"'
+    braces = rf'\{{\s*(?:{string}(?:\s*,\s*{string})*\s*,?\s*)?\}}'
+    type_text = r'(?:::)?std\s*::\s*vector\s*<\s*(?:::)?std\s*::\s*string\s*>'
+    if unqualified:
+        type_text = r'(?:' + type_text + r'|vector\s*<\s*string\s*>)'
+    native_grid = re.compile(rf'(?:const\s+)?{type_text}\s+(?P<name>[A-Za-z_]\w*)\s*'
+                             rf'(?:(?:=\s*)?{braces}|\(\s*[0-9]+\s*\))?\s*;')
+    sites = []
+
+    def string_grid(expr):
+        return (expr.kind == 'array' and bool(expr.children)
+                and all(child.kind == 'literal' and child.extra.get('type') == 'string'
+                        and re.fullmatch(string, child.value) for child in expr.children)
+                or input_safe and expr.kind == 'call' and expr.value == expr.token.text == 'input'
+                and len(expr.children) == 1 and not expr.extra.get('kwargs')
+                and expr.extra.get('types') in (['string'], ['str'], ['std::string']))
+
+    def expression(expr, known):
+        # Exact paths that emit checked expression operands. Do not walk
+        # arbitrary calls/invokes: those may recursively emit native C++.
+        if expr.kind == 'call' and expr.value in {'print', 'debug'}:
+            for arg in expr.children:
+                method_chain(arg, known)
+        else:
+            method_chain(expr, known)
+
+    def method_chain(expr, known):
+        # An immediate marked receiver remains checked through one outer
+        # method (grid.transpose().size()). Do not look past an unrelated
+        # intermediate, whose own receiver may be emitted in native mode.
+        if expr.kind == 'method' and expr.children and expr.children[0].kind == 'method':
+            expr = expr.children[0]
+        if (expr.kind == 'method' and expr.value == 'transpose' and len(expr.children) == 1
+                and not any(expr.extra.get(k) for k in ('pointer', 'kwargs', 'types'))):
+            grid = expr.children[0]
+            if grid.kind == 'name' and grid.value == grid.token.text and grid.value in known:
+                expr.extra['kuma_transpose_proven'] = True
+                sites.append(expr)
+
+    def block(statements):
+        known = set()
+        for stmt in statements:
+            if stmt.token.line <= header:
+                continue
+            if stmt.kind.startswith('cpp_'):
+                native = native_grid.fullmatch(stmt.value) if stmt.kind == 'cpp_stmt' else None
+                if native:
+                    known.add(native['name'])
+                else:
+                    known.clear()
+                continue
+            if stmt.kind in {'declare', 'exprstmt', 'write'}:
+                for expr in stmt.children:
+                    expression(expr, known)
+            if stmt.kind == 'declare':
+                known.difference_update(stmt.value)
+                annotation = re.sub(r'\s', '', stmt.extra.get('type') or '')
+                if (len(stmt.value) == 1 and
+                        (not annotation and string_grid(stmt.children[0])
+                         or annotation in ('std::vector<std::string>', '::std::vector<::std::string>')
+                         or unqualified and annotation == 'vector<string>')):
+                    known.add(stmt.value[0])
+            # Nested scopes don't inherit the proof of any outer binding.
+
+    if not parser.has_native_main and not any(n.kind == 'main_entry' for n in nodes):
+        block(nodes)
+    for node in nodes:
+        if node.kind in {'main_entry', 'cpp_main'}:
+            block(node.extra.get('body', ()))
+        if node.kind == 'cpp_opaque_sections' and node.extra.get('main'):
+            sections = [s for s in node.extra['sections'] if s[0] == 'function']
+            if len(sections) == 1:
+                block(sections[0][1])
+    return sites
+
+
+def _mixed_scalar_vector_proof():
+    """Shared local evidence for an ordinary, owning scalar vector."""
+    integer = re.compile(r"(0|[1-9](?:'?[0-9])*)(?:LL|ll)?")
+    floating = re.compile(r"(?:[0-9]+\.[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+")
+    character = re.compile(r"\x27(?:[\x20-\x26\x28-\x5b\x5d-\x7e]|\\[abfnrtv\\\x27\x22?0])\x27")
+    string = re.compile(r'"(?:[^"\\\r\n]|\\[^\r\n])*"')
+
+    def literal_type(expr):
+        if expr.kind == 'unary' and expr.value in ('+', '-') and len(expr.children) == 1:
+            arg = expr.children[0]
+            return literal_type(arg) if arg.kind == 'literal' and arg.extra.get('type') in ('i64', 'f64') else None
+        if expr.kind != 'literal':
+            return None
+        spelling, tag = expr.value, expr.extra.get('type')
+        if tag == 'i64' and (match := integer.fullmatch(spelling)):
+            digits = match[1].replace("'", '')
+            if len(digits) <= 19 and int(digits) <= (1 << 63) - 1:
+                return 'long long'
+        if tag == 'f64' and floating.fullmatch(spelling):
+            return 'double'
+        if tag == 'bool' and spelling in ('true', 'false'):
+            return 'bool'
+        if tag == 'char' and character.fullmatch(spelling):
+            return 'char'
+        if tag == 'string' and string.fullmatch(spelling):
+            return 'std::string'
+        return None
+
+    def vector_type(expr, locals_):
+        if expr.kind == 'name' and expr.value == expr.token.text:
+            return locals_.get(expr.value)
+        if expr.kind == 'array' and expr.children:
+            types = {literal_type(el) for el in expr.children}
+            if len(types) == 1:
+                return types.pop()
+        if (expr.kind == 'call' and expr.value == expr.token.text == 'input'
+                and len(expr.children) == 1 and not expr.extra.get('kwargs')):
+            types = expr.extra.get('types') or ()
+            elem = _mixed_set_scalar(types[0]) if len(types) == 1 else 'long long' if not types else None
+            if elem in _MIXED_SET_SCALARS:
+                return elem
+        return None
+
+    return vector_type
+
+
+def mark_mixed_set_conversions(nodes, parser):
+    """Prove checked vector conversions without changing native CTAD or calls."""
+    header = parser.stock_ac_header_line
+    if header is None or re.search(r'\\[ \t]*\n', parser.source):
+        return
+    tokens = parser.tokens
+    if (not any(t.text in ('set', 'to_set') for t in tokens)
+            or any(t.text == 'kuma_rt' or t.text == 'std' and tokens[i + 1].text != '::'
+                   for i, t in enumerate(tokens[:-1]))):
+        return
+    vector_type = _mixed_scalar_vector_proof()
+    free_calls = []
+
+    def conversion(expr, locals_):
+        if (len(expr.children) != 1 or expr.value != expr.token.text
+                or any(expr.extra.get(k) for k in ('pointer', 'kwargs', 'types'))):
+            return
+        if not vector_type(expr.children[0], locals_):
+            return
+        if expr.kind == 'method' and expr.value == 'to_set':
+            expr.extra['kuma_set_from_vector'] = True
+        elif expr.kind == 'call' and expr.value == 'set':
+            free_calls.append(expr)
+
+    def expression(expr, locals_):
+        if expr.kind not in ('method', 'call'):
+            return
+        conversion(expr, locals_)
+        if expr.kind == 'method' and expr.children:
+            child = expr.children[0]
+            if child.kind in ('method', 'call'):
+                conversion(child, locals_)
+        elif expr.kind == 'call' and expr.value in ('print', 'debug'):
+            for child in expr.children:
+                expression(child, locals_)
+
+    def block(statements):
+        locals_ = {}
+        for stmt in statements:
+            if stmt.token.line <= header:
+                continue
+            if stmt.kind.startswith('cpp_'):
+                locals_.clear()
+                continue
+            if stmt.kind in {'declare', 'exprstmt', 'write'}:
+                for child in stmt.children:
+                    expression(child, locals_)
+            if stmt.kind == 'declare':
+                inferred = vector_type(stmt.children[0], locals_) if len(stmt.value) == 1 else None
+                for name in stmt.value:
+                    locals_.pop(name, None)
+                if len(stmt.value) != 1:
+                    continue
+                annotation = stmt.extra.get('type')
+                if annotation:
+                    annotation = re.fullmatch(r'(?:(?:::)?std\s*::\s*)?(?:vec|vector)\s*<\s*(.+?)\s*>', annotation)
+                    inferred = _mixed_set_scalar(annotation[1]) if annotation else None
+                if inferred in _MIXED_SET_SCALARS:
+                    locals_[stmt.value[0]] = inferred
+
+    if not parser.has_native_main and not any(n.kind == 'main_entry' for n in nodes):
+        block(nodes)
+    for node in nodes:
+        if node.kind in {'main_entry', 'cpp_main'}:
+            block(node.extra.get('body', ()))
+        if node.kind == 'cpp_opaque_sections' and node.extra.get('main'):
+            sections = [s for s in node.extra['sections'] if s[0] == 'function']
+            if len(sections) == 1:
+                block(sections[0][1])
+
+    exact_sites = {node.token for node in free_calls}
+    if all(token in exact_sites or i > 0 and tokens[i - 1].text in ('::', '.', '->')
+           or i + 1 < len(tokens) and tokens[i + 1].text == '<'
+           for i, token in enumerate(tokens) if token.kind == 'IDENT' and token.text == 'set'):
+        for node in free_calls:
+            node.extra['kuma_set_from_vector'] = True
+
+
+VECTOR_INDEX_ARITIES = {'insert_at': 3, 'erase_at': 2, 'erase_range': 3, 'pop_at': 2}
+
+
+def mark_mixed_vector_index_calls(nodes, parser):
+    """Find only checked calls on proved writable stock vector lvalues."""
+    header = parser.stock_ac_header_line
+    if header is None or re.search(r'\\[ \t]*\n', parser.source):
+        return
+    tokens = parser.tokens
+    if (not any(t.text in VECTOR_INDEX_ARITIES for t in tokens)
+            or any(t.text in ('kuma_rt', 'import', 'module')
+                   or t.text == 'std' and tokens[i + 1].text != '::'
+                   for i, t in enumerate(tokens[:-1]))):
+        return
+    positions = {token: i for i, token in enumerate(tokens)}
+    vector_type = _mixed_scalar_vector_proof()
+    direct_type = re.compile(r'(?:vec|vector|(?:::)?std\s*::\s*vector)\s*<\s*(.+?)\s*>')
+
+    def standalone_tail(method):
+        # CppParser accepts a terminated native-looking call as an implicit
+        # expression statement too. Verify the original tokens and withhold
+        # the extension from explicit semicolons and continued statements.
+        i = positions.get(method.token, -1) + 1
+        if i <= 0 or i >= len(tokens) or tokens[i].text != '(':
+            return False
+        depth = 0
+        for j in range(i, len(tokens) - 1):
+            token = tokens[j]
+            if token.text == '(':
+                depth += 1
+            elif token.text == ')':
+                depth -= 1
+                if depth == 0:
+                    if tokens[j + 1].kind not in ('NEWLINE', 'EOF'):
+                        return False
+                    while tokens[j + 1].kind == 'NEWLINE':
+                        j += 1
+                    return tokens[j + 1].text != ';'
+        return False
+
+    def proof(expr, known, standalone=False):
+        if (expr.kind != 'method' or expr.value not in VECTOR_INDEX_ARITIES
+                or len(expr.children) != VECTOR_INDEX_ARITIES[expr.value]
+                or any(expr.extra.get(k) for k in ('pointer', 'kwargs', 'types'))):
+            return
+        if expr.value != 'pop_at' and not standalone:
+            return
+        receiver = expr.children[0]
+        if (receiver.kind == 'name' and receiver.value == receiver.token.text
+                and receiver.value in known
+                and not any(arg.kind == 'cpp_expr' and arg.value.lstrip().startswith('{')
+                            for arg in expr.children[1:])):
+            expr.extra['kuma_vector_index_type'] = known[receiver.value]
+
+    def compound_pop(stmt, known, loop_bindings, *, tokens_checked=False):
+        lhs, rhs = stmt.children
+        if (lhs.kind != 'name' or lhs.token != stmt.token or lhs.value in loop_bindings
+                or rhs.kind != 'method'
+                or rhs.value != 'pop_at'):
+            return
+        if not tokens_checked:
+            first = positions[stmt.token]
+            site = positions[rhs.token]
+            if (site != first + 4 or tokens[first + 1].text != '+='
+                    or tokens[first + 3].text != '.' or not standalone_tail(rhs)):
+                return
+        proof(rhs, known)
+        if 'kuma_vector_index_type' in rhs.extra:
+            # Keep C++'s compound assignment (including evaluation order);
+            # the completion probe also checks the accumulator type.
+            rhs.extra['kuma_vector_pop_accumulator'] = lhs.value
+
+    def layout_call(stmt, known, loop_bindings):
+        # Inside a C++-capable block the parser preserves a complete raw
+        # statement with a synthetic semicolon. Retry only the narrow native
+        # shapes whose receiver already has a live stock-vector binding.
+        last = stmt.extra.get('implicit_call_end')
+        if last is None:
+            return None
+        first, end = positions[stmt.token], positions[last]
+        call = first
+        operator = tokens[first + 1].text
+        assign = operator in ('=', '+=')
+        if assign:
+            if stmt.token.kind != 'IDENT':
+                return None
+            call += 2
+        if call + 4 > end:
+            return None
+        recv, dot, method, opening = tokens[call:call + 4]
+        if (recv.kind != 'IDENT' or recv.text not in known or dot.text != '.'
+                or method.text not in VECTOR_INDEX_ARITIES or opening.text != '('
+                or assign and method.text != 'pop_at'
+                or parser.native_bodies.pairs.get(call + 3) != end
+                or not standalone_tail(Node('method', method))):
+            return None
+        # Keep the real coordinates for the generated source map and LSP edit
+        # probe. Parse independently so failed trials cannot mutate the AST.
+        candidate = CppParser(
+            '\n' * (stmt.token.line - 1) + ' ' * (stmt.token.column - 1)
+            + parser.source_range(stmt.token, last))
+        candidate.newlines()
+        try:
+            parsed = Parser.statement(candidate)
+        except KumaError:
+            return None
+        if candidate.current.kind != 'EOF' or parsed.kind != ('assign' if assign else 'exprstmt'):
+            return None
+        expr = parsed.children[-1]
+        if operator == '+=':
+            compound_pop(parsed, known, loop_bindings, tokens_checked=True)
+        else:
+            proof(expr, known, standalone=not assign)
+        return parsed if 'kuma_vector_index_type' in expr.extra else None
+
+    def control_body(statements, known, loop_bindings, *, alternative=False):
+        if not statements:
+            return
+        first = statements[0]
+        if first.token in parser.indented_control_bodies:
+            block(statements, implicit=True, inherited=known, loop_bindings=loop_bindings, layout=True)
+        elif alternative and first.kind == 'if':
+            index = positions[first.token]
+            if index and tokens[index - 1].text == 'else':
+                block(statements, implicit=True, inherited=known, loop_bindings=loop_bindings)
+
+    def block(statements, *, implicit=False, inherited=(), loop_bindings=frozenset(), layout=False):
+        known = dict(inherited)
+        for index, stmt in enumerate(statements):
+            if stmt.token.line <= header:
+                continue
+            if stmt.kind.startswith('cpp_'):
+                parsed = (layout_call(stmt, known, loop_bindings)
+                          if layout and stmt.kind == 'cpp_stmt' else None)
+                if parsed is None:
+                    known.clear()
+                else:
+                    statements[index] = parsed
+                continue
+            if implicit and stmt.kind in ('if', 'while'):
+                control_body(stmt.extra.get('body', ()), known, loop_bindings)
+                control_body(stmt.extra.get('else', ()), known, loop_bindings, alternative=True)
+            if implicit and stmt.kind == 'for':
+                pattern = stmt.extra['pattern']
+                if pattern.kind == 'bind_name':
+                    # A simple loop binding hides an outer receiver in the
+                    # body only and is const in mixed emission. Leave
+                    # destructuring and native loops opaque.
+                    scoped = {name: elem for name, elem in known.items() if name != pattern.value}
+                    control_body(stmt.extra.get('body', ()), scoped, loop_bindings | {pattern.value})
+            if implicit and stmt.kind == 'assign' and stmt.value == '+=':
+                compound_pop(stmt, known, loop_bindings)
+            if stmt.kind in ('declare', 'write', 'exprstmt') and stmt.children:
+                child = stmt.children[0]
+                if stmt.kind == 'exprstmt' and child.kind == 'method':
+                    if implicit and standalone_tail(child):
+                        proof(child, known, standalone=True)
+                elif (stmt.kind == 'exprstmt' and child.kind == 'call'
+                      and child.value in ('print', 'debug')):
+                    for operand in child.children:
+                        proof(operand, known)
+                elif stmt.kind in ('declare', 'write'):
+                    for operand in stmt.children:
+                        proof(operand, known)
+            if stmt.kind != 'declare':
+                continue
+            if len(stmt.value) != 1:
+                for name in stmt.value:
+                    known.pop(name, None)
+                continue
+            spelling = stmt.extra.get('type')
+            annotation = direct_type.fullmatch(spelling) if spelling else None
+            inferred = (_mixed_set_scalar(annotation[1]) if annotation else
+                        None if spelling else vector_type(stmt.children[0], known))
+            name = stmt.value[0]
+            known.pop(name, None)
+            if inferred in _MIXED_SET_SCALARS:
+                known[name] = inferred
+
+    if not parser.has_native_main and not any(n.kind == 'main_entry' for n in nodes):
+        block(nodes, implicit=True)
+    for node in nodes:
+        if node.kind in ('main_entry', 'cpp_main'):
+            block(node.extra.get('body', ()))
+        elif node.kind == 'cpp_opaque_sections' and node.extra.get('main'):
+            sections = [s for s in node.extra['sections'] if s[0] == 'function']
+            if len(sections) == 1:
+                block(sections[0][1])
+
+
+def mark_mixed_byte_conversions(nodes, parser):
+    """Add checked string/char-vector conversions without reinterpreting native calls."""
+    header = parser.stock_ac_header_line
+    if header is None or re.search(r'\\[ \t]*\n', parser.source):
+        return
+    tokens = parser.tokens
+    if (not any(t.text in ('vec', 'to_vec', 'string') for t in tokens)
+            or any(t.text in ('import', 'module') for t in tokens)
+            or any(t.text == 'kuma_rt' or t.text == 'std' and tokens[i + 1].text != '::'
+                   for i, t in enumerate(tokens[:-1]))):
+        return
+
+    blocks = []
+    if not parser.has_native_main and not any(n.kind == 'main_entry' for n in nodes):
+        blocks.append(nodes)
+    for node in nodes:
+        if node.kind in {'main_entry', 'cpp_main'}:
+            blocks.append(node.extra.get('body', ()))
+        elif node.kind == 'cpp_opaque_sections' and node.extra.get('main'):
+            sections = [s for s in node.extra['sections'] if s[0] == 'function']
+            if len(sections) == 1:
+                blocks.append(sections[0][1])
+
+    # Identify only spellings already parsed as ordinary calls, rather than
+    # treating every bare identifier before '(' as a stock constructor.
+    call_sites = set()
+    type_sites = set()
+    helper_sites = set()
+    positions = {token: i for i, token in enumerate(tokens)}
+    for statements in blocks:
+        for stmt in statements:
+            if stmt.kind not in ('declare', 'exprstmt', 'write'):
+                continue
+            if stmt.kind == 'declare' and stmt.extra.get('type') == 'string':
+                index = positions.get(stmt.token, 0)
+                if index and tokens[index - 1].text == 'string':
+                    type_sites.add(tokens[index - 1])
+            pending = list(stmt.children)
+            while pending:
+                expr = pending.pop()
+                if expr.kind in ('lambda', 'comprehension', 'cpp_opaque_sections'):
+                    continue
+                if expr.kind == 'call' and expr.value == expr.token.text and expr.value in ('vec', 'string'):
+                    call_sites.add(expr.token)
+                if expr.kind == 'call' and expr.value in ('to_vec', 'to_str', '::to_vec', '::to_str'):
+                    i = positions.get(expr.token)
+                    if i is not None:
+                        if tokens[i].text == '::':
+                            i += 1
+                        if tokens[i].text == expr.value.removeprefix('::'):
+                            helper_sites.add(i)
+                pending.extend(expr.children)
+
+    def qualified(index):
+        return index > 0 and tokens[index - 1].text in ('::', '.', '->')
+
+    def stock_constructor(name):
+        for i, token in enumerate(tokens[:-1]):
+            if token.kind != 'IDENT' or token.text != name or qualified(i):
+                continue
+            if token in call_sites or token in type_sites or tokens[i + 1].text == '<':
+                continue
+            if (i > 0 and tokens[i - 1].text in ('<', ',')
+                    and tokens[i + 1].text in ('>', '>>', ',')):
+                continue  # A scalar type argument (e.g. input<string>).
+            return False
+        return True
+
+    # Source declarations/using-imports can contribute other overloads,
+    # including abbreviated templates. Ordinary parsed calls and member
+    # uses alone do not alter the global qualified helper.
+    def stock_helper(name):
+        return all(i in helper_sites or i > 0 and tokens[i - 1].text in ('.', '->')
+                   for i, token in enumerate(tokens) if token.text == name)
+
+    stock_vec = stock_helper('to_vec')
+    stock_str = stock_helper('to_str')
+    ctor_vec = stock_vec and stock_constructor('vec')
+    ctor_str = stock_str and stock_constructor('string')
+    character = re.compile(r"\x27(?:[\x20-\x26\x28-\x5b\x5d-\x7e]|\\[abfnrtv\\\x27\x22?0]|\\[0-7]{1,3}|\\x[0-9A-Fa-f]{1,2})\x27")
+
+    def operand_type(expr, local):
+        if expr.kind == 'name' and expr.value == expr.token.text:
+            return local.get(expr.value)
+        if (expr.kind == 'literal' and expr.extra.get('type') == 'string'
+                and re.fullmatch(r'"(?:[^"\\\r\n]|\\[^\r\n])*"', expr.value)):
+            return 'string'
+        if expr.kind == 'array' and expr.children and all(
+                row.kind == 'literal' and row.extra.get('type') == 'char' and character.fullmatch(row.value)
+                for row in expr.children):
+            return 'chars'
+        if expr.kind != 'call':
+            return expr.extra.get('kuma_byte_conversion')
+        if expr.value in ('std::string', '::std::string') and not expr.extra.get('types'):
+            return 'string'
+        if expr.value == expr.token.text == 'input':
+            types = expr.extra.get('types') or ()
+            kw = expr.extra.get('kwargs') or {}
+            if not expr.children:
+                string_type = len(types) == 1 and _mixed_set_scalar(types[0]) == 'std::string'
+                if string_type and not kw or set(kw) == {'mode'} and kw['mode'].value == '"line"' and (not types or string_type):
+                    return 'string'
+            if len(expr.children) == 1 and not kw and types in (['char'], ('char',)):
+                return 'chars'
+        return expr.extra.get('kuma_byte_conversion')
+
+    def conversion(expr, local):
+        if (expr.kind not in ('method', 'call', 'member') or len(expr.children) != 1
+                or expr.value != expr.token.text
+                or any(expr.extra.get(k) for k in ('pointer', 'kwargs', 'types'))):
+            return None
+        source = operand_type(expr.children[0], local)
+        if source == 'string' and (expr.kind == 'method' and expr.value == 'to_vec' and stock_vec
+                                   or expr.kind == 'call' and expr.value == 'vec' and ctor_vec):
+            expr.extra['kuma_byte_conversion'] = 'chars'
+            return 'chars'
+        if source == 'chars' and expr.kind == 'call' and expr.value == 'string' and ctor_str:
+            expr.extra['kuma_byte_conversion'] = 'string'
+            return 'string'
+        if source == 'chars' and expr.kind in ('method', 'member') and expr.value == 'to_str':
+            return 'string'  # The existing native-first .to_str path is unchanged.
+        return None
+
+    def expression(expr, local):
+        if expr.kind == 'call' and expr.value in ('print', 'debug'):
+            for child in expr.children:
+                expression(child, local)
+        elif expr.kind == 'method' and expr.children:
+            conversion(expr.children[0], local)
+        return conversion(expr, local)
+
+    for statements in blocks:
+        local = {}
+        for stmt in statements:
+            if stmt.token.line <= header:
+                continue
+            if stmt.kind.startswith('cpp_'):
+                local.clear()
+                continue
+            marked = None
+            if stmt.kind in ('declare', 'exprstmt', 'write'):
+                for child in stmt.children:
+                    marked = expression(child, local)
+            if stmt.kind != 'declare':
+                continue
+            annotation = re.sub(r'\s', '', stmt.extra.get('type') or '')
+            inferred = marked or (operand_type(stmt.children[0], local) if len(stmt.value) == 1 else None)
+            for name in stmt.value:
+                local.pop(name, None)
+            if len(stmt.value) != 1:
+                continue
+            if annotation == 'string' or annotation in ('str', 'std::string', '::std::string'):
+                inferred = 'string'
+            elif annotation in ('vec<char>', 'vector<char>', 'std::vector<char>', '::std::vector<char>'):
+                inferred = 'chars'
+            elif annotation:
+                inferred = None
+            if inferred:
+                local[stmt.value[0]] = inferred
+
+
+def mark_mixed_to_f64(nodes, parser):
+    """Lower only scalar numeric and string receivers whose spelling and scope are known."""
+    from .compiler import _TO_F64_METHODS
+
+    if not any(token.text in _TO_F64_METHODS for token in parser.tokens):
+        return
+    header = parser.stock_ac_header_line
+    if (header is None or re.search(r'\\[ \t]*(?:\r\n|\r|\n)', parser.source)
+            or any(t.text in ('kuma_rt', 'import', 'module') for t in parser.tokens)
+            or any(t.kind == 'CPP_DIRECTIVE' and t.text.strip() not in
+                   ('#include "ac.hpp"', '#include "ac_io.hpp"', '#include <bits/stdc++.h>')
+                   for t in parser.tokens)):
+        return
+
+    # Raw C++ is never passed to cpp_type; aliases can denote a local class.
+    primitive = r'(?:int|long[ \t]+long|float|double)'
+    std_string = r'(?:::)?std::string'
+    # A source-defined type or alias called std is not the stock namespace.
+    stock_string = not any(t.text == 'std' and parser.tokens[i + 1].text != '::'
+                           for i, t in enumerate(parser.tokens[:-1]))
+    raw_type = rf'{primitive}|{std_string}' if stock_string else primitive
+    declaration = re.compile(
+        rf'(?:(?:const|constexpr)[ \t]+)*({raw_type})[ \t]+([A-Za-z_]\w*)'
+        r'[ \t]*(?:=[^;{}]*)?;')
+    integer = re.compile(r"(?:0|[1-9](?:'?[0-9])*)(?:LL|ll)?")
+    digits = r"[0-9](?:'?[0-9])*"
+    floating = re.compile(rf"(?:{digits}\.(?:{digits})?|\.{digits})(?:[eE][+-]?{digits})?"
+                          rf"|{digits}[eE][+-]?{digits}")
+    checked_casts = {'i32', 'i64', 'll', 'f64', 'int', 'float', 'double'}
+
+    def operand_type(expr, known):
+        if expr.kind == 'name':
+            return known.get(expr.value) if expr.value == expr.token.text else None
+        if expr.kind == 'literal':
+            tag = expr.extra.get('type')
+            if (tag == 'i64' and integer.fullmatch(expr.value)
+                    or tag == 'f64' and floating.fullmatch(expr.value)):
+                return 'numeric'
+            if stock_string and tag == 'string' and re.fullmatch(r'"(?:[^"\\\r\n]|\\[^\r\n])*"', expr.value):
+                return 'string'
+            return None
+        if expr.kind in ('unary', 'postfix') and expr.value in ('+', '-', '++', '--'):
+            return 'numeric' if operand_type(expr.children[0], known) == 'numeric' else None
+        if expr.kind == 'binary' and expr.value in ('+', '-', '*', '/', '%'):
+            left, right = (operand_type(child, known) for child in expr.children)
+            return 'numeric' if left == right == 'numeric' else None
+        if (stock_string and expr.kind == 'call' and expr.value == expr.token.text == 'input'
+                and not expr.children and not expr.extra.get('kwargs')
+                and tuple(expr.extra.get('types') or ()) in (('string',), ('str',), ('std::string',))):
+            return 'string'
+        if (expr.kind not in ('call', 'method') or len(expr.children) != 1
+                or expr.value != expr.token.text
+                or any(expr.extra.get(k) for k in ('pointer', 'kwargs', 'types'))):
+            return None
+        if expr.kind == 'call':
+            # Existing explicit casts have numeric result types. Don't inspect
+            # their arguments: some calls preserve native operand spelling.
+            return 'numeric' if expr.value in checked_casts else None
+        if expr.value in _TO_F64_METHODS and (operand := operand_type(expr.children[0], known)):
+            expr.extra['kuma_to_f64'] = operand
+            return 'numeric'
+        return None
+
+    def evaluate(expr, known):
+        if expr.kind == 'call' and expr.value in ('print', 'debug'):
+            for child in expr.children:
+                operand_type(child, known)
+            return None
+        return operand_type(expr, known)
+
+    def block(statements):
+        known = {}
+        for stmt in statements:
+            if stmt.token.line <= header:
+                continue
+            if stmt.kind.startswith('cpp_'):
+                native = declaration.fullmatch(stmt.value.strip()) if stmt.kind == 'cpp_stmt' else None
+                if native:
+                    known[native[2]] = 'numeric' if re.fullmatch(primitive, native[1]) else 'string'
+                else:
+                    known.clear()
+                continue
+            if stmt.kind not in ('declare', 'exprstmt', 'write'):
+                # Don't infer through native islands, local shadowing or
+                # nested scopes in this first slice.
+                known.clear()
+                continue
+            results = [evaluate(child, known) for child in stmt.children]
+            if stmt.kind == 'declare':
+                for name in stmt.value:
+                    known.pop(name, None)
+                annotation = stmt.extra.get('type') or ''
+                # Checked declarations emit cpp_type(annotation), unlike raw
+                # C++ declarations where e.g. i32 can be a local type alias.
+                emitted = cpp_type(annotation) if annotation else ''
+                if len(stmt.value) == 1:
+                    name = stmt.value[0]
+                    if re.fullmatch(primitive, emitted):
+                        known[name] = 'numeric'
+                    elif stock_string and re.fullmatch(std_string, emitted):
+                        known[name] = 'string'
+                    elif not annotation and len(results) == 1 and results[0]:
+                        known[name] = results[0]
+
+    if not parser.has_native_main and not any(n.kind == 'main_entry' for n in nodes):
+        block(nodes)
+    for node in nodes:
+        if node.kind in {'main_entry', 'cpp_main'}:
+            block(node.extra.get('body', ()))
+        if node.kind == 'cpp_opaque_sections' and node.extra.get('main'):
+            sections = [s for s in node.extra['sections'] if s[0] == 'function']
+            if len(sections) == 1:
+                block(sections[0][1])
+
+
 def mark_iter_collect(nodes, tokens):
     """V1 proof: checked main: value expressions over explicitly proven vectors."""
     if any(t.kind == 'CPP_DIRECTIVE' and not re.match(r'#\s*include\b', t.text)
@@ -3833,6 +4608,11 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     if not mixed_main and not parser.has_native_main:
         lower_implicit_write(nodes, parser)
     mark_mixed_kth(nodes, parser)
+    mark_mixed_transpose(nodes, parser)
+    mark_mixed_set_conversions(nodes, parser)
+    mark_mixed_byte_conversions(nodes, parser)
+    mark_mixed_to_f64(nodes, parser)
+    mark_mixed_vector_index_calls(nodes, parser)
     mark_optional_collection_calls(nodes,
                                   masked_members=_cpp_stmt_masked_members(parser.tokens))
     emitter = emitter or CppEmitter(filename)
