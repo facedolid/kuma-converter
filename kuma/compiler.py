@@ -88,6 +88,18 @@ def windows_element(type_: Type) -> Type:
     return CHAR if source == STRING else source.args[0]
 
 
+def pairwise_view_operand(node: Node) -> Node | None:
+    if (node.kind == "method" and node.value == "pairwise_view" and len(node.children) == 1
+            and not any(node.extra.get(k) for k in ("pointer", "kwargs", "types"))):
+        return node.children[0]
+    return None
+
+
+def flat_pair_pattern(pattern: Node) -> bool:
+    return (pattern.kind == "bind_tuple" and len(pattern.children) == 2
+            and all(child.kind == "bind_name" for child in pattern.children))
+
+
 def direct_windows_width(node: Node, *, mixed: bool = False) -> Node | None:
     # Only spellings that lower directly to a windows adapter. Native mixed
     # methods may still win; the C++ helper checks the actual row type.
@@ -1287,7 +1299,7 @@ class Compiler(DeclarationSupport):
                 return True
         return False
 
-    def lower_function(self, function: Function, argument_types: list[Type], *, argument_values=None, observe=False) -> tuple[str, Type]:
+    def lower_function(self, function: Function, argument_types: list[Type], *, argument_values=None, observe=False, observe_from=0) -> tuple[str, Type]:
         node, params = function.node, function.node.extra["params"]
         if len(params) != len(argument_types):
             self.fail(f"引数は {len(params)} 個必要です（指定は {len(argument_types)} 個）", node)
@@ -1311,12 +1323,13 @@ class Compiler(DeclarationSupport):
         try:
             declarations = []
             for i, ((name, annotation), actual) in enumerate(zip(params, argument_types)):
+                observe_arg = observe and i >= observe_from
                 if pattern := node.extra.get("param_pattern"):
                     if actual.name not in ("tuple", "pair") or len(actual.args) != len(pattern.children):
                         self.fail("アロー関数の分割引数の名前と tuple・pair の要素数を一致させてください", pattern)
                     arg = self.fresh("arrow_tuple")
-                    self.bind_pattern(pattern, actual, arg, readonly=observe)
-                    declarations.append(f"{'const auto&' if observe else actual.cpp()} {arg}")
+                    self.bind_pattern(pattern, actual, arg, readonly=observe_arg)
+                    declarations.append(f"{'const auto&' if observe_arg else actual.cpp()} {arg}")
                     continue
                 if actual != FUNCTION:
                     self.owned(Value("", actual), node)
@@ -1338,14 +1351,14 @@ class Compiler(DeclarationSupport):
                     symbol.function = passed.function
                     continue
                 symbol = self.bind(name, target, node)
-                symbol.readonly = mode == "const" or observe
+                symbol.readonly = mode == "const" or observe_arg
                 if mode != "value" and argument_values is not None:
                     symbol.origins = argument_values[i].origins
                 if target == FUNCTION:
                     declarations.append(f"auto {symbol.code}")
                     continue
                 qualifier = ("const " if mode == "const" else "") + target.cpp() + ("&" if mode != "value" else "")
-                if observe and target == actual:
+                if observe_arg and target == actual:
                     qualifier = "const auto&"
                 declarations.append(f"{qualifier} {symbol.code}")
             if node.extra.get("expression"):
@@ -1369,6 +1382,23 @@ class Compiler(DeclarationSupport):
             self.scopes, self.return_types, self.loop_depth = old_scopes, old_returns, old_loop_depth
             self.return_expected = old_expected
 
+    def window_pattern_source(self, source: Node, pattern: Node) -> tuple[Node, Node | None]:
+        width = direct_windows_width(source) if pattern.kind == "bind_tuple" else None
+        if width is not None and not (width.kind == "literal" and width.extra.get("type") == "i64"):
+            source = Node(source.kind, source.token, source.value, source.children,
+                          {**source.extra, "kuma_windows_binding": len(pattern.children)})
+        return source, width
+
+    def bind_window_pattern(self, pattern: Node, row: Type, code: str, width: Node | None) -> None:
+        if width is None:
+            self.fail("windows の分割束縛は ... in a.windows(k) と直接書いてください", pattern)
+        if width.kind == "literal" and width.extra.get("type") == "i64":
+            literal = self.integer_literal(width)
+            if literal > 0 and literal != len(pattern.children):
+                self.fail("windows の幅と分割束縛の名前の数を一致させてください", pattern)
+        for i, child in enumerate(pattern.children):
+            self.bind_pattern(child, windows_element(row), f"{code}[{i}]", readonly=True)
+
     def comprehension(self, node: Node, expected: Type | None) -> Value:
         clauses = node.extra["clauses"]
         output = self.fresh("collected")
@@ -1387,15 +1417,20 @@ class Compiler(DeclarationSupport):
                 self.condition(condition, clause)
                 body, element = lower(index + 1)
                 return f"if ({condition.code}) {{\n{body}\n}}", element
-            sequence = self.expr(clause.children[0])
+            pattern = clause.extra["pattern"]
+            source_expr, width = self.window_pattern_source(clause.children[0], pattern)
+            sequence = self.expr(source_expr)
             is_sorted = sequence.type.name == "SortedList"
             item_type = sequence.type.args[0] if is_sorted or sequence.type.name == "deque" else self.iter_element(sequence.type, clause)
             source_name = self.fresh("iterable")
             item_name = self.fresh("item")
             self.scopes.append({})
             try:
-                self.bind_pattern(clause.extra["pattern"], item_type, item_name,
-                                  readonly=True, origins=frozenset() if is_sorted else sequence.origins)
+                if item_type.name == "window_row" and pattern.kind == "bind_tuple":
+                    self.bind_window_pattern(pattern, item_type, item_name, width)
+                else:
+                    self.bind_pattern(pattern, item_type, item_name,
+                                      readonly=True, origins=frozenset() if is_sorted else sequence.origins)
                 with self.protect(frozenset() if is_sorted else sequence.origins):
                     body, element = lower(index + 1)
             finally:
@@ -1768,6 +1803,7 @@ class Compiler(DeclarationSupport):
             self.fail("reduce(a,f,initial)、count(a,predicate_or_value)、any/all(a[,predicate]) と書いてください", node)
         sequence = self.expr(args[0])
         element = sequence.type.args[0] if name == "count" and sequence.type.name == "deque" else self.iter_element(sequence.type, node)
+        window_arity = 0
         with self.protect(sequence.origins):
             callback = self.expr(args[1]) if len(args) > 1 else None
             if name == "reduce":
@@ -1775,7 +1811,21 @@ class Compiler(DeclarationSupport):
                 self.owned(initial, node)
                 if callback is None or callback.function is None:
                     self.fail("reduceの第2引数は2引数の関数にしてください", node)
-                code, result = self.lower_function(callback.function, [initial.type, element])
+                params = callback.function.node.extra.get("params", ())
+                if node.kind == "method" and sequence.type.name == "windows_view" and len(params) > 2:
+                    if args[1].kind != "lambda" or any(annotation for _, annotation in params):
+                        self.fail("windows.reduce の分割引数は型なしのアロー関数を直接指定してください", args[1])
+                    window_arity = len(params) - 1
+                    width = direct_windows_width(args[0])
+                    if width and width.kind == "literal" and width.extra.get("type") == "i64":
+                        literal = self.integer_literal(width)
+                        if literal > 0 and literal != window_arity:
+                            self.fail("windows の幅と累積値を除いた引数の数を一致させてください", args[1])
+                    code, result = self.lower_function(callback.function,
+                        [initial.type, *([windows_element(element)] * window_arity)],
+                        observe=True, observe_from=1)
+                else:
+                    code, result = self.lower_function(callback.function, [initial.type, element])
                 self.coerce(Value("", result), initial.type, node)
             elif callback is not None and callback.function is not None:
                 code, result = self.lower_function(callback.function, [element])
@@ -1809,7 +1859,9 @@ class Compiler(DeclarationSupport):
             initial_name = self.fresh("initial")
             statements.append(f"{initial.type.cpp()} {initial_name} = {initial.code};")
             output = initial.type
-            expression = f"kuma_rt::fold<{element.cpp()}>({source_name}, {code}, std::move({initial_name}))"
+            expression = (f"{source_name}.reduce_fields<{window_arity}>({code}, std::move({initial_name}))"
+                          if window_arity else
+                          f"kuma_rt::fold<{element.cpp()}>({source_name}, {code}, std::move({initial_name}))")
         else:
             output = I64 if name == "count" else BOOL
             if name == "count" and callback.function is None:
@@ -2860,6 +2912,8 @@ class Compiler(DeclarationSupport):
             output = Type("vec", (source.type,))
             return self.ordered([source, width], output,
                                 lambda ns: f"::kuma_rt::chunks_copy({ns[0]}, {ns[1]})", borrow=True)
+        if name == "pairwise_view" and node.kind == "method":
+            self.fail("pairwise_view は for または lazy(...) の入力に直接使ってください", node)
         if name == "pairwise" and node.kind in ("call", "method"):
             if kwargs or len(args) != 1:
                 self.fail("pairwise(a) または a.pairwise() と書いてください", node)
@@ -4315,13 +4369,20 @@ class Compiler(DeclarationSupport):
             return result
         if kind in ("rep", "for"):
             source_expr = node.children[0]
+            pairwise = pairwise_view_operand(source_expr) if kind == "for" else None
             width = None
-            if kind == "for" and node.extra["pattern"].kind == "bind_tuple":
-                width = direct_windows_width(source_expr)
-                if width is not None and not (width.kind == "literal" and width.extra.get("type") == "i64"):
-                    source_expr = Node(source_expr.kind, source_expr.token, source_expr.value, source_expr.children,
-                                       {**source_expr.extra, "kuma_windows_binding": len(node.extra["pattern"].children)})
-            value = self.expr(source_expr)
+            if kind == "for":
+                source_expr, width = self.window_pattern_source(source_expr, node.extra["pattern"])
+            if pairwise is not None:
+                if not flat_pair_pattern(node.extra["pattern"]):
+                    self.fail("pairwise_view は for (x, y) in a.pairwise_view() と書いてください", node)
+                expected = Type("vec", (I64,)) if pairwise.kind == "array" and not pairwise.children else None
+                value = self.expr(pairwise, expected)
+                if value.type != STRING and not (value.type.name == "vec"
+                        and self.ordered_owned_type_supported(value.type.args[0])):
+                    self.fail("pairwise_view は対応する所有値の配列か文字列に使ってください", source_expr)
+            else:
+                value = self.expr(source_expr)
             self.scopes.append({})
             self.loop_depth += 1
             try:
@@ -4331,6 +4392,12 @@ class Compiler(DeclarationSupport):
                     sym = self.bind(node.value, I64, node)
                     limit = self.fresh("limit")
                     head = f"for (long long {sym.code} = 0, {limit} = kuma_rt::count({value.code}); {sym.code} < {limit}; ++{sym.code}) "
+                elif pairwise is not None:
+                    elem = CHAR if value.type == STRING else value.type.args[0]
+                    owner, row = self.fresh("adjacent_source"), self.fresh("adjacent_row")
+                    self.bind_pattern(node.extra["pattern"], Type("tuple", (elem, elem)), row, readonly=True)
+                    head = (f"for (auto&& {owner} = {value.code}; auto {row} : "
+                            f"::kuma_rt::BorrowedPairwiseView{{{owner}}}) ")
                 else:
                     elem = value.type.args[0] if value.type.name in ("SortedList", "deque") else self.iter_element(value.type, node)
                     declared = self.parse_type(node.extra["type"], node.token) if node.extra.get("type") and node.extra["type"] != "auto" else elem
@@ -4338,15 +4405,7 @@ class Compiler(DeclarationSupport):
                     item_name = self.fresh("item")
                     pattern = node.extra["pattern"]
                     if declared.name == "window_row" and pattern.kind == "bind_tuple":
-                        arity = len(pattern.children)
-                        if width is None:
-                            self.fail("windows の分割束縛は for (...) in a.windows(k) と直接書いてください", pattern)
-                        if width.kind == "literal" and width.extra.get("type") == "i64":
-                            literal = self.integer_literal(width)
-                            if literal > 0 and literal != arity:
-                                self.fail("windows の幅と分割束縛の名前の数を一致させてください", pattern)
-                        for i, child in enumerate(pattern.children):
-                            self.bind_pattern(child, windows_element(declared), f"{item_name}[{i}]", readonly=True)
+                        self.bind_window_pattern(pattern, declared, item_name, width)
                     else:
                         self.bind_pattern(pattern, declared, item_name)
                     source = f"({value.code}).snapshot()" if value.type.name == "SortedList" else value.code

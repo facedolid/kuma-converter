@@ -14,6 +14,7 @@ from .cpp_bodies import NativeBodies
 from .model import KumaError, Node, Token, safe_sorted_key, sorted_key_captures, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
 from .parser import QUEUE_STACK, RELATIONAL_OPERATORS, Parser, _BARE_CALLS, parse_interpolation
 from .power import CPP_POWER
+from .pipelines import lower_mixed_lazy, mixed_lazy_chain
 
 
 def _rep_paren_multiline_count_token(tokens, open_index: int, close_index: int):
@@ -1123,6 +1124,25 @@ class CppParser(InitializerSupport, Parser):
             self.position = begin
             return None
         return Node('cpp_bare_call', start, callee, args)
+
+    def for_iterable(self) -> Node:
+        # In a Kuma for header, a bare brace normally starts the body.
+        # A matched Type{...} immediately followed by member access is
+        # instead an unambiguous prefix of the iterable expression.
+        position = self.position
+        while self.tokens[position].text == '(':
+            position += 1
+        if self.tokens[position].kind != 'IDENT' or self.tokens[position + 1].text != '{':
+            return super().for_iterable()
+        closing = self.native_bodies.pairs.get(position + 1)
+        if closing is None or self.tokens[closing + 1].text not in ('.', '->'):
+            return super().for_iterable()
+        saved = getattr(self, '_brace_rhs_position', None)
+        self._brace_rhs_position = position
+        try:
+            return super().for_iterable()
+        finally:
+            self._brace_rhs_position = saved
 
     def rhs(self) -> Node:
         self.reject_ambiguous_local_input()
@@ -2281,6 +2301,13 @@ class CppEmitter:
             return f'const auto& {self.mark(pattern.value, pattern.token)} = {item};'
         return '\n'.join(self.pattern(child, f'std::get<{i}>({item})') for i, child in enumerate(pattern.children))
 
+    def window_pattern(self, pattern, item, arity):
+        if not arity:
+            return self.pattern(pattern, item)
+        return (f'::kuma_rt::check_window_binding<{arity}>({item});\n'
+                + '\n'.join(self.pattern(child, f'::kuma_rt::window_binding_element<{i}>({item})')
+                            for i, child in enumerate(pattern.children)))
+
     def callback(self, params, body, expression=True):
         args = ', '.join(f'{cpp_type(type_) if type_ else "auto"} {name}' for name, type_ in params)
         if expression:
@@ -2386,6 +2413,27 @@ class CppEmitter:
         extra = set(kwargs) - set(allowed)
         if extra: self.fail(node, '未対応のオプションです: ' + ', '.join(sorted(extra)))
 
+    def window_pattern_source(self, source, pattern):
+        from .compiler import direct_windows_width
+
+        width = direct_windows_width(source, mixed=True) if pattern.kind == 'bind_tuple' else None
+        if width is None:
+            return source, 0
+        literal = (width.value if width.kind == 'literal' and width.extra.get('type') == 'i64'
+                   and re.fullmatch(r"[1-9][0-9']*(?:ll|LL)?", width.value) else '0')
+        arity = len(pattern.children)
+        # Only the stock receiver fallback infers row width from the argument.
+        source = Node(source.kind, source.token, source.value, source.children,
+                      {**source.extra, 'kuma_windows_binding': (arity, literal)})
+        return source, arity
+
+    def comprehension_source(self, clause):
+        source, arity = self.window_pattern_source(clause.children[0], clause.extra['pattern'])
+        code = self.expr(source)
+        if arity:
+            code = f'::kuma_rt::validate_window_binding_range<{arity}>({code})'
+        return f'kuma_rt::mixed_iteration_range({code})', arity
+
     def comprehension_type(self, node):
         """Mirror cpp_collect's const-reference bindings without any callbacks.
 
@@ -2396,20 +2444,21 @@ class CppEmitter:
         saved = self.type_bindings
         self.type_bindings = dict(saved)
 
-        def bind(pattern, expression):
+        def bind(pattern, expression, window=False):
             if pattern.kind == 'bind_name':
                 self.type_bindings[pattern.value] = expression
             else:
                 for index, child in enumerate(pattern.children):
-                    bind(child, f'std::get<{index}>({expression})')
+                    get = '::kuma_rt::window_binding_element' if window else 'std::get'
+                    bind(child, f'{get}<{index}>({expression})')
 
         try:
             for clause in node.extra['clauses']:
                 if clause.kind != 'comp_for': continue
-                source = 'kuma_rt::mixed_iteration_range(' + self.expr(clause.children[0]) + ')'
+                source, arity = self.comprehension_source(clause)
                 item = ('std::declval<const kuma_rt::cpp_item<'
                         'std::remove_cvref_t<decltype(' + source + ')>>&>()')
-                bind(clause.extra['pattern'], item)
+                bind(clause.extra['pattern'], item, window=bool(arity))
             mapped = self.expr(node.children[0])
             return 'std::declval<std::vector<std::decay_t<decltype(' + mapped + ')>>>()'
         finally:
@@ -2423,7 +2472,8 @@ class CppEmitter:
             clause = clauses[index]
             if clause.kind != 'comp_for': self.fail(clause, '内包表記はforで開始してください')
             item = self.fresh('item')
-            bind = self.pattern(clause.extra['pattern'], item)
+            source, arity = self.comprehension_source(clause)
+            bind = self.window_pattern(clause.extra['pattern'], item, arity)
             predicates = []
             next_ = index + 1
             while next_ < len(clauses) and clauses[next_].kind == 'comp_if':
@@ -2432,11 +2482,15 @@ class CppEmitter:
             predicate = '[&](const auto& ' + item + ') { ' + bind + ' return ' + (' && '.join(f'({p})' for p in predicates) or 'true') + '; }'
             mapper = '[&](const auto& ' + item + ') { ' + bind + ' return ' + (lower(next_) if next_ < len(clauses) else self.expr(node.children[0])) + '; }'
             function = 'cpp_flat_collect' if next_ < len(clauses) else 'cpp_collect'
-            return f'kuma_rt::{function}(kuma_rt::mixed_iteration_range({self.expr(clause.children[0])}), {mapper}, {predicate})'
+            return f'kuma_rt::{function}({source}, {mapper}, {predicate})'
         return lower(0)
 
     def expr(self, node, expected=None, *, native=False):
         kind, value = node.kind, node.value
+        if not native and kind == 'method' and mixed_lazy_chain(node):
+            if self.type_probe:
+                self.fail(node, '混在lazyは実行ブロック内の式に使用してください')
+            return lower_mixed_lazy(self, node)
         if not native and not self.type_probe and node.extra.get('kuma_iter_collect'):
             source, pred, mapper, count = node.extra['kuma_iter_collect']
             incoming, snapshot, predicate, transform = (
@@ -2770,12 +2824,29 @@ class CppEmitter:
                                          {**owner.extra, 'kuma_windows_binding': (tuple_arrow_arity, literal)})
                             children = [owner, children[1]]
 
+            windows_reduce_arity = 0
+            if (not native and kind == 'method' and value == 'reduce' and len(children) == 3
+                    and not node.extra.get('pointer') and not node.extra.get('types') and not kw
+                    and children[1].kind == 'lambda' and not children[1].extra.get('param_pattern')):
+                params = children[1].extra['params']
+                if len(params) > 2 and all(annotation is None for _, annotation in params):
+                    from .compiler import direct_windows_width
+                    windows_reduce_arity = len(params) - 1
+                    owner = children[0]
+                    width = direct_windows_width(owner, mixed=True)
+                    literal = tuple_get_literal(width) if width is not None else -1
+                    if literal > 0:
+                        owner = Node(owner.kind, owner.token, owner.value, owner.children,
+                                     {**owner.extra, 'kuma_windows_binding': (windows_reduce_arity, literal)})
+                        children = [owner, *children[1:]]
+
             args = [self.expr(c, native=(native_args and not (
                         not native and (c.kind == 'method' and (c.value in extension_members
                                                                 or adjacent_chain(c)
                                                                 or c.extra.get('kuma_kth_proven')
                                                                 or c.extra.get('kuma_transpose_proven'))
                                         or c.kind == 'call' and c.value in PROJECTED_EXTREMA
+                                        or c.kind == 'method' and mixed_lazy_chain(c)
                                         or c.kind == 'member' and c.value == 'to_str'
                                         or windows_index(c)
                                         or c.extra.get('kuma_set_from_vector')
@@ -2788,6 +2859,19 @@ class CppEmitter:
                 member = 'true' if kind == 'method' else 'false'
                 return (f'::kuma_rt::cpp_map_filter_tuple_arrow<{tuple_arrow_arity}, {filtering}, {member}>'
                         f'({args[0]}, {args[1]})')
+            if windows_reduce_arity:
+                # The receiver is evaluated before the seed, and a native
+                # method retains the original flat callback and value category.
+                seed = children[2]
+                if seed.kind == 'unary' and seed.value == '-':
+                    seed = seed.children[0]
+                # Unadorned integer literals are i64 in Kuma, but native
+                # methods must see the original C++ seed type.
+                integer_literal = (seed.kind == 'literal' and seed.extra.get('type') == 'i64'
+                                   and re.fullmatch(r"[0-9][0-9']*", seed.value) is not None
+                                   and tuple_get_literal(seed) >= 0)
+                return (f'::kuma_rt::windows_reduce_receiver<{windows_reduce_arity}, '
+                        f'{str(integer_literal).lower()}>({args[0]}).reduce({args[1]}, {args[2]})')
             # Forwarding an unproven native callback or a braced argument can
             # change deduction. Only an inline or locally proved Kuma arrow
             # opts into projected extrema fallback.
@@ -3038,7 +3122,7 @@ class CppEmitter:
                        'discard_line': 'discard_line'}
             if value in helpers: return 'kuma_rt::' + helpers[value] + '(' + ', '.join(args) + ')'
             if value in {'min', 'max', 'abs'}: return 'std::' + value + '(' + ', '.join(args) + ')'
-            if value in {'lazy', 'zip_view', 'enumerate_view'}: self.fail(node, '混在モードの遅延ビューはまだ未対応です')
+            if value in {'zip_view', 'enumerate_view'}: self.fail(node, '混在モードの遅延ビューはまだ未対応です')
             if value in {'i32', 'i64', 'll', 'f64'}:
                 if len(args) != 1: self.fail(node, '数値変換は1引数です')
                 return f'kuma_rt::numeric_cast<{cpp_type(value)}>({args[0]})'
@@ -3307,29 +3391,24 @@ class CppEmitter:
                 header = 'for ' + node.value
             return prefix + header + ' {\n' + self.statements(node.extra['body']) + '\n}'
         if kind == 'for':
-            from .compiler import direct_windows_width
+            from .compiler import direct_windows_width, flat_pair_pattern, pairwise_view_operand
             item = self.fresh('item')
             pattern = node.extra['pattern']
             source = node.children[0]
             body = node.extra['body']
+            if (pairwise := pairwise_view_operand(source)) is not None:
+                pair = str(flat_pair_pattern(pattern)).lower()
+                # Keep the operand in the C++23 range-initializer: temporary
+                # owners of borrowed reference results then outlive the loop.
+                iterable = f'::kuma_rt::cpp_member_pairwise_view<{pair}>({self.expr(pairwise)})'
+                return (prefix + f'for (auto {item} : '
+                        f'kuma_rt::mixed_iteration_range({iterable})) {{\n' + self.pattern(pattern, item)
+                        + '\n' + self.statements(body) + '\n}')
             width = direct_windows_width(source, mixed=True)
             if width is not None and pattern.kind == 'bind_name':
                 body = window_body_bindings(body, pattern.value)
-            if width is not None and pattern.kind == 'bind_tuple':
-                # Prove only positive decimal integer literals here. Other
-                # widths use the actual row size; native tuple rows are untouched.
-                literal = (width.value if width.kind == 'literal' and width.extra.get('type') == 'i64'
-                           and re.fullmatch(r"[1-9][0-9']*(?:ll|LL)?", width.value) else '0')
-                arity = len(pattern.children)
-                # Reuse windows' native-first receiver adapter. Only the
-                # fallback adapter may infer its row width from the argument.
-                source = Node(source.kind, source.token, source.value, source.children,
-                              {**source.extra, 'kuma_windows_binding': (arity, literal)})
-                bindings = f'::kuma_rt::check_window_binding<{arity}>({item});\n'
-                bindings += '\n'.join(self.pattern(child, f'::kuma_rt::window_binding_element<{i}>({item})')
-                                      for i, child in enumerate(pattern.children))
-            else:
-                bindings = self.pattern(pattern, item)
+            source, arity = self.window_pattern_source(source, pattern)
+            bindings = self.window_pattern(pattern, item, arity)
             return prefix + f'for (auto {item} : kuma_rt::mixed_iteration_range({self.expr(source)})) {{\n' + bindings + '\n' + self.statements(body) + '\n}'
         if kind == 'rep':
             limit = self.fresh('limit'); name = node.value
@@ -3972,10 +4051,10 @@ def mark_mixed_kth(nodes, parser, *, source_parser=None):
     return sites
 
 
-def mark_mixed_extrema_keys(nodes, parser):
+def mark_mixed_local_arrows(nodes, parser):
     """Recognize an earlier, unambiguous Kuma arrow in the same block."""
     from .compiler import PROJECTED_EXTREMA
-    if not any(token.text in PROJECTED_EXTREMA for token in parser.tokens):
+    if not any(token.text in PROJECTED_EXTREMA or token.text == 'lazy' for token in parser.tokens):
         return
     if re.search(r'(?m)^[ \t]*%:|\\[ \t]*\n', parser.source):
         return  # Untracked preprocessing can replace these tokens.
@@ -3995,11 +4074,25 @@ def mark_mixed_extrema_keys(nodes, parser):
             if (plain_name(key) in names
                     and not (source.kind == 'cpp_expr' and source.value.lstrip().startswith('{'))):
                 value.extra['kuma_extrema_key_proven'] = True
+        if value.kind == 'method' and 'lazy' not in macros and mixed_lazy_chain(value):
+            stage = value
+            while stage.kind == 'method':
+                index = 2 if stage.value == 'fold' else 1
+                if (stage.value in {'map', 'filter', 'fold', 'min_by', 'max_by'} - macros
+                        and len(stage.children) == index + 1
+                        and not any(stage.extra.get(k) for k in ('kwargs', 'types', 'pointer'))
+                        and (arity := names.get(plain_name(stage.children[index]))) in (index, index + 1)):
+                    stage.extra['kuma_lazy_callback_proven'] = arity
+                for operand in stage.children[1:]:
+                    expression(operand, names)
+                stage = stage.children[0]
+            expression(stage, names)
+            return
         for child in value.children:
             expression(child, names)
 
     def block(statements):
-        names = set()
+        names = {}
         for stmt in statements:
             if stmt.kind.startswith('cpp_'):
                 names.clear()
@@ -4008,16 +4101,21 @@ def mark_mixed_extrema_keys(nodes, parser):
             for child in stmt.children:
                 expression(child, names)
             if stmt.kind == 'declare':
-                names.difference_update(stmt.value)
+                for name in stmt.value:
+                    names.pop(name, None)
                 if (len(stmt.value) == len(stmt.children) == 1
                         and not (stmt.extra.get('type') or stmt.extra.get('types'))
                         and stmt.children[0].kind == 'lambda' and stmt.value[0] not in macros):
-                    names.add(stmt.value[0])
+                    arrow = stmt.children[0]
+                    names[stmt.value[0]] = (len(arrow.extra.get('params', ()))
+                                              if not arrow.extra.get('param_pattern') else -1)
             elif stmt.kind == 'assign':
-                names.discard(plain_name(stmt.children[0]))
+                names.pop(plain_name(stmt.children[0]), None)
             if stmt.kind in {'if', 'while', 'for', 'rep'}:
                 for field in ('body', 'else'):
                     block(stmt.extra.get(field, ()))
+                names.clear()
+            elif stmt.kind == 'try':
                 names.clear()
 
     if not parser.has_native_main and not any(node.kind == 'main_entry' for node in nodes):
@@ -4930,7 +5028,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     if not mixed_main and not parser.has_native_main:
         lower_implicit_write(nodes, parser)
     mark_mixed_kth(nodes, parser)
-    mark_mixed_extrema_keys(nodes, parser)
+    mark_mixed_local_arrows(nodes, parser)
     mark_mixed_transpose(nodes, parser)
     mark_mixed_set_conversions(nodes, parser)
     mark_mixed_byte_conversions(nodes, parser)

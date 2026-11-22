@@ -554,13 +554,16 @@ class Parser:
                 self.expect(")", "C形式のforは未対応です。範囲forまたはrepを使ってください")
                 self.group_depth -= 1
                 self.expect("in")
-                iterable = self.expression()
+                iterable = self.for_iterable()
         else:
             pattern = self.binding_pattern()
             self.expect("in", "範囲forは for x in iterable と書いてください")
-            iterable = self.expression()
+            iterable = self.for_iterable()
         return Node("for", start, pattern.value, [iterable],
                     {"body": self.block(start), "type": declared_type, "pattern": pattern})
+
+    def for_iterable(self) -> Node:
+        return self.expression()
 
     def restore_type_trial(self, position: int, depth: int, split_mark: int) -> None:
         self.position = position
