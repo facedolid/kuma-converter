@@ -4052,7 +4052,7 @@ def mark_mixed_kth(nodes, parser, *, source_parser=None):
     return sites
 
 
-def mark_mixed_local_arrows(nodes, parser):
+def mark_mixed_local_arrows(nodes, parser, lazy_map_definitions=None):
     """Recognize an earlier, unambiguous Kuma arrow in the same block."""
     from .compiler import PROJECTED_EXTREMA
     if not any(token.text in PROJECTED_EXTREMA or token.text == 'lazy' for token in parser.tokens):
@@ -4071,6 +4071,13 @@ def mark_mixed_local_arrows(nodes, parser):
         index > 0 and parser.tokens[index - 1].text == ':='
         and (parser.tokens[index + 1].text == '<' or parser.tokens[index + 1].kind in {'NEWLINE', 'EOF'})
         for index, token in enumerate(parser.tokens) if token.text == 'input')
+
+    unshadowed_std = all(token.text != 'std' or parser.tokens[index + 1].text == '::'
+                         for index, token in enumerate(parser.tokens))
+    native_vector = re.compile(
+        r'[ \t]*(?:const[ \t]+)?(?P<global>::)?std[ \t]*::[ \t]*vector[ \t]*<[ \t]*'
+        r'(?:int|long[ \t]+long|double|bool|char)[ \t]*>[ \t]+(?P<name>[A-Za-z_]\w*)[ \t]*'
+        r'(?:(?:=[ \t]*)?\{[^;{}]*\}|\([ \t]*[0-9]+[ \t]*\))?;[ \t]*')
 
     def stock_input(value):
         return (safe_input and value.kind == 'call' and value.value == value.token.text == 'input'
@@ -4092,7 +4099,7 @@ def mark_mixed_local_arrows(nodes, parser):
             return value.value
         return None
 
-    def expression(value, names, stock):
+    def expression(value, names, stock, scalars):
         if value.kind in {'lambda', 'comprehension'} or value.kind.startswith('cpp_'):
             return
         if (value.kind in ('call', 'method') and value.value in PROJECTED_EXTREMA - macros
@@ -4116,55 +4123,78 @@ def mark_mixed_local_arrows(nodes, parser):
                 index = 2 if stage.value == 'fold' else 1
                 if (stage.value in {'map', 'filter', 'fold', 'min_by', 'max_by'} - macros
                         and len(stage.children) == index + 1
-                        and not any(stage.extra.get(k) for k in ('kwargs', 'types', 'pointer'))
-                        and (arity := names.get(plain_name(stage.children[index]))) in (index, index + 1)):
-                    stage.extra['kuma_lazy_callback_proven'] = arity
+                        and not any(stage.extra.get(k) for k in ('kwargs', 'types', 'pointer'))):
+                    binding = names.get(plain_name(stage.children[index]))
+                    if binding and binding[0] in (index, index + 1):
+                        stage.extra['kuma_lazy_callback_proven'] = binding[0]
+                        if lazy_map_definitions is not None and stage.value == 'map':
+                            captured = {name: expr for name, expr in binding[2].items()
+                                        if scalars.get(name) is expr}
+                            lazy_map_definitions[id(stage)] = (binding[1], captured)
+                    elif (lazy_map_definitions is not None and stage.value == 'map'
+                          and stage.children[1].kind == 'lambda'):
+                        lazy_map_definitions[id(stage)] = (stage.children[1], dict(scalars))
                 for operand in stage.children[1:]:
-                    expression(operand, names, stock)
+                    expression(operand, names, stock, scalars)
                 stage = stage.children[0]
             for operand in stage.children:
-                expression(operand, names, stock)
+                expression(operand, names, stock, scalars)
             return
         for child in value.children:
-            expression(child, names, stock)
+            expression(child, names, stock, scalars)
 
     def block(statements):
         names = {}
         stock = set()
+        scalars = {}
         for stmt in statements:
             if stmt.kind.startswith('cpp_'):
                 names.clear()
                 stock.clear()
+                scalars.clear()
+                if safe_member and stmt.kind == 'cpp_stmt':
+                    declaration = native_vector.fullmatch(stmt.value)
+                    if (declaration and declaration['name'] not in macros
+                            and (declaration['global'] or unshadowed_std)):
+                        stock.add(declaration['name'])
                 continue
             # Initializers use earlier bindings; introduce the new name after.
             for child in stmt.children:
-                expression(child, names, stock)
+                expression(child, names, stock, scalars)
             if stmt.kind == 'declare':
                 for name in stmt.value:
                     names.pop(name, None)
                     stock.discard(name)
+                    scalars.pop(name, None)
                 if (len(stmt.value) == len(stmt.children) == 1
                         and not (stmt.extra.get('type') or stmt.extra.get('types'))
                         and stmt.children[0].kind == 'lambda' and stmt.value[0] not in macros):
                     arrow = stmt.children[0]
-                    names[stmt.value[0]] = (len(arrow.extra.get('params', ()))
-                                              if not arrow.extra.get('param_pattern') else -1)
+                    arity = len(arrow.extra.get('params', ())) if not arrow.extra.get('param_pattern') else -1
+                    names[stmt.value[0]] = (arity, arrow, dict(scalars) if lazy_map_definitions is not None else None)
                 if (len(stmt.value) == len(stmt.children) == 1
                         and not (stmt.extra.get('type') or stmt.extra.get('types'))
                         and stmt.value[0] not in macros
                         and (stock_literal(stmt.children[0]) or stock_input(stmt.children[0]))):
                     stock.add(stmt.value[0])
+                if (lazy_map_definitions is not None and len(stmt.value) == len(stmt.children) == 1
+                        and not (stmt.extra.get('type') or stmt.extra.get('types'))
+                        and stmt.value[0] not in macros and stmt.children[0].kind == 'literal'):
+                    scalars[stmt.value[0]] = stmt.children[0]
             elif stmt.kind == 'assign':
                 names.pop(plain_name(stmt.children[0]), None)
                 stock.discard(plain_name(stmt.children[0]))
+                scalars.pop(plain_name(stmt.children[0]), None)
             if stmt.kind in {'if', 'while', 'for', 'rep'}:
                 for field in ('body', 'else'):
                     block(stmt.extra.get(field, ()))
                 names.clear()
                 stock.clear()
+                scalars.clear()
             elif stmt.kind == 'try':
                 names.clear()
                 stock.clear()
+                scalars.clear()
 
     if not parser.has_native_main and not any(node.kind == 'main_entry' for node in nodes):
         block(nodes)
@@ -5060,7 +5090,7 @@ def validate_mixed_main_entries(nodes: list[Node], parser: CppParser) -> Node | 
 
 
 def transpile_cpp(source: str, filename: str, *, emitter=None,
-                  native_checked: bool = False) -> str:
+                  native_checked: bool = False, lazy_map_definitions=None) -> str:
     from .native_cpp import native_cpp
     if not native_checked and native_cpp(source, filename):
         return emitter.mark(source, Token('CPP_LITERAL', source, 1, 1, 0)) if emitter else source
@@ -5076,7 +5106,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     if not mixed_main and not parser.has_native_main:
         lower_implicit_write(nodes, parser)
     mark_mixed_kth(nodes, parser)
-    mark_mixed_local_arrows(nodes, parser)
+    mark_mixed_local_arrows(nodes, parser, lazy_map_definitions)
     mark_mixed_transpose(nodes, parser)
     mark_mixed_set_conversions(nodes, parser)
     mark_mixed_byte_conversions(nodes, parser)
