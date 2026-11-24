@@ -17,7 +17,7 @@ import re
 from .pipelines import lazy_root, lower_pipeline, pure_expression
 from .declarations import DeclarationSupport
 from .model import KumaError, Node, Token, safe_sorted_key, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
-from .parser import QUEUE_STACK, parse
+from .parser import FIXED_MODULI, QUEUE_STACK, parse
 from .runtime import CPP_RUNTIME
 from .power import CPP_POWER
 
@@ -26,12 +26,17 @@ from .power import CPP_POWER
 class Type:
     name: str
     args: tuple["Type", ...] = ()
+    callbacks: tuple[str, ...] = ()
 
     def cpp(self) -> str:
         scalar = {"i64": "long long", "i32": "int", "f64": "double",
                   "string": "std::string", "bool": "bool", "char": "char",
                   "void": "void", "range": "kuma_rt::Range", "union_find": "::UnionFind",
-                  "dynamic_bitset": "kuma_rt::DynamicBitset", "dfs_result": "::DfsResult"}
+                  "weighted_union_find": "::CheckedWeightedUnionFind",
+                  "dynamic_bitset": "kuma_rt::DynamicBitset", "dfs_result": "::DfsResult",
+                  "heavy_light": "::HeavyLightDecomposition"}
+        if self.name in FIXED_MODULI:
+            return f"::atcoder::static_modint<{FIXED_MODULI[self.name]}>"
         if self.name.startswith("record:"):
             return "kuma_gen_type_" + self.name.removeprefix("record:")
         if self.name in scalar:
@@ -42,6 +47,27 @@ class Type:
             return f"std::priority_queue<{element}, std::vector<{element}>, std::{comparator}<{element}>>"
         if self.name == "coordinate_compressor":
             return "::CoordinateCompressor<long long>"
+        if self.name == "two_sat":
+            return "::kuma_rt::CheckedTwoSat"
+        if self.name == "max_flow":
+            return "::CheckedMaxFlow"
+        if self.name == "min_cost_flow":
+            return "::CheckedMinCostFlow"
+        if self.name == "range_assign_range_min":
+            return "::RangeAssignRangeMin"
+        if self.name == LAZY_SEGMENT_TREE:
+            arguments = [t.cpp() for t in self.args] + list(self.callbacks)
+            return "::ac_detail::algorithm::checked_lazy_segment_tree<" + ", ".join(arguments) + ">"
+        if self.name == "range_assign_range_sum":
+            return "::RangeAssignRangeSum"
+        if self.name == WEIGHTED_WAVELET_MATRIX:
+            return f"::WeightedWaveletMatrix<{self.args[0].cpp()}>"
+        if self.name == WAVELET_MATRIX:
+            return f"::WaveletMatrix<{self.args[0].cpp()}>"
+        if self.name == RANGE_MIN_STATIC:
+            return f"::RangeMinStatic<{self.args[0].cpp()}>"
+        if self.name == "range_add_range_sum":
+            return "::RangeAddRangeSum"
         if self.name == "range_fenwick":
             return "::RangeFenwick<long long>"
         if self.name == "fenwick":
@@ -113,6 +139,20 @@ def contains_windows_type(type_: Type) -> bool:
     return type_.name in WINDOWS_TYPES or any(contains_windows_type(t) for t in type_.args)
 
 
+FIXED_MODINTS = {name: Type(name) for name in FIXED_MODULI}
+RANGE_ADD_RANGE_SUM = Type("range_add_range_sum")
+RANGE_ASSIGN_RANGE_MIN = Type("range_assign_range_min")
+RANGE_ASSIGN_RANGE_SUM = Type("range_assign_range_sum")
+LAZY_SEGMENT_TREE = "lazy_segment_tree"
+RANGE_MIN_STATIC = "range_min_static"
+WAVELET_MATRIX = "wavelet_matrix"
+WEIGHTED_WAVELET_MATRIX = "weighted_wavelet_matrix"
+WAVELET_MATRICES = frozenset({WAVELET_MATRIX, WEIGHTED_WAVELET_MATRIX})
+WEIGHTED_UNION_FIND = Type("weighted_union_find")
+TWO_SAT = Type("two_sat")
+MAX_FLOW = Type("max_flow")
+MIN_COST_FLOW = Type("min_cost_flow")
+HEAVY_LIGHT = Type("heavy_light")
 NUMBER = (I32, I64, F64)
 ARG_EXTREMA = frozenset({"argmin", "argmax"})
 VALUE_EXTREMA = frozenset({"min_by", "max_by"})
@@ -132,16 +172,18 @@ RESERVED = {
     "range", "SortedList",
     "input", "print", "read", "write", "if", "else", "while", "for", "in", "rep", "break",
     "EOF", "continue", "return", "true", "false", "auto", "long", "void", "tuple",
-    "i64", "i32", "f64", "bool", "char", "string", "vec", *ALIASES,
+    "i64", "i32", "f64", "bool", "char", "string", "vec", *FIXED_MODINTS, RANGE_ADD_RANGE_SUM.name, RANGE_ASSIGN_RANGE_MIN.name, RANGE_ASSIGN_RANGE_SUM.name, RANGE_MIN_STATIC, *WAVELET_MATRICES, TWO_SAT.name, MAX_FLOW.name, MIN_COST_FLOW.name, HEAVY_LIGHT.name, *ALIASES,
     "len", "size", "sum", "sort", "sorted", "reverse", "reversed", "min",
     "max", "discard_line", "debug", "map", "filter",
     "zip", "enumerate", "lazy", "zip_view", "enumerate_view", "set", "dict", "pair", "contains", "fn", "def", "function", "struct", "class", "namespace", "using",
     "template", "abs", "flush", "reduce", "any", "all", "count", "some", "every",
 }
+LCP_ARRAY_BYTES = "lcp_array_bytes"
+BYTE_STRING_METHODS = frozenset({"suffix_array_bytes", "z_algorithm_bytes", LCP_ARRAY_BYTES})
 _NUMERIC_BOUNDARIES = frozenset({"first_true", "last_true"})
 BUILTINS = {
-    *QUEUE_STACK, *_NUMERIC_BOUNDARIES, *PROJECTED_EXTREMA,
-    "range", "SortedList", "deque", "count_by", "sum_by_key", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "prefix_sum", "prefix_scan", "prefix_sum2d", "prefix2d", "range_sum", "lower_bound_idx", "upper_bound_idx", "equal_range_idx", "has_bit", "bit_count", "bit_ctz", "rotate90", "transpose", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices", "frequencies", "read_graph", "read_weighted_graph", "bfs_dist", "dijkstra_dist", "bfs_path", "dijkstra_path",
+    *QUEUE_STACK, *BYTE_STRING_METHODS, *_NUMERIC_BOUNDARIES, *PROJECTED_EXTREMA, LAZY_SEGMENT_TREE, *FIXED_MODINTS, RANGE_ADD_RANGE_SUM.name, RANGE_ASSIGN_RANGE_MIN.name, RANGE_ASSIGN_RANGE_SUM.name, RANGE_MIN_STATIC, *WAVELET_MATRICES, TWO_SAT.name, MAX_FLOW.name, MIN_COST_FLOW.name, HEAVY_LIGHT.name,
+    "rerooting", "range", "SortedList", "deque", "count_by", "sum_by_key", "sorted_by", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "weighted_union_find", "dynamic_bitset", "find_idx", "prefix_sum", "prefix_scan", "prefix_sum2d", "prefix2d", "range_sum", "lower_bound_idx", "upper_bound_idx", "equal_range_idx", "has_bit", "bit_count", "bit_ctz", "rotate90", "transpose", "segment_tree", "dfs", "dfs_forest", "union_find", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "inv_mod", "convolution998", "convolution_ll", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices", "frequencies", "read_graph", "read_weighted_graph", "bfs_dist", "dijkstra_dist", "bfs_path", "dijkstra_path",
     "input", "print", "len", "size", "sum", "sort", "sorted", "reverse",
     "reversed", "min", "max", "discard_line", "map", "filter",
     "i32", "int", "i64", "ll", "f64", "double", "zip", "enumerate", "pairwise", "chunks", "windows", "lazy", "zip_view", "enumerate_view",
@@ -212,14 +254,34 @@ def parse_type(text: str, token: Token, *, records=None, allow_owned_heaps=False
             return Type("min_heap", (I64,))
         if not args and name == "coordinate_compressor":
             return Type("coordinate_compressor", (I64,))
+        if not args and name == TWO_SAT.name:
+            return TWO_SAT
+        if not args and name == MAX_FLOW.name:
+            return MAX_FLOW
+        if not args and name == MIN_COST_FLOW.name:
+            return MIN_COST_FLOW
+        if not args and name == HEAVY_LIGHT.name:
+            return HEAVY_LIGHT
+        if not args and name == RANGE_ASSIGN_RANGE_MIN.name:
+            return RANGE_ASSIGN_RANGE_MIN
+        if not args and name == RANGE_ASSIGN_RANGE_SUM.name:
+            return RANGE_ASSIGN_RANGE_SUM
+        if name in ({RANGE_MIN_STATIC} | WAVELET_MATRICES) and len(args) == 1 and args[0] in INTEGER:
+            return Type(name, tuple(args))
+        if not args and name == RANGE_ADD_RANGE_SUM.name:
+            return RANGE_ADD_RANGE_SUM
         if not args and name == "range_fenwick":
             return Type("range_fenwick", (I64,))
         if not args and name == "fenwick":
             return Type("fenwick", (I64,))
         if not args and name == "union_find":
             return Type("union_find")
+        if not args and name == WEIGHTED_UNION_FIND.name:
+            return WEIGHTED_UNION_FIND
         if not args and name == "dfs_result":
             return Type("dfs_result")
+        if not args and name in FIXED_MODINTS:
+            return FIXED_MODINTS[name]
         if not args and name in {"i64", "i32", "f64", "bool", "char", "string", "void"}:
             return Type(name)
         raise KumaError(f"現在は未対応の型です: {text}", token)
@@ -463,6 +525,21 @@ def emit_mixed_binary(op: str, left_expr, right_expr, fresh, *, type_probe=False
 _SEQUENCE_ARITHMETIC_METHODS = frozenset({"dot", "mul_each", "concat", "repeat"})
 
 _VECTOR_ASSIGN_METHODS = frozenset({"add_assign", "sub_assign"})
+
+
+def emit_mixed_lcp_array_bytes(recv_expr, arg_expr, fresh, *, type_probe=False):
+    left, right = (fresh(suffix) for suffix in ("lcp_text", "lcp_suffixes"))
+    tl, tr = (fresh(suffix) for suffix in ("lcp_text_type", "lcp_suffixes_type"))
+    force_l, force_r = f"std::forward<{tl}>({left})", f"std::forward<{tr}>({right})"
+    native = f"({force_l}).{LCP_ARRAY_BYTES}({force_r})"
+    body = (f"if constexpr (requires {{ {native}; }}) return {native}; "
+            f"else if constexpr (std::is_same_v<std::remove_cvref_t<{tl}>, std::string> "
+            f"&& std::is_same_v<std::remove_cvref_t<{tr}>, std::vector<int>> "
+            f"&& !std::is_volatile_v<std::remove_reference_t<{tl}>> "
+            f"&& !std::is_volatile_v<std::remove_reference_t<{tr}>>) "
+            f"return (::kuma_rt::{LCP_ARRAY_BYTES})({force_l}, {force_r}); else return {native};")
+    return _emit_mixed_ordered_pair(fresh, recv_expr, arg_expr, left, right, tl, tr, body,
+                                    type_probe=type_probe)
 
 
 def emit_mixed_sequence_method(name, recv_expr, arg_expr, fresh, *, type_probe=False):
@@ -733,8 +810,17 @@ class Compiler(DeclarationSupport):
         self.line_directives = True
         self.optimize = optimize
         self.uses_power = False
+        self.acl_modints: set[str] = set()
+        self.uses_acl_range_add_range_sum = False
+        self.uses_acl_range_assign_range_min = False
+        self.uses_acl_range_assign_range_sum = False
+        self.uses_acl_lazy_segment_tree = False
+        self.uses_acl_two_sat = False
+        self.uses_acl_max_flow = False
+        self.uses_acl_min_cost_flow = False
         self.uses_graph = False
         self.uses_math = False
+        self.uses_convolution998 = False
         self.uses_algo = False
         self.observing = False
         self.scopes: list[dict[str, Symbol]] = [{}]
@@ -763,16 +849,31 @@ class Compiler(DeclarationSupport):
             for child in current.args:
                 validate_heap_type(child)
         validate_heap_type(type_)
-        if self.has_type(type_, "coordinate_compressor"):
+        if any(self.has_type(type_, name) for name in ("coordinate_compressor", RANGE_MIN_STATIC, *WAVELET_MATRICES)):
             self.uses_algo = True
         if self.has_type(type_, "range_fenwick"):
             self.uses_algo = True
         if self.has_type(type_, "fenwick"):
             self.uses_algo = True
-        if self.has_type(type_, "union_find"):
+        if self.has_type(type_, "union_find") or self.has_type(type_, WEIGHTED_UNION_FIND.name):
             self.uses_algo = True
         if self.has_type(type_, "dfs_result"):
             self.uses_graph = True
+        if self.has_type(type_, HEAVY_LIGHT.name):
+            self.uses_graph = True
+        if self.has_type(type_, TWO_SAT.name):
+            self.uses_acl_two_sat = True
+        if self.has_type(type_, MAX_FLOW.name):
+            self.uses_acl_max_flow = self.uses_graph = True
+        if self.has_type(type_, MIN_COST_FLOW.name):
+            self.uses_acl_min_cost_flow = self.uses_graph = True
+        if self.has_type(type_, RANGE_ASSIGN_RANGE_SUM.name):
+            self.uses_acl_range_assign_range_sum = self.uses_algo = True
+        if self.has_type(type_, RANGE_ASSIGN_RANGE_MIN.name):
+            self.uses_acl_range_assign_range_min = self.uses_algo = True
+        if self.has_type(type_, RANGE_ADD_RANGE_SUM.name):
+            self.uses_acl_range_add_range_sum = self.uses_algo = True
+        self.acl_modints.update(name for name in FIXED_MODINTS if self.has_type(type_, name))
         return type_
 
     def fresh(self, suffix: str = "tmp") -> str:
@@ -810,6 +911,8 @@ class Compiler(DeclarationSupport):
             self.fail("条件は bool または数値にしてください", node)
 
     def owned(self, value: Value, node: Node, *, allow_void=False, allow_function=False) -> None:
+        if self.has_type(value.type, LAZY_SEGMENT_TREE):
+            self.fail("lazy_segment_tree はローカル変数に束縛してメソッドで操作してください", node)
         if value.type == FUNCTION and not allow_function:
             self.fail("関数はローカル名・呼び出し・map/filter/他アローの引数にだけ使えます。返却やコンテナ保存は未対応です", node)
         if value.type.name == "range" or (value.type == VOID and not allow_void):
@@ -847,8 +950,8 @@ class Compiler(DeclarationSupport):
                 if value.type in NUMBER and target in NUMBER else "代入元と代入先の型を揃えてください。")
         self.fail(f"{value.type} から {target} へ暗黙変換できません", node, hint=hint)
 
-    def ordered(self, values: list[Value], result: Type, expression, *, borrow=False) -> Value:
-        borrow = borrow or self.observing
+    def ordered(self, values: list[Value], result: Type, expression, *, borrow=False, snapshot=False) -> Value:
+        borrow = borrow or (self.observing and not snapshot)
         names, lines = [], []
         for value in values:
             name = self.fresh()
@@ -1027,8 +1130,19 @@ class Compiler(DeclarationSupport):
                 else:
                     self.fail(f"演算 {op} に {left.type} と {right.type} は使えません", node)
                 return self.ordered([left, right], result_type, lambda ns: f"({ns[0]} {op} {ns[1]})")
+            if left.type.name in FIXED_MODINTS or right.type.name in FIXED_MODINTS:
+                if left.type != right.type or op not in ("+", "-", "*", "/", "==", "!="):
+                    self.fail(f"演算 {op} に {left.type} と {right.type} は使えません", node)
+                result_type = BOOL if op in ("==", "!=") else left.type
+                if op == "/":
+                    return self.ordered([left, right], result_type, lambda ns:
+                                        f'([&]() {{ if ({ns[1]}.val() == 0) throw std::domain_error("{left.type}: division by zero"); '
+                                        f'return {ns[0]} / {ns[1]}; }}())', snapshot=True)
+                return self.ordered([left, right], result_type, lambda ns: f"({ns[0]} {op} {ns[1]})", snapshot=True)
             numeric = left.type in NUMBER and right.type in NUMBER
             comparison = op in ("==", "!=", "<", "<=", ">", ">=")
+            if LAZY_SEGMENT_TREE in (left.type.name, right.type.name):
+                self.fail("lazy_segment_tree に演算子は使えません", node)
             if comparison and (contains_windows_type(left.type) or contains_windows_type(right.type)):
                 self.fail("windows の結果は直接比較できません。要素を取り出して比較してください", node)
             string_concat = op == "+" and left.type == STRING and right.type in (STRING, CHAR)
@@ -1229,7 +1343,7 @@ class Compiler(DeclarationSupport):
                 self.parameter(annotation, None, node)
 
         def use(name: str, at: Node, local: set[str], *, callee=False) -> None:
-            if name in local or (callee and (name in BUILTINS or name in self.records) and not ((name in QUEUE_STACK or name in _NUMERIC_BOUNDARIES or name in PROJECTED_EXTREMA or name in ("deque", "count_by", "sum_by_key", "sorted_by", "pairwise", "chunks", "windows", "prefix_scan", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")) and name in available)):
+            if name in local or (callee and (name in BUILTINS or name in self.records) and not ((name == LAZY_SEGMENT_TREE or name in QUEUE_STACK or name in BYTE_STRING_METHODS or name in _NUMERIC_BOUNDARIES or name in PROJECTED_EXTREMA or name in ("deque", "count_by", "sum_by_key", "sorted_by", "pairwise", "chunks", "windows", "prefix_scan", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "weighted_union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "inv_mod", "convolution998", "convolution_ll", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")) and name in available)):
                 return
             if name not in available:
                 self.fail(f"定義位置から参照できない名前です: {name}。後方参照・再帰は未対応です", at)
@@ -1299,7 +1413,8 @@ class Compiler(DeclarationSupport):
                 return True
         return False
 
-    def lower_function(self, function: Function, argument_types: list[Type], *, argument_values=None, observe=False, observe_from=0) -> tuple[str, Type]:
+    def lower_function(self, function: Function, argument_types: list[Type], *, argument_values=None,
+                       observe=False, observe_from=0, lambda_capture="[&]") -> tuple[str, Type]:
         node, params = function.node, function.node.extra["params"]
         if len(params) != len(argument_types):
             self.fail(f"引数は {len(params)} 個必要です（指定は {len(argument_types)} 個）", node)
@@ -1375,7 +1490,7 @@ class Compiler(DeclarationSupport):
                 if result != VOID and not self.definitely_returns(node.extra["body"]):
                     self.fail("値を返すアロー関数はすべての分岐でreturnしてください", node)
             # A concrete owning return type prevents references/proxies escaping.
-            return ("[&](" + ", ".join(declarations) + ") -> " + result.cpp()
+            return (lambda_capture + "(" + ", ".join(declarations) + ") -> " + result.cpp()
                     + " {\n" + body + "\n}", result)
         finally:
             self.active_functions.pop()
@@ -2248,6 +2363,164 @@ class Compiler(DeclarationSupport):
             result = BOOL if name == "empty" else element
         return Value(f"([&]() -> {result.cpp()} {{ {body} }}())", result)
 
+    def lazy_segment_value_type(self, type_: Type) -> bool:
+        if type_ in (*NUMBER, BOOL, CHAR) or type_.name in FIXED_MODINTS:
+            return True
+        if type_.name in ("pair", "tuple"):
+            return all(self.lazy_segment_value_type(t) for t in type_.args)
+        if type_.name.startswith("record:"):
+            fields = self.records.get(type_.name.removeprefix("record:"), ())
+            return bool(fields) and all(self.lazy_segment_value_type(t) for _, t, _ in fields)
+        return False
+
+    @staticmethod
+    def lazy_segment_direct_io(node: Node) -> bool:
+        if node.kind in ("read", "write") or (node.kind == "call" and
+                node.value in ("input", "print", "debug", "flush", "discard_line")):
+            return True
+        nested = [*node.children, *node.extra.get("body", ()), *node.extra.get("else", ()),
+                  *node.extra.get("clauses", ()), *node.extra.get("kwargs", {}).values()]
+        return any(Compiler.lazy_segment_direct_io(child) for child in nested)
+
+    def lazy_segment_constructor(self, node: Node) -> Value:
+        args = node.children
+        if len(args) != 6 or node.extra.get("kwargs") or node.extra.get("types"):
+            self.fail("lazy_segment_tree(配列, op, e, mapping, composition, id) と書いてください", node)
+        roles = ("op", "e", "mapping", "composition", "id")
+        functions = []
+        for role, callback in zip(roles, args[1:]):
+            if callback.kind != "name":
+                self.fail(f"{role} にはトップレベルの通常関数名を指定してください", callback)
+            symbol = self.lookup(callback.value, callback)
+            if self.named_functions.get(callback.value) is not symbol or not symbol.function:
+                self.fail(f"{role} にはトップレベルの通常関数名を指定してください", callback)
+            function = symbol.function
+            if self.lazy_segment_direct_io(function.node):
+                self.fail(f"lazy_segment_tree の {role} では入出力を行えません", callback)
+            functions.append(function)
+        state, tag = functions[1].result, functions[4].result
+        if not self.lazy_segment_value_type(state) or not self.lazy_segment_value_type(tag):
+            self.fail("lazy_segment_tree の S と F は対応するスカラー・タプル・pair・構造体にしてください", node)
+        signatures = (((state, state), state), ((), state), ((tag, state), state),
+                      ((tag, tag), tag), ((), tag))
+        for role, callback, function, (parameters, result) in zip(roles, args[1:], functions, signatures):
+            params = function.node.extra["params"]
+            if (len(params) != len(parameters) or function.result != result or
+                    any(not annotation or self.parameter(annotation, None, function.node) != (target, "value")
+                        for (_, annotation), target in zip(params, parameters))):
+                signature = ", ".join(map(str, parameters))
+                self.fail(f"{role} の型は ({signature}) -> {result} にしてください。引数は値渡しです", callback)
+        array_type = Type("vec", (state,))
+        initial_arg = args[0]
+        initial = self.expr(initial_arg, array_type if initial_arg.kind == "array" and not initial_arg.children else None)
+        if initial.type != array_type:
+            self.fail(f"lazy_segment_tree の初期値は {array_type} にしてください", initial_arg)
+        self.uses_algo = self.uses_acl_lazy_segment_tree = True
+        callbacks = tuple("&::" + function.code for function in functions)
+        result = Type(LAZY_SEGMENT_TREE, (state, tag), callbacks)
+        return Value(f"::lazy_segment_tree<{', '.join(callbacks)}>({initial.code})", result)
+
+    @staticmethod
+    def lazy_segment_predicate_expr(node: Node, names: frozenset[str]) -> bool:
+        # Deliberately exclude all calls, indexing, and runtime-only members.
+        if node.kind == "literal":
+            return True
+        if node.kind == "name":
+            return node.value in names
+        if node.kind == "member":
+            allowed = not node.extra.get("pointer")
+        elif node.kind == "unary":
+            allowed = node.value == "!"
+        elif node.kind == "binary":
+            allowed = node.value in ("==", "!=", "<", "<=", ">", ">=", "&&", "||")
+        else:
+            allowed = node.kind == "compare_chain"
+        return allowed and all(Compiler.lazy_segment_predicate_expr(child, names) for child in node.children)
+
+    def lazy_segment_inline_predicate(self, node: Node, state: Type) -> str:
+        params = node.extra["params"]
+        if (not node.extra.get("expression") or node.extra.get("param_pattern") or
+                len(params) != 1 or params[0][1] is not None):
+            self.fail("境界探索のアロー述語は x => 条件 の形にしてください", node)
+        function = self.capture_function(node)
+        names = frozenset({params[0][0], *function.captures})
+        if not self.lazy_segment_predicate_expr(node.children[0], names):
+            self.fail("境界探索のアロー述語には呼び出しや副作用のない条件式を指定してください", node)
+        snapshots, captures = {}, []
+        for name, symbol in function.captures.items():
+            if symbol.type not in (*NUMBER, BOOL, CHAR):
+                self.fail("境界探索のアロー述語が捕捉できるのは i32、i64、f64、bool、char だけです", node)
+            captured = self.fresh("predicate_capture")
+            snapshots[name] = Symbol(captured, symbol.type, readonly=True)
+            captures.append(f"{captured} = {symbol.code}")
+        code, result = self.lower_function(Function(node, snapshots), [state],
+                                           lambda_capture="[" + ", ".join(captures) + "]")
+        if result != BOOL:
+            self.fail("境界探索のアロー述語は bool を返してください", node)
+        return code
+
+    def lazy_segment_boundary(self, node: Node, receiver: Value) -> Value:
+        name, args = node.value, node.children
+        if len(args) != 3 or any(node.extra.get(k) for k in ("kwargs", "types", "pointer")):
+            self.fail(f"lazy_segment_tree の {name} は端点と述語を指定してください", node)
+        with self.protect(receiver.origins):
+            endpoint = self.expr(args[1])
+        if endpoint.type not in INTEGER:
+            self.fail(f"{name} の端点は i32 または i64 にしてください", args[1])
+        predicate = args[2]
+        if predicate.kind == "lambda":
+            code = self.lazy_segment_inline_predicate(predicate, receiver.type.args[0])
+            recv = self.fresh(LAZY_SEGMENT_TREE)
+            index = self.fresh("boundary")
+            return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; "
+                         f"{endpoint.type.cpp()} {index} = {endpoint.code}; "
+                         f"return {recv}.{name}({index}, {code}); }}())", I32)
+        if predicate.kind != "name":
+            self.fail(f"{name} の述語にはトップレベルの通常関数名を指定してください", predicate)
+        symbol = self.lookup(predicate.value, predicate)
+        if self.named_functions.get(predicate.value) is not symbol or not symbol.function:
+            self.fail(f"{name} の述語にはトップレベルの通常関数名を指定してください", predicate)
+        function = symbol.function
+        params = function.node.extra["params"]
+        state = receiver.type.args[0]
+        if (len(params) != 1 or not params[0][1] or function.result != BOOL or
+                self.parameter(params[0][1], None, function.node) != (state, "value")):
+            self.fail(f"{name} の述語は {state} を値で受け取り bool を返してください", predicate)
+        body = function.node.extra["body"]
+        if (len(body) != 1 or body[0].kind != "return" or len(body[0].children) != 1 or
+                not self.lazy_segment_predicate_expr(body[0].children[0], frozenset({params[0][0]}))):
+            self.fail(f"{name} の述語は呼び出しや副作用のない単一 return 式にしてください", predicate)
+        recv = self.fresh(LAZY_SEGMENT_TREE)
+        return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; "
+                     f"return {recv}.{name}({endpoint.code}, &::{function.code}); }}())", I32)
+
+    def lazy_segment_method(self, node: Node, receiver: Value) -> Value:
+        name = node.value
+        arity = {"size": 0, "set": 2, "get": 1, "apply": 3, "prod": 2, "all_prod": 0}[name]
+        if len(node.children) != arity + 1 or any(node.extra.get(k) for k in ("kwargs", "types", "pointer")):
+            self.fail(f"lazy_segment_tree の {name} の引数を確認してください", node)
+        mutating = name in ("set", "apply")
+        if mutating:
+            self.writable(receiver, node)
+        state, tag = receiver.type.args
+        indices = {"set": 1, "get": 1, "apply": 2, "prod": 2}.get(name, 0)
+        value_type = state if name == "set" else tag
+        values = []
+        with self.protect(receiver.origins):
+            for i, arg in enumerate(node.children[1:]):
+                if i < indices:
+                    value = self.expr(arg)
+                    if value.type not in INTEGER:
+                        self.fail(f"{name} の添字と端点は i32 または i64 にしてください", arg)
+                else:
+                    value = self.coerce(self.expr(arg, value_type), value_type, arg)
+                values.append(value)
+        recv = self.fresh(LAZY_SEGMENT_TREE)
+        target = VOID if mutating else I32 if name == "size" else state
+        result = self.ordered(values, target, lambda ns: f"{recv}.{name}({', '.join(ns)})")
+        return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; "
+                     f"{'' if mutating else 'return '}{result.code}; }}())", target)
+
     def call(self, node: Node, expected: Type | None) -> Value:
         name, args = node.value, node.children
         kwargs = node.extra.get("kwargs", {})
@@ -2269,8 +2542,221 @@ class Compiler(DeclarationSupport):
         converted = self.lower_count_if_method(node)
         if converted is not None:
             return converted
+        if node.kind == "call" and name == LAZY_SEGMENT_TREE and name not in self.records:
+            symbol = next((scope[name] for scope in reversed(self.scopes) if name in scope), None)
+            if symbol is not None:
+                if not symbol.function:
+                    self.fail(f"{name} は関数として呼び出せません", node)
+                if kwargs or node.extra.get("types"):
+                    self.fail("関数は位置引数だけに対応しています", node)
+                return self.invoke(Value(symbol.code, FUNCTION, function=symbol.function), args, node)
+            return self.lazy_segment_constructor(node)
+        if node.kind == "call" and name in FIXED_MODINTS:
+            if len(args) != 1 or kwargs or node.extra.get("types"):
+                self.fail(f"{name}(整数) と書いてください", node)
+            value = self.expr(args[0])
+            if value.type not in INTEGER:
+                self.fail(f"{name} の引数は i32 または i64 にしてください", args[0])
+            self.acl_modints.add(name)
+            mint = FIXED_MODINTS[name]
+            return Value(f"{mint.cpp()}({value.code})", mint)
+        if node.kind == "method" and name in ("val", "pow", "inv"):
+            value = self.expr(args[0])
+            if value.type.name in FIXED_MODINTS:
+                count = 2 if name == "pow" else 1
+                if len(args) != count or kwargs or node.extra.get("types") or node.extra.get("pointer"):
+                    self.fail("a.val()、a.inv()、a.pow(非負整数) の形で書いてください", node)
+                if name == "val":
+                    return Value(f"({value.code}).val()", I32)
+                if name == "inv":
+                    return self.ordered([value], value.type, lambda ns:
+                                        f'([&]() {{ if ({ns[0]}.val() == 0) throw std::domain_error("{value.type}: inverse of zero"); '
+                                        f'return {ns[0]}.inv(); }}())', snapshot=True)
+                exponent = self.expr(args[1])
+                if exponent.type not in INTEGER or (exponent.constant is not None and exponent.constant < 0):
+                    self.fail("pow の指数は 0 以上の i32 または i64 にしてください", args[1])
+                return self.ordered([value, exponent], value.type, lambda ns:
+                                    f'([&]() {{ if ({ns[1]} < 0) throw std::invalid_argument("{value.type}.pow: negative exponent"); '
+                                    f'return {ns[0]}.pow({ns[1]}); }}())', snapshot=True)
+        if node.kind == "call" and name == "rerooting":
+            if len(args) not in (5, 6) or kwargs or node.extra.get("types"):
+                self.fail("rerooting(隣接リスト, 単位元, merge, lift, finish[, 根]) と書いてください", node)
+            literal_empty = args[0].kind == "array" and all(
+                row.kind == "array" and not row.children for row in args[0].children)
+            empty_type = Type("vec", (Type("vec", (I64,)),)) if literal_empty else None
+            graph = self.expr(args[0], empty_type)
+            if graph.type not in tuple(Type("vec", (Type("vec", (item,)),)) for item in INTEGER):
+                self.fail("rerooting の隣接リストは i32 または i64 の2次元配列にしてください", args[0])
+            with self.protect(graph.origins):
+                identity = self.expr(args[1])
+                state = identity.type
+                if state.name not in FIXED_MODINTS and not self.equality_owned_type_supported(state):
+                    self.fail("rerooting の状態には数値・文字列などの対応する所有値を使ってください", args[1])
+                callbacks = []
+                for arg, label, types in zip(args[2:5], ("merge", "lift", "finish"),
+                                              ([state, state], [state, I32, I32], [state, I32])):
+                    callback = self.expr(arg)
+                    if callback.function is None:
+                        self.fail(f"rerooting の {label} は {len(types)} 引数の関数にしてください", arg)
+                    code, result = self.lower_function(callback.function, types, observe=True)
+                    if result != state:
+                        self.fail(f"rerooting の {label} は単位元と同じ型 {state} を返してください", arg)
+                    callbacks.append(code)
+                root = self.expr(args[5]) if len(args) == 6 else Value("0", I32)
+            if root.type not in INTEGER:
+                self.fail("rerooting の根は i32 または i64 にしてください", args[5])
+            self.uses_graph = True
+            graph_name, identity_name, root_name = (self.fresh(tag) for tag in ("tree", "identity", "root"))
+            return Value(f"([&]() {{ const auto& {graph_name} = {graph.code}; "
+                         f"{state.cpp()} {identity_name} = {identity.code}; "
+                         f"{root.type.cpp()} {root_name} = {root.code}; "
+                         f"return ::ac_graph_detail::checked_rerooting({graph_name}, std::move({identity_name}), "
+                         f"{', '.join(callbacks)}, {root_name}); }}())",
+                         Type("vec", (state,)))
+        if node.kind == "call" and name == HEAVY_LIGHT.name:
+            if len(args) not in (1, 2) or kwargs or node.extra.get("types"):
+                self.fail("heavy_light(隣接リスト[, 根]) と書いてください", node)
+            literal_empty = args[0].kind == "array" and all(
+                row.kind == "array" and not row.children for row in args[0].children)
+            empty_type = Type("vec", (Type("vec", (I64,)),)) if literal_empty else None
+            graph = self.expr(args[0], empty_type)
+            if graph.type not in tuple(Type("vec", (Type("vec", (item,)),)) for item in INTEGER):
+                self.fail("heavy_light の隣接リストは i32 または i64 の2次元配列にしてください", args[0])
+            with self.protect(graph.origins):
+                root = self.expr(args[1]) if len(args) == 2 else Value("0", I32)
+            if root.type not in INTEGER:
+                self.fail("heavy_light の根は i32 または i64 にしてください", args[-1])
+            self.uses_graph = True
+            return self.ordered([graph, root], HEAVY_LIGHT, lambda ns:
+                                f"::ac_graph_detail::checked_heavy_light({ns[0]}, {ns[1]})", borrow=True)
+        if node.kind == "method" and name in ("position", "vertex_at", "subtree", "lca", "path"):
+            receiver = self.expr(args[0])
+            if receiver.type == HEAVY_LIGHT:
+                counts = {"position": (1,), "vertex_at": (1,), "subtree": (1,),
+                          "lca": (2,), "path": (2, 3)}
+                if len(args) - 1 not in counts[name] or kwargs or node.extra.get("types") or node.extra.get("pointer"):
+                    self.fail("heavy_light のメソッドの引数を確認してください", node)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                path_edges = name == "path" and len(values) == 3
+                indices = values[:2] if path_edges else values
+                if any(v.type not in INTEGER for v in indices) or (path_edges and values[2].type != BOOL):
+                    self.fail("heavy_light の頂点・位置は整数、path の辺モードはboolにしてください", node)
+                recv = self.fresh("heavy_light")
+                path_type = Type("vec", (Type("tuple", (I32, I32, BOOL)),))
+                result_type = (path_type if name == "path" else Type("pair", (I32, I32))
+                               if name == "subtree" else I32)
+
+                def query(ns):
+                    checked = [f"::ac_graph_detail::checked_heavy_light_index({n})" for n in ns[:len(indices)]]
+                    if path_edges:
+                        checked.append(ns[2])
+                    call = f"{recv}.{name}({', '.join(checked)})"
+                    if name != "path":
+                        return call
+                    path = self.fresh("hld_path")
+                    out = self.fresh("hld_result")
+                    return (f"([&]() {{ auto {path} = {call}; {path_type.cpp()} {out}; "
+                            f"{out}.reserve({path}.size()); for (const auto& segment : {path}) "
+                            f"{out}.emplace_back(segment.l, segment.r, segment.reversed); return {out}; }}())")
+
+                result = self.ordered(values, result_type, query)
+                return Value(f"([&]() {{ const auto& {recv} = {receiver.code}; return {result.code}; }}())", result_type)
+        if node.kind == "call" and name == TWO_SAT.name:
+            if len(args) != 1 or kwargs or node.extra.get("types"):
+                self.fail("two_sat(変数の数) と書いてください", node)
+            n = self.expr(args[0])
+            if n.type not in INTEGER:
+                self.fail("two_sat の変数の数は i32 または i64 にしてください", args[0])
+            self.uses_acl_two_sat = True
+            return Value(f"{TWO_SAT.cpp()}({n.code})", TWO_SAT)
+        if node.kind == "method" and name in ("add_clause", "satisfiable", "answer"):
+            receiver = self.expr(args[0])
+            if receiver.type == TWO_SAT:
+                count = 4 if name == "add_clause" else 0
+                if len(args) != count + 1 or kwargs or node.extra.get("types") or node.extra.get("pointer"):
+                    signature = "add_clause(i, f, j, g)" if count else f"{name}()"
+                    self.fail(f"s.{signature} の形で使ってください", node)
+                if name != "answer":
+                    self.writable(receiver, node)
+                if not count:
+                    result_type = BOOL if name == "satisfiable" else Type("vec", (BOOL,))
+                    return Value(f"({receiver.code}).{name}()", result_type)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                for arg, value, accepted in zip(args[1:], values, (INTEGER, (BOOL,), INTEGER, (BOOL,))):
+                    if value.type not in accepted:
+                        self.fail("add_clause は添字に整数、リテラルの値に bool を取ります", arg)
+                recv = self.fresh("two_sat")
+                result = self.ordered(values, VOID, lambda ns: f"{recv}.{name}({', '.join(ns)})")
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; {result.code}; }}())", VOID)
+        if node.kind == "call" and name == MAX_FLOW.name:
+            if len(args) != 1 or kwargs or node.extra.get("types"):
+                self.fail("max_flow(頂点数) と書いてください", node)
+            n = self.expr(args[0])
+            if n.type not in INTEGER:
+                self.fail("max_flow の頂点数は i32 または i64 にしてください", args[0])
+            self.uses_acl_max_flow = self.uses_graph = True
+            return Value(f"{MAX_FLOW.cpp()}({n.code})", MAX_FLOW)
+        if node.kind == "call" and name == MIN_COST_FLOW.name:
+            if len(args) != 1 or kwargs or node.extra.get("types"):
+                self.fail("min_cost_flow(頂点数) と書いてください", node)
+            n = self.expr(args[0])
+            if n.type not in INTEGER:
+                self.fail("min_cost_flow の頂点数は i32 または i64 にしてください", args[0])
+            self.uses_acl_min_cost_flow = self.uses_graph = True
+            return Value(f"{MIN_COST_FLOW.cpp()}({n.code})", MIN_COST_FLOW)
+        if node.kind == "method" and name in ("add_edge", "flow", "edge_flow", "min_cut"):
+            receiver = self.expr(args[0])
+            if receiver.type == MIN_COST_FLOW and name in ("add_edge", "flow", "edge_flow"):
+                signatures = {"add_edge": (4, "add_edge(from, to, capacity, cost)", I32),
+                              "flow": (3, "flow(source, sink, limit)", Type("pair", (I64, I64))),
+                              "edge_flow": (1, "edge_flow(id)", I64)}
+                count, signature, result_type = signatures[name]
+                if len(args) - 1 != count or kwargs or node.extra.get("types") or node.extra.get("pointer"):
+                    self.fail(f"g.{signature} の形で使ってください", node)
+                if name != "edge_flow":
+                    self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                if any(v.type not in INTEGER for v in values):
+                    self.fail("min_cost_flow の頂点・容量・費用・上限・辺 ID は i32 または i64 にしてください", node)
+                recv = self.fresh("min_cost_flow")
+                result = self.ordered(values, result_type, lambda ns: f"{recv}.{name}({', '.join(ns)})")
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", result_type)
+            if receiver.type == MAX_FLOW:
+                counts = {"add_edge": (3,), "flow": (2, 3), "edge_flow": (1,), "min_cut": (1,)}
+                examples = {"add_edge": "add_edge(from, to, capacity)", "flow": "flow(s, t[, limit])",
+                            "edge_flow": "edge_flow(id)", "min_cut": "min_cut(source)"}
+                if len(args) - 1 not in counts[name] or kwargs or node.extra.get("types") or node.extra.get("pointer"):
+                    self.fail(f"g.{examples[name]} の形で使ってください", node)
+                if name in ("add_edge", "flow"):
+                    self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                if any(v.type not in INTEGER for v in values):
+                    self.fail("max_flow の頂点・容量・上限・辺 ID は i32 または i64 にしてください", node)
+                recv = self.fresh("max_flow")
+                result_type = {"add_edge": I32, "flow": I64, "edge_flow": I64, "min_cut": Type("vec", (BOOL,))}[name]
+                result = self.ordered(values, result_type, lambda ns: f"{recv}.{name}({', '.join(ns)})")
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", result_type)
         if node.kind == "call" and name in _COUNT_IF_METHODS:
             self.fail("count_if は a.count_if(条件) と書いてください", node)
+        if node.kind == "method" and name == "at_wrap":
+            if len(args) != 2 or kwargs or node.extra.get("types") or node.extra.get("pointer"):
+                self.fail("a.at_wrap(i) の形で使用してください", node)
+            source = self.expr(args[0])
+            if source.type.name not in ("vec", "string", "deque"):
+                self.fail("at_wrap は配列・文字列・deque に使ってください", node)
+            target = CHAR if source.type == STRING else source.type.args[0]
+            if not extrema_element_supported(target, returns_value=True):
+                self.fail("at_wrap は対応するスカラー・pair の要素に使ってください", node)
+            with self.protect(source.origins):
+                index = self.expr(args[1])
+            if index.type not in INTEGER:
+                self.fail("at_wrap の添字は i32 または i64 にしてください", node)
+            return self.ordered([source, index], target, lambda ns:
+                                f"static_cast<{target.cpp()}>(::kuma_rt::checked_index({ns[0]}, {ns[1]}))", borrow=True)
         if node.kind == "method" and name == "to_str":
             if len(args) != 1 or kwargs or node.extra.get("types"):
                 self.fail("to_str は引数を取りません", node)
@@ -2520,9 +3006,47 @@ class Compiler(DeclarationSupport):
                             f'throw std::out_of_range("coordinate_compressor: value not found"); return i; }}())')
                 result = self.ordered(values, result_type, checked)
                 return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", result_type)
-        if node.kind == "method" and name in ("size", "add", "sum", "get"):
+        if node.kind == "method" and name in ("size", "add", "sum", "get", "assign", "min", "kth", "sum_le"):
             receiver = self.expr(args[0])
-            if receiver.type.name == "range_fenwick":
+            preset_methods = {
+                RANGE_ADD_RANGE_SUM: {"size": 0, "add": 3, "sum": 2},
+                RANGE_ASSIGN_RANGE_MIN: {"size": 0, "assign": 3, "min": 2},
+                RANGE_ASSIGN_RANGE_SUM: {"size": 0, "assign": 3, "sum": 2},
+            }
+            static_min = receiver.type.name == RANGE_MIN_STATIC
+            wavelet = receiver.type.name in WAVELET_MATRICES
+            if receiver.type.name == WEIGHTED_WAVELET_MATRIX:
+                counts = {"size": 0, "kth": 3, "sum_le": 3}
+            elif wavelet:
+                counts = {"size": 0, "kth": 3}
+            elif static_min:
+                counts = {"size": 0, "min": 2}
+            else:
+                counts = preset_methods.get(receiver.type, {})
+            if name in counts:
+                if len(args) - 1 != counts[name] or kwargs or node.extra.get("types") or node.extra.get("pointer"):
+                    self.fail(f"{receiver.type} の {name} の引数を確認してください", node)
+                mutator = name in ("add", "assign")
+                if mutator:
+                    self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                if any(v.type not in INTEGER for v in values):
+                    if wavelet:
+                        parameter = "上限値" if name == "sum_le" else "順位"
+                        self.fail(f"{receiver.type} の端点と{parameter}には整数を指定してください", node)
+                    self.fail(f"{receiver.type} の端点と更新値には整数を指定してください", node)
+                if mutator:
+                    result_type = VOID
+                elif name == "size":
+                    result_type = I32
+                else:
+                    result_type = receiver.type.args[0] if static_min or (wavelet and name == "kth") else I64
+                recv = self.fresh(receiver.type.name)
+                result = self.ordered(values, result_type, lambda ns: f"{recv}.{name}({', '.join(ns)})")
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; "
+                             f"{'' if result_type == VOID else 'return '}{result.code}; }}())", result_type)
+            if receiver.type.name == "range_fenwick" and name not in ("assign", "min", "kth", "sum_le"):
                 counts = {"size": (0,), "add": (3,), "sum": (1, 2), "get": (1,)}
                 if kwargs or node.extra.get("types") or len(args) - 1 not in counts[name]:
                     self.fail(f"range_fenwick の {name} の引数を確認してください", node)
@@ -2577,6 +3101,8 @@ class Compiler(DeclarationSupport):
                 return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; " + ("" if result_type == VOID else "return ") + result.code + "; }())", result_type)
         if node.kind == "method" and name in ("max_right", "min_left"):
             receiver = self.expr(args[0])
+            if receiver.type.name == LAZY_SEGMENT_TREE:
+                return self.lazy_segment_boundary(node, receiver)
             if receiver.type.name == "segment_tree":
                 if kwargs or node.extra.get("types") or len(args) != 3:
                     self.fail(f"segment_tree の {name} は端点と通常述語を指定してください", node)
@@ -2605,9 +3131,11 @@ class Compiler(DeclarationSupport):
                             f'return {recv}.{name}(static_cast<int>({ns[0]}), &{symbol.function.code}); }}())')
                 result = self.ordered([endpoint], I32, checked)
                 return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", I32)
-        if node.kind == "method" and name in ("size", "set", "get", "prod", "all_prod"):
+        if node.kind == "method" and name in ("size", "set", "get", "apply", "prod", "all_prod"):
             receiver = self.expr(args[0])
-            if receiver.type.name == "segment_tree":
+            if receiver.type.name == LAZY_SEGMENT_TREE:
+                return self.lazy_segment_method(node, receiver)
+            if receiver.type.name == "segment_tree" and name != "apply":
                 arity = {"size": 0, "set": 2, "get": 1, "prod": 2, "all_prod": 0}[name]
                 if kwargs or node.extra.get("types") or len(args) != arity + 1:
                     self.fail(f"segment_tree の {name} の引数を確認してください", node)
@@ -2635,9 +3163,23 @@ class Compiler(DeclarationSupport):
                     return "([&]() { " + check + ("" if result_type == VOID else "return ") + call + "; }())"
                 result = self.ordered(values, result_type, checked)
                 return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; " + ("" if result_type == VOID else "return ") + result.code + "; }())", result_type)
-        if node.kind == "method" and name in ("unite", "same", "find", "component_size", "count", "size"):
+        if node.kind == "method" and name in ("unite", "same", "find", "component_size", "count", "size", "diff"):
             receiver = self.expr(args[0])
-            if receiver.type.name == "union_find":
+            if receiver.type == WEIGHTED_UNION_FIND:
+                arity = {"unite": 3, "diff": 2, "same": 2, "find": 1, "component_size": 1, "count": 0, "size": 0}[name]
+                if kwargs or node.extra.get("types") or node.extra.get("pointer") or len(args) != arity + 1:
+                    self.fail(f"weighted_union_find の {name} の引数を確認してください", node)
+                if name not in ("count", "size"):
+                    self.writable(receiver, node)
+                with self.protect(receiver.origins):
+                    values = [self.expr(arg) for arg in args[1:]]
+                if any(value.type not in INTEGER for value in values):
+                    self.fail(f"{name} の添字・差分は i32 または i64 にしてください", node)
+                recv = self.fresh("weighted_union_find")
+                result_type = BOOL if name in ("unite", "same") else I64 if name == "diff" else I32
+                result = self.ordered(values, result_type, lambda ns: f"{recv}.{name}({', '.join(ns)})")
+                return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", result_type)
+            if receiver.type.name == "union_find" and name != "diff":
                 arity = 2 if name in ("unite", "same") else 1 if name in ("find", "component_size") else 0
                 if kwargs or node.extra.get("types") or len(args) != arity + 1:
                     self.fail(f"union_find の {name} の引数を確認してください", node)
@@ -2692,15 +3234,15 @@ class Compiler(DeclarationSupport):
             width = bitset_width(types[0], node.token)
             result = Type("bitset", (Type(width),))
             return Value(result.cpp() + "()", result)
-        if node.extra.get("types"):
+        if node.extra.get("types") and not (node.kind == "call" and name in WAVELET_MATRICES):
             self.fail("この呼び出しの明示型引数は未対応です", node)
-        if node.kind == "call" and (name not in BUILTINS or name in _NUMERIC_BOUNDARIES or name in PROJECTED_EXTREMA or name in ("deque", "count_by", "sum_by_key", "sorted_by", "pairwise", "chunks", "windows", "prefix_scan", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")):
+        if node.kind == "call" and (name not in BUILTINS or name in BYTE_STRING_METHODS or name in _NUMERIC_BOUNDARIES or name in PROJECTED_EXTREMA or name in ("deque", "count_by", "sum_by_key", "sorted_by", "pairwise", "chunks", "windows", "prefix_scan", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "weighted_union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "inv_mod", "convolution998", "convolution_ll", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")):
             symbol = next((scope[name] for scope in reversed(self.scopes) if name in scope), None)
             if symbol and symbol.function:
                 if kwargs:
                     self.fail("アロー関数は位置引数だけに対応しています", node)
                 return self.invoke(Value(symbol.code, FUNCTION, function=symbol.function), args, node)
-            if symbol and (name in _NUMERIC_BOUNDARIES or name in PROJECTED_EXTREMA or name in ("deque", "count_by", "sum_by_key", "sorted_by", "pairwise", "chunks", "windows", "prefix_scan", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")):
+            if symbol and (name in BYTE_STRING_METHODS or name in _NUMERIC_BOUNDARIES or name in PROJECTED_EXTREMA or name in ("deque", "count_by", "sum_by_key", "sorted_by", "pairwise", "chunks", "windows", "prefix_scan", "partition_vec", "group_by", "unique_stable", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "segment_tree", "dfs", "dfs_forest", "union_find", "weighted_union_find", "dynamic_bitset", "find_idx", "rfind_idx", "compress", "run_length_encode", "run_length_decode", "gcd", "desc", "lcm", "sort_unique", "is_prime", "divisors", "prime_factorize", "is_unique", "mex", "ceil_div", "floor_div", "pow_mod", "inv_mod", "convolution998", "convolution_ll", "positions", "has_common", "strongly_connected_component_groups", "strongly_connected_component_ids", "connected_component_ids", "bipartite_colors", "topological_order", "grid_bfs_dist", "zero_one_bfs_dist", "next_permutation", "sliding_window_min", "sliding_window_max", "next_greater_indices")):
                 self.fail(name + " は関数として呼び出せません", node)
         if node.kind == "call" and name == "segment_tree":
             if kwargs or node.extra.get("types") or len(args) != 3:
@@ -2832,6 +3374,56 @@ class Compiler(DeclarationSupport):
                 return (f'([&]() {{ if ({ns[0]}.size() > static_cast<size_t>(std::numeric_limits<int>::max())) '
                         f'throw std::length_error("coordinate_compressor: size too large"); return ::CoordinateCompressor<long long>({source}); }}())')
             return self.ordered([value], result, from_array, borrow=True)
+        if node.kind == "call" and name in WAVELET_MATRICES:
+            types = node.extra.get("types", [])
+            if len(args) != 1 or kwargs or len(types) > 1:
+                self.fail(f"{name}(配列) または {name}<T>(配列) と書いてください", node)
+            explicit = self.parse_type(types[0], node.token) if types else None
+            if explicit is not None and explicit not in INTEGER:
+                self.fail(f"{name} の型引数は i32 または i64 にしてください", node)
+            if explicit is not None:
+                element = explicit
+            elif not args[0].children and expected is not None and expected.name == name:
+                element = expected.args[0]
+            else:
+                element = I64
+            contextual_array = args[0].kind == "array" and (explicit is not None or not args[0].children)
+            value = self.expr(args[0], Type("vec", (element,)) if contextual_array else None)
+            if value.type.name != "vec" or value.type.args[0] not in INTEGER:
+                self.fail(f"{name} には vec<i32> または vec<i64> を指定してください", args[0])
+            if explicit is not None and value.type.args[0] != explicit:
+                self.fail(f"{name} の型引数と配列の要素型を揃えてください", args[0])
+            self.uses_algo = True
+            result = Type(name, value.type.args)
+            return Value(f"{result.cpp()}({value.code})", result)
+        if node.kind == "call" and name == RANGE_MIN_STATIC:
+            if len(args) != 1 or kwargs or node.extra.get("types"):
+                self.fail("range_min_static(配列) と書いてください", node)
+            empty = args[0].kind == "array" and not args[0].children
+            element = expected.args[0] if expected is not None and expected.name == RANGE_MIN_STATIC else I64
+            value = self.expr(args[0], Type("vec", (element,)) if empty else None)
+            if value.type.name != "vec" or value.type.args[0] not in INTEGER:
+                self.fail("range_min_static には vec<i32> または vec<i64> を指定してください", args[0])
+            self.uses_algo = True
+            result = Type(RANGE_MIN_STATIC, value.type.args)
+            return Value(f"{result.cpp()}({value.code})", result)
+        if node.kind == "call" and name in (RANGE_ADD_RANGE_SUM.name, RANGE_ASSIGN_RANGE_MIN.name, RANGE_ASSIGN_RANGE_SUM.name):
+            if len(args) != 1 or kwargs or node.extra.get("types"):
+                self.fail(f"{name}(n) または {name}(配列) と書いてください", node)
+            value = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if value.type not in (*INTEGER, Type("vec", (I32,)), Type("vec", (I64,))):
+                self.fail(f"{name} の引数には整数の要素数か vec<i32> / vec<i64> を指定してください", args[0])
+            if name == RANGE_ADD_RANGE_SUM.name:
+                self.uses_acl_range_add_range_sum = True
+                result = RANGE_ADD_RANGE_SUM
+            elif name == RANGE_ASSIGN_RANGE_MIN.name:
+                self.uses_acl_range_assign_range_min = True
+                result = RANGE_ASSIGN_RANGE_MIN
+            else:
+                self.uses_acl_range_assign_range_sum = True
+                result = RANGE_ASSIGN_RANGE_SUM
+            self.uses_algo = True
+            return Value(f"{result.cpp()}({value.code})", result)
         if node.kind == "call" and name == "range_fenwick":
             if kwargs or node.extra.get("types") or len(args) != 1:
                 self.fail("range_fenwick(n) または range_fenwick(配列) と書いてください", node)
@@ -2862,6 +3454,14 @@ class Compiler(DeclarationSupport):
                             f'throw std::length_error("fenwick: size too large"); return ::Fenwick<long long>({source}); }}())')
                 return self.ordered([value], result, from_array, borrow=True)
             self.fail("fenwick の引数は整数の要素数か vec<i32> / vec<i64> にしてください", node)
+        if node.kind == "call" and name == WEIGHTED_UNION_FIND.name:
+            if kwargs or node.extra.get("types") or len(args) != 1:
+                self.fail("weighted_union_find(n) と書いてください", node)
+            size = self.expr(args[0])
+            if size.type not in INTEGER:
+                self.fail("weighted_union_find の要素数は i32 または i64 にしてください", node)
+            self.uses_algo = True
+            return Value(f"{WEIGHTED_UNION_FIND.cpp()}({size.code})", WEIGHTED_UNION_FIND)
         if node.kind == "call" and name == "union_find":
             if kwargs or node.extra.get("types") or len(args) != 1:
                 self.fail("union_find(n) と書いてください", node)
@@ -3167,6 +3767,9 @@ class Compiler(DeclarationSupport):
             for v in values:
                 self.owned(v, node)
                 self.check_windows_output(v.type, node)
+                for mint in FIXED_MODINTS:
+                    if self.has_type(v.type, mint):
+                        self.fail(f"{mint} を出力するには .val() で整数にしてください", node)
                 depth, t = 0, v.type
                 while t.name == "vec":
                     depth, t = depth + 1, t.args[0]
@@ -3714,6 +4317,40 @@ class Compiler(DeclarationSupport):
             source = self.fresh("positions_source")
             result = self.ordered([start], result_type, lambda ns: f"::positions({source}, {ns[0]})")
             return Value(f"([&]() {{ auto&& {source} = {values.code}; return {result.code}; }}())", result_type)
+        if node.kind == "call" and name in ("convolution998", "convolution_ll"):
+            if len(args) != 2 or kwargs or node.extra.get("types"):
+                self.fail(f"{name}(a, b) と書いてください", node)
+            vector = Type("vec", (I64,))
+            def operand(arg):
+                expected_empty = vector if arg.kind == "array" and not arg.children else None
+                value = self.expr(arg, expected_empty)
+                if value.type.name != "vec" or value.type.args[0] not in INTEGER:
+                    self.fail(f"{name} には i32 または i64 の配列を渡してください", arg)
+                return value
+            left = operand(args[0])
+            with self.protect(left.origins):
+                right = operand(args[1])
+            if name == "convolution998":
+                self.uses_math = self.uses_convolution998 = True
+            target = "::convolution998" if name == "convolution998" else "(::kuma_rt::checked_convolution_ll)"
+            return self.ordered([left, right], vector, lambda ns: f"{target}({ns[0]}, {ns[1]})", borrow=True)
+        if node.kind == "call" and name == "inv_mod":
+            if len(args) != 2 or kwargs or node.extra.get("types"):
+                self.fail("inv_mod(x, m) と書いてください", node)
+            values = [self.expr(arg) for arg in args]
+            if any(value.type not in INTEGER for value in values):
+                self.fail("inv_mod の引数は i32 または i64 にしてください", node)
+            self.uses_math = True
+            # Materialize both values even in observation contexts that borrow operands.
+            values = [Value(f"static_cast<ll>({value.code})", I64) for value in values]
+            def inv_mod_code(ns):
+                x, m = ns
+                return ("([&]() { "
+                        f'if ({m} <= 0) throw std::invalid_argument("inv_mod: modulus must be positive"); '
+                        f"ll r = {x} % {m}; if (r < 0) r += {m}; "
+                        f'if (std::gcd(r, {m}) != 1) throw std::invalid_argument("inv_mod: value and modulus must be coprime"); '
+                        f"return ::inv_mod(r, {m}); }}())")
+            return self.ordered(values, I64, inv_mod_code)
         if node.kind == "call" and name == "pow_mod":
             if len(args) != 3 or node.extra.get("types"):
                 self.fail("pow_mod(x, n, m) と書いてください", node)
@@ -3949,6 +4586,23 @@ class Compiler(DeclarationSupport):
                         "total += count; } " + convert +
                         f"return ::run_length_decode({source}); }}())")
             return self.ordered([values], result, decode_code, borrow=True)
+        if node.kind in ("call", "method") and name in BYTE_STRING_METHODS:
+            is_lcp = name == LCP_ARRAY_BYTES
+            if len(args) != (2 if is_lcp else 1) or kwargs or node.extra.get("pointer"):
+                signature = f"{name}(文字列, 接尾辞配列)" if is_lcp else f"{name}(文字列)"
+                self.fail(f"{signature} と書いてください", node)
+            value = self.expr(args[0])
+            if value.type != STRING:
+                self.fail(f"{name} の最初の値には文字列を使ってください", args[0])
+            vector = Type("vec", (I32,))
+            if is_lcp:
+                with self.protect(value.origins):
+                    suffixes = self.expr(args[1], vector)
+                if suffixes.type != vector:
+                    self.fail("lcp_array_bytes の接尾辞配列は vec<i32> にしてください", args[1])
+                return self.ordered([value, suffixes], vector,
+                                    lambda ns: f"(::kuma_rt::{name})({ns[0]}, {ns[1]})", borrow=True)
+            return Value(f"(::kuma_rt::{name})({value.code})", vector)
         if node.kind in ("call", "method") and name == "run_length_encode":
             if len(args) != 1 or kwargs or node.extra.get("types"):
                 self.fail("run_length_encode(配列または文字列) と書いてください", node)
@@ -4300,19 +4954,26 @@ class Compiler(DeclarationSupport):
                         f"kuma_rt::{helpers[node.value]}({target}, {source}); }}")
             with self.protect(protected):
                 right = self.expr(node.children[1], left.type)
-                self.owned(right, node)
+                if left.type.name != LAZY_SEGMENT_TREE or node.value != "=":
+                    self.owned(right, node)
                 bitset_shift = left.type.name == "bitset" and node.value in ("<<=", ">>=")
                 right = self.coerce(right, I64 if bitset_shift else left.type, node)
             if node.value != "=":
                 if left.type.name == "bitset":
                     if node.value not in ("|=", "&=", "^=", "<<=", ">>="):
                         self.fail("この型の複合代入には対応していません", node)
+                elif left.type.name in FIXED_MODINTS:
+                    if node.value not in ("+=", "-=", "*=", "/="):
+                        self.fail(f"{left.type} には +=、-=、*=、/= を使えます", node)
                 elif left.type not in NUMBER and not (left.type == STRING and node.value == "+="):
                     self.fail("この型の複合代入には対応していません", node)
                 elif node.value in ("%=", "&=", "|=", "^=", "<<=", ">>=") and left.type not in INTEGER:
                     self.fail("この複合代入は整数に使ってください", node)
             target, source = self.fresh(), self.fresh()
-            return prefix + f"{{ auto&& {target} = {left.code}; {right.type.cpp()} {source} = {right.code}; {target} {node.value} {source}; }}"
+            zero_check = (f'if ({source}.val() == 0) throw std::domain_error("{left.type}: division by zero"); '
+                          if left.type.name in FIXED_MODINTS and node.value == "/=" else "")
+            return prefix + (f"{{ auto&& {target} = {left.code}; {right.type.cpp()} {source} = {right.code}; "
+                             f"{zero_check}{target} {node.value} {source}; }}")
         if kind == "read":
             if node.extra.get("index1"):
                 target = self.expr(node.children[0])
@@ -4452,9 +5113,35 @@ def transpile(source: str, filename: str = "input.kuma", *, optimize: bool = Tru
     power_runtime = CPP_POWER if compiler.uses_power else ""
     graph_include = '#include "ac_graph.hpp"\n' if compiler.uses_graph else ""
     math_include = '#include "ac_math.hpp"\n' if compiler.uses_math else ""
+    if compiler.uses_convolution998:
+        math_include += '#ifndef AC_HAS_ACL\n#error "Kuma convolution998 requires AtCoder Library (ACL)"\n#endif\n'
     algo_include = '#include "ac_algo.hpp"\n' if compiler.uses_algo else ""
+    modint_include = ''.join('#ifndef AC_HAS_ACL\n'
+                             f'#error "Kuma {name} requires AtCoder Library (ACL)"\n#endif\n'
+                             for name in sorted(compiler.acl_modints))
+    range_add_include = ('#ifndef AC_HAS_ACL\n'
+                         '#error "Kuma range_add_range_sum requires AtCoder Library (ACL)"\n'
+                         '#endif\n') if compiler.uses_acl_range_add_range_sum else ""
+    range_assign_include = ('#ifndef AC_HAS_ACL\n'
+                            '#error "Kuma range_assign_range_min requires AtCoder Library (ACL)"\n'
+                            '#endif\n') if compiler.uses_acl_range_assign_range_min else ""
+    range_assign_sum_include = ('#ifndef AC_HAS_ACL\n'
+                                '#error "Kuma range_assign_range_sum requires AtCoder Library (ACL)"\n'
+                                '#endif\n') if compiler.uses_acl_range_assign_range_sum else ""
+    lazy_segment_include = ('#ifndef AC_HAS_ACL\n'
+                            '#error "Kuma lazy_segment_tree requires AtCoder Library (ACL)"\n'
+                            '#endif\n') if compiler.uses_acl_lazy_segment_tree else ""
+    two_sat_include = ('#ifndef AC_HAS_ACL\n'
+                       '#error "Kuma two_sat requires AtCoder Library (ACL)"\n'
+                       '#endif\n') if compiler.uses_acl_two_sat else ""
+    max_flow_include = ('#ifndef AC_HAS_ACL\n'
+                        '#error "Kuma max_flow requires AtCoder Library (ACL)"\n'
+                        '#endif\n') if compiler.uses_acl_max_flow else ""
+    min_cost_flow_include = ('#ifndef AC_HAS_ACL\n'
+                             '#error "Kuma min_cost_flow requires AtCoder Library (ACL)"\n'
+                             '#endif\n') if compiler.uses_acl_min_cost_flow else ""
     return (archive + ("" if compact else "// Generated by Kuma M5. Edit the .kuma source, not this file.\n")
-            + CPP_RUNTIME + graph_include + math_include + algo_include + power_runtime + "\n" + declarations + "\nint main() {\ntry {\nkuma_rt::init();\n" + body
+            + CPP_RUNTIME + graph_include + math_include + algo_include + modint_include + range_add_include + range_assign_include + range_assign_sum_include + lazy_segment_include + two_sat_include + max_flow_include + min_cost_flow_include + power_runtime + "\n" + declarations + "\nint main() {\ntry {\nkuma_rt::init();\n" + body
             + '\nreturn 0;\n} catch (const std::exception& kuma_gen_error) {\n'
             + 'std::cerr << "Kuma runtime error: " << kuma_gen_error.what() << "\\n";\n'
             + 'return 1;\n}\n}\n')

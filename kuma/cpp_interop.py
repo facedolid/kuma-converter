@@ -14,7 +14,7 @@ from .cpp_bodies import NativeBodies
 from .model import KumaError, Node, Token, safe_sorted_key, sorted_key_captures, safe_sorted_function, safe_sorted_function_chain, safe_value_call_signature
 from .parser import QUEUE_STACK, RELATIONAL_OPERATORS, Parser, _BARE_CALLS, parse_interpolation
 from .power import CPP_POWER
-from .pipelines import lower_mixed_lazy, mixed_lazy_chain
+from .pipelines import direct_owned_lazy_terminal_source, lower_mixed_lazy, mixed_lazy_chain
 
 
 def _rep_paren_multiline_count_token(tokens, open_index: int, close_index: int):
@@ -84,6 +84,9 @@ from .cpp_initializers import InitializerSupport, captureless_lambda_return, mem
 _PREFIX_BODY_HEADERS = {
     '"ac.hpp"', '"ac_io.hpp"', '"ac_graph.hpp"', '<bits/stdc++.h>', '<iostream>', '<vector>',
 }
+
+
+_OWNED_VIEW_CALLS = {'zip_view', 'enumerate_view'}
 
 
 _TEMPLATE_LOOP_MACROS = frozenset({'rep', 'rrep', 'repi', 'repl', 'repit', 'repeach'})
@@ -234,6 +237,20 @@ class CppParser(InitializerSupport, Parser):
     @staticmethod
     def _cpp_parameter_binds_input(param: list[str]) -> bool:
         return (CppParser._cpp_parameter_trackable(param) and param[-1] == 'input')
+
+    @staticmethod
+    def _cpp_structured_binding_binds_input(tokens: list[str]) -> bool:
+        if '[' not in tokens or not tokens or tokens[-1] != ']':
+            return False
+        start = tokens.index('[')
+        head, bindings = tokens[:start], tokens[start + 1:-1]
+        if not re.fullmatch(r'(?:(?:const|volatile) )*auto(?: (?:const|volatile))?(?: (?:&|&&))?',
+                            ' '.join(head)):
+            return False
+        return (bool(bindings) and len(bindings) % 2 == 1
+                and all(CppParser._identifier_text(token) if i % 2 == 0 else token == ','
+                        for i, token in enumerate(bindings))
+                and 'input' in bindings[::2])
 
     def source_range(self, start: Token, end: Token) -> str:
         a = self.offsets[start.line - 1] + start.column - 1
@@ -452,10 +469,13 @@ class CppParser(InitializerSupport, Parser):
             return None
         if self.current.text == '[' and 'auto' in annotation.split():
             bindings = self.group('[', ']')
+            tokens = [t.text for t in self.tokens[position:self.position] if t.kind != 'NEWLINE']
             self.expect('=')
             value = self.rhs()
             self.end_statement()
-            return Node('cpp_binding', start, annotation + ' ' + bindings, [value])
+            return Node('cpp_binding', start, annotation + ' ' + bindings, [value],
+                        extra={'local_input_declaration': (self.simple_input_binding_safe
+                               and self._cpp_structured_binding_binds_input(tokens))})
         if self.current.kind != 'IDENT':
             self.restore_type_trial(position, original_depth, type_mark)
             return None
@@ -1251,7 +1271,8 @@ class CppParser(InitializerSupport, Parser):
                 and self.current.text == 'input'
                 and self.tokens[self.position + 1].text != '<'):
             raise KumaError('見える範囲に input という変数があり入力呼び出しと区別できません。変数名を変更してください',
-                            self.current, code='KUMA_CPP')
+                            self.current, code='KUMA_CPP',
+                            hint='標準入力を読む場合は input<i64> など型を指定してください')
 
     def _statement(self) -> Node:
         if self.record_depth:
@@ -1421,9 +1442,10 @@ class CppParser(InitializerSupport, Parser):
             types = {'auto', 'bool', 'char', 'short', 'int', 'long', 'float', 'double',
                      'signed', 'unsigned', 'const', 'volatile', '*', '&', '&&'}
             bases = types - {'const', 'volatile', '*', '&', '&&'}
-            has_input = (self.simple_input_binding_safe and len(prefix) >= 2
-                         and prefix[-1] == 'input' and set(prefix[:-1]) <= types
-                         and bool(set(prefix[:-1]) & bases))
+            has_input = (self.simple_input_binding_safe and (
+                (len(prefix) >= 2 and prefix[-1] == 'input' and set(prefix[:-1]) <= types
+                 and bool(set(prefix[:-1]) & bases))
+                or self._cpp_structured_binding_binds_input(prefix)))
             if has_input:
                 self.local_input_scopes.append(True)
             try:
@@ -2606,6 +2628,10 @@ class CppEmitter:
             c, a, b = (self.expr(c, native=native) for c in node.children)
             return f'({c} ? {a} : {b})'
         if kind == 'index':
+            if 'kuma_lazy_tuple_index' in node.extra:
+                subscript = node.extra['kuma_lazy_tuple_index']
+                receiver, index = (self.expr(child, native=native) for child in node.children)
+                return f'::kuma_rt::cpp_lazy_view_index<{subscript}>({receiver}, {index})'
             a, i = (self.expr(c, native=native) for c in node.children)
             # Native [] is deliberate here: do not rewrite an arbitrary C++ class's
             # operator[] as vector indexing or turn map keys into offsets.
@@ -2751,6 +2777,28 @@ class CppEmitter:
                         args.append(self.expr(key).replace('[&]', capture, 1))
                 helper = 'sorted_named_key' if 'key' in kw and kw['key'].kind == 'name' else 'SortedList'
                 return 'kuma_rt::' + helper + '(' + ', '.join(args) + ')'
+            if not native and kind == 'call' and value in _OWNED_VIEW_CALLS:
+                is_zip = value == 'zip_view'
+                option = 'strict' if is_zip else 'start'
+                self.options(node, kw, {option})
+                operands = node.children
+                if (node.extra.get('types') or
+                        (len(operands) < 2 if is_zip else
+                         len(operands) not in (1, 2) or (len(operands) == 2 and kw))):
+                    self.fail(node, 'zip_view(a, b, ..., strict=false) と書いてください' if is_zip else
+                              'enumerate_view(a, start=0) と書いてください')
+                # Braced initialization snapshots every input before evaluating
+                # the next, including before the strict/start option. Snapshot
+                # calls also keep any temporary owner alive while copying.
+                sources = operands if is_zip else operands[:1]
+                snapshots = [f'::kuma_rt::cpp_view_snapshot(({self.expr(arg)}))' for arg in sources]
+                option_node = operands[1] if not is_zip and len(operands) == 2 else kw.get(option)
+                argument = self.expr(option_node) if option_node is not None else ('false' if is_zip else '0LL')
+                if is_zip:
+                    return ('::kuma_rt::cpp_zip_view(::kuma_rt::CppZipViewRequest{std::tuple{' +
+                            ', '.join(snapshots) + '}, ::kuma_rt::cpp_view_strict((' + argument + '))})')
+                return ('::kuma_rt::cpp_enumerate_view(::kuma_rt::CppEnumerateViewRequest{' +
+                        snapshots[0] + ', ::kuma_rt::cpp_view_start((' + argument + '))})')
             if kind == 'call' and value == 'range' and not native:
                 self.options(node, kw)
                 if node.extra.get('types') or not 1 <= len(node.children) <= 3:
@@ -2768,21 +2816,21 @@ class CppEmitter:
             from .compiler import (_SCALAR_CONVERSION_METHODS, _SEQUENCE_ARITHMETIC_METHODS,
                                    _STRING_PAD_METHODS, _INTEGER_MASK_METHODS, _VECTOR_ASSIGN_METHODS,
                                    _BETWEEN_METHODS, _COUNT_IF_METHODS, _FIND_IDX_METHODS,
-                                   PROJECTED_EXTREMA, _SORTED_BY_METHODS,
+                                   PROJECTED_EXTREMA, _SORTED_BY_METHODS, BYTE_STRING_METHODS, LCP_ARRAY_BYTES,
                                    emit_mixed_scalar_conversion, emit_scalar_conversion,
                                    emit_mixed_integer_mask_method, emit_mixed_sequence_method,
                                    emit_mixed_string_pad, emit_mixed_vector_assign_method,
                                    emit_mixed_between, emit_mixed_count_if, emit_mixed_find_idx,
-                                   emit_mixed_key_vector)
+                                   emit_mixed_key_vector, emit_mixed_lcp_array_bytes)
             extension_members = (_SCALAR_CONVERSION_METHODS | _STRING_PAD_METHODS
                                    | _SEQUENCE_ARITHMETIC_METHODS | _INTEGER_MASK_METHODS
                                    | _VECTOR_ASSIGN_METHODS | _BETWEEN_METHODS | _COUNT_IF_METHODS
-                                   | _FIND_IDX_METHODS | _RUN_LENGTH_METHODS | _FREQUENCIES_METHODS
+                                   | _FIND_IDX_METHODS | _RUN_LENGTH_METHODS | _FREQUENCIES_METHODS | BYTE_STRING_METHODS
                                    | _NUMERIC_VECTOR_ZERO_ARG_METHODS | PROJECTED_EXTREMA
                                    | _POSITIONS_METHODS | _SORTED_BY_METHODS | _BOUND_INDEX_METHODS
                                    | _WINDOW_EXTREMA_METHODS | _PREDICATE_INDEX_METHODS
                                    | {'get', 'to_str', 'in_range', 'range_sum', 'combination_indices', 'combinations', 'next_greater_indices', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec', 'pairwise', 'chunks'})
-            extension_members = extension_members | {'windows'}
+            extension_members = extension_members | {'windows', 'at_wrap'}
 
             def windows_index(child):
                 if child.kind != 'index':
@@ -2845,8 +2893,9 @@ class CppEmitter:
                                                                 or adjacent_chain(c)
                                                                 or c.extra.get('kuma_kth_proven')
                                                                 or c.extra.get('kuma_transpose_proven'))
-                                        or c.kind == 'call' and c.value in PROJECTED_EXTREMA
+                                        or c.kind == 'call' and c.value in PROJECTED_EXTREMA | _OWNED_VIEW_CALLS
                                         or c.kind == 'method' and mixed_lazy_chain(c)
+                                        or c.extra.get('kuma_lazy_owned_inline')
                                         or c.kind == 'member' and c.value == 'to_str'
                                         or windows_index(c)
                                         or c.extra.get('kuma_set_from_vector')
@@ -2919,6 +2968,14 @@ class CppEmitter:
                 if (value in ('combination_indices', 'combinations') and len(args) == 2
                         and not kw and not node.extra.get('types')):
                     return emit_mixed_combinations(value, *args, self.fresh, type_probe=self.type_probe)
+                if (value == 'at_wrap' and len(args) == 2 and not kw and not node.extra.get('types')
+                        and not any(t.kind == 'CPP_DIRECTIVE' and re.match(
+                            r'#(?:[ \t]|/\*.*?\*/)*define(?:[ \t]|/\*.*?\*/)+at_wrap\b',
+                            re.sub(r'\\[ \t]*\r?\n', '', t.text)) for t in self.source_tokens)):
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return f'::kuma_rt::at_wrap_receiver({args[0]}).at_wrap({args[1]})'
                 if value == 'get' and len(args) == 2 and not kw and not node.extra.get('types'):
                     recv, index = args
                     position = tuple_get_literal(node.children[1])
@@ -2987,6 +3044,24 @@ class CppEmitter:
                         args[0] = self.expr(receiver)
                     return emit_mixed_find_idx(value, args[0], args[1], self.fresh,
                                                type_probe=self.type_probe)
+                if (value in BYTE_STRING_METHODS and len(args) == (2 if value == LCP_ARRAY_BYTES else 1) and not kw
+                        and not node.extra.get('types')):
+                    self.options(node, kw)
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    if value == LCP_ARRAY_BYTES:
+                        return emit_mixed_lcp_array_bytes(args[0], args[1], self.fresh,
+                                                          type_probe=self.type_probe)
+                    recv, typ = self.fresh('bytes_recv'), self.fresh('bytes_type')
+                    forward = f'std::forward<{typ}>({recv})'
+                    native = f'({forward}).{value}()'
+                    return (f'([]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ '
+                            f'if constexpr (requires {{ {native}; }}) return {native}; '
+                            f'else if constexpr (std::is_same_v<std::remove_cvref_t<{typ}>, std::string> '
+                            f'&& !std::is_volatile_v<std::remove_reference_t<{typ}>>) '
+                            f'return (::kuma_rt::{value})({forward}); '
+                            f'else return {native}; }})({args[0]})')
                 if (value in _RUN_LENGTH_METHODS and len(args) == 1 and not kw
                         and not node.extra.get('types')):
                     self.options(node, kw)
@@ -3123,7 +3198,6 @@ class CppEmitter:
                        'discard_line': 'discard_line'}
             if value in helpers: return 'kuma_rt::' + helpers[value] + '(' + ', '.join(args) + ')'
             if value in {'min', 'max', 'abs'}: return 'std::' + value + '(' + ', '.join(args) + ')'
-            if value in {'zip_view', 'enumerate_view'}: self.fail(node, '混在モードの遅延ビューはまだ未対応です')
             if value in {'i32', 'i64', 'll', 'f64'}:
                 if len(args) != 1: self.fail(node, '数値変換は1引数です')
                 return f'kuma_rt::numeric_cast<{cpp_type(value)}>({args[0]})'
@@ -4099,8 +4173,49 @@ def mark_mixed_local_arrows(nodes, parser, lazy_map_definitions=None):
             return value.value
         return None
 
-    def expression(value, names, stock, scalars):
-        if value.kind in {'lambda', 'comprehension'} or value.kind.startswith('cpp_'):
+    # A native declaration, overload, or callable named lazy can win lookup.
+    # Treat tokens not accounted for by parsed call sites as potential bindings.
+    lazy_tokens = {t for t in parser.tokens if t.kind == 'IDENT' and t.text == 'lazy'}
+    lazy_calls = set()
+    owned_terminals = []
+
+    def account_nested_lazy_calls(value):
+        # Recognize already-explicit pipelines for the collision check only.
+        # Do not transfer binding proofs through a lambda or comprehension.
+        if value.kind.startswith('cpp_'):
+            return
+        if value.kind == 'method':
+            root = value
+            explicit_arrow = False
+            while root.kind == 'method' and root.value != 'lazy':
+                explicit_arrow |= any(arg.kind == 'lambda' for arg in root.children[1:])
+                root = root.children[0]
+            if explicit_arrow and root.kind == 'call' and root.value == root.token.text == 'lazy':
+                lazy_calls.add(root.token)
+        for child in value.children:
+            account_nested_lazy_calls(child)
+        if value.kind == 'comprehension':
+            for clause in value.extra.get('clauses', ()):
+                account_nested_lazy_calls(clause)
+
+    def expression(value, names, stock, scalars, owned):
+        if value.kind == 'call' and value.value == value.token.text == 'lazy':
+            lazy_calls.add(value.token)
+        source = direct_owned_lazy_terminal_source(value)
+        if source is not None:
+            inline = (source.kind == 'call' and source.value == source.token.text
+                      and source.value in _OWNED_VIEW_CALLS - macros)
+            if inline and 'lazy' not in macros:
+                # The outer call may stay native; its explicit Kuma operand
+                # must still be lowered before invoking that overload.
+                value.extra['kuma_lazy_owned_inline'] = True
+                value.children[0].extra['kuma_lazy_owned_inline'] = True
+            if safe_member and 'lazy' not in macros and (inline or plain_name(source) in owned):
+                owned_terminals.append(value)
+        if value.kind in {'lambda', 'comprehension'}:
+            account_nested_lazy_calls(value)
+            return
+        if value.kind.startswith('cpp_'):
             return
         if (value.kind in ('call', 'method') and value.value in PROJECTED_EXTREMA - macros
                 and len(value.children) == 2 and not any(value.extra.get(k) for k in ('kwargs', 'types', 'pointer'))):
@@ -4135,22 +4250,26 @@ def mark_mixed_local_arrows(nodes, parser, lazy_map_definitions=None):
                           and stage.children[1].kind == 'lambda'):
                         lazy_map_definitions[id(stage)] = (stage.children[1], dict(scalars))
                 for operand in stage.children[1:]:
-                    expression(operand, names, stock, scalars)
+                    expression(operand, names, stock, scalars, owned)
                 stage = stage.children[0]
+            if stage.kind == 'call' and stage.value == stage.token.text == 'lazy':
+                lazy_calls.add(stage.token)
             for operand in stage.children:
-                expression(operand, names, stock, scalars)
+                expression(operand, names, stock, scalars, owned)
             return
         for child in value.children:
-            expression(child, names, stock, scalars)
+            expression(child, names, stock, scalars, owned)
 
     def block(statements):
         names = {}
         stock = set()
         scalars = {}
+        owned = set()
         for stmt in statements:
             if stmt.kind.startswith('cpp_'):
                 names.clear()
                 stock.clear()
+                owned.clear()
                 scalars.clear()
                 if safe_member and stmt.kind == 'cpp_stmt':
                     declaration = native_vector.fullmatch(stmt.value)
@@ -4160,11 +4279,12 @@ def mark_mixed_local_arrows(nodes, parser, lazy_map_definitions=None):
                 continue
             # Initializers use earlier bindings; introduce the new name after.
             for child in stmt.children:
-                expression(child, names, stock, scalars)
+                expression(child, names, stock, scalars, owned)
             if stmt.kind == 'declare':
                 for name in stmt.value:
                     names.pop(name, None)
                     stock.discard(name)
+                    owned.discard(name)
                     scalars.pop(name, None)
                 if (len(stmt.value) == len(stmt.children) == 1
                         and not (stmt.extra.get('type') or stmt.extra.get('types'))
@@ -4172,6 +4292,13 @@ def mark_mixed_local_arrows(nodes, parser, lazy_map_definitions=None):
                     arrow = stmt.children[0]
                     arity = len(arrow.extra.get('params', ())) if not arrow.extra.get('param_pattern') else -1
                     names[stmt.value[0]] = (arity, arrow, dict(scalars) if lazy_map_definitions is not None else None)
+                if (safe_member and len(stmt.value) == len(stmt.children) == 1
+                        and not (stmt.extra.get('type') or stmt.extra.get('types'))
+                        and stmt.value[0] not in macros):
+                    init = stmt.children[0]
+                    if (init.kind == 'call' and init.value == init.token.text
+                            and init.value in _OWNED_VIEW_CALLS - macros):
+                        owned.add(stmt.value[0])
                 if (len(stmt.value) == len(stmt.children) == 1
                         and not (stmt.extra.get('type') or stmt.extra.get('types'))
                         and stmt.value[0] not in macros
@@ -4184,16 +4311,19 @@ def mark_mixed_local_arrows(nodes, parser, lazy_map_definitions=None):
             elif stmt.kind == 'assign':
                 names.pop(plain_name(stmt.children[0]), None)
                 stock.discard(plain_name(stmt.children[0]))
+                owned.discard(plain_name(stmt.children[0]))
                 scalars.pop(plain_name(stmt.children[0]), None)
             if stmt.kind in {'if', 'while', 'for', 'rep'}:
                 for field in ('body', 'else'):
                     block(stmt.extra.get(field, ()))
                 names.clear()
                 stock.clear()
+                owned.clear()
                 scalars.clear()
             elif stmt.kind == 'try':
                 names.clear()
                 stock.clear()
+                owned.clear()
                 scalars.clear()
 
     if not parser.has_native_main and not any(node.kind == 'main_entry' for node in nodes):
@@ -4205,6 +4335,10 @@ def mark_mixed_local_arrows(nodes, parser, lazy_map_definitions=None):
             for section in node.extra['sections']:
                 if section[0] == 'function':
                     block(section[1])
+
+    if lazy_tokens <= lazy_calls:
+        for terminal in owned_terminals:
+            terminal.extra['kuma_lazy_owned_terminal_proven'] = True
 
 
 def mark_mixed_transpose(nodes, parser):

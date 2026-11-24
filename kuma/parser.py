@@ -13,6 +13,7 @@ _SCALARS = {
     "str", "string", "char", "void",
 }
 _CONSTRUCTORS = {"set", "dict", "map", "pair"}
+FIXED_MODULI = {"mint998244353": 998244353, "mint1000000007": 1000000007}
 QUEUE_STACK = frozenset({"queue", "stack"})
 _TYPE_NAMES = _SCALARS | {"vec", "vector", "tuple", "auto", "prefix2d", *_CONSTRUCTORS}
 _BARE_CALLS = {
@@ -52,6 +53,11 @@ class Parser:
         # Recognize type spellings before parsing; the resolver validates their definitions.
         self.user_types = {self.tokens[i + 1].text for i, t in enumerate(self.tokens[:-1])
                            if t.text == "struct" and self.tokens[i + 1].kind == "IDENT"}
+        if not cpp:
+            self.user_types.update((*FIXED_MODULI, "range_add_range_sum", "range_assign_range_min", "max_flow",
+                                    "range_assign_range_sum", "two_sat",
+                                    "heavy_light", "min_cost_flow", "weighted_union_find", "range_min_static",
+                                    "wavelet_matrix", "weighted_wavelet_matrix"))
         self.bare_functions: set[str] = set()
         self.lines = source.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         self.indent_style: str | None = None
@@ -600,7 +606,8 @@ class Parser:
             self.expect("long", "64bit 整数には long long または ll を使ってください")
             return "long long"
         if ((name.text in {"min_heap", "max_heap", "deque"} and name.text not in self.user_types
-                and self.current.text == "<") or self.queue_stack_type_head(name, self.current)):
+                and self.current.text == "<") or self.queue_stack_type_head(name, self.current)
+                or (not self.cpp and name.text in {"range_min_static", "wavelet_matrix", "weighted_wavelet_matrix"})):
             self.expect("<")
             arguments = self.type_arguments_after_open()
             if len(arguments) != 1:
@@ -832,7 +839,8 @@ class Parser:
         if token.kind == "IDENT":
             if self.accept("=>"):
                 return self.lambda_body(token, [(token.text, None)])
-            if token.text in _CONSTRUCTORS and self.accept("<"):
+            if ((token.text in _CONSTRUCTORS or (not self.cpp and token.text in {"wavelet_matrix", "weighted_wavelet_matrix"}))
+                    and self.accept("<")):
                 types = self.type_arguments_after_open()
                 arguments, keywords = self.arguments()
                 return Node("call", token, token.text, arguments, {"types": types, "kwargs": keywords})

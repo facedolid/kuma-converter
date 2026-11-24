@@ -48,6 +48,27 @@ printf '4\n' | ./example
 
 この例の出力は`5`です。`AC_NO_ACL`はAtCoder Libraryを使わない例向けの指定です。ACLを使うソースでは指定を外し、ACLも用意します。macOSの標準`g++`はApple Clangであるため、GNU GCCとは区別してください。
 
+### AtCoder Libraryを使う例
+
+純Kumaでは、固定法の `mint998244353`・`mint1000000007`、`convolution998`・`convolution_ll`、`two_sat`、バイト単位の `suffix_array_bytes`・`z_algorithm_bytes`・`lcp_array_bytes` を使えます。整数の逆元を求める `inv_mod(x, m)` は正の法と互いに素な整数を受け取り、ACLなしでも使えます。
+
+次を `acl-example.kuma` として保存します。
+
+```text
+print convolution_ll([-1, 2], [3, 4])
+print mint1000000007(2).inv().val()
+```
+
+`acl/` の直下にACLの `atcoder/` ディレクトリを置き、対応する公開ヘッダを `headers/` に用意します。
+
+```sh
+python3 convert.py acl-example.kuma -o acl-example.cpp
+g++ -std=c++23 -O2 -Iheaders -Iacl acl-example.cpp -o acl-example
+./acl-example
+```
+
+出力は `-3 2 8`、次の行に `500000004` です。`convolution_ll` の出力は最大 `2^24` 要素です。係数の絶対値が `i64` の最大値以下と確認できない入力は、実際には収まる場合も含めてエラーになります。`lcp_array_bytes` の第2引数には同じ文字列の接尾辞配列を渡します。2-SATの `answer()` は、節を追加した後に判定が `true` になってから呼びます。
+
 ## 元のソースと出力
 
 Kumaを変換した場合は、元のソース全文とSHA-256を生成C++の先頭コメントに残します。ファイル名は末尾の名前だけを記録し、変換器から絶対パスや`#line`を追加しません。元のソース自体にパスや秘密情報があれば、コメントにも残るため、共有前に入力内容を確認してください。

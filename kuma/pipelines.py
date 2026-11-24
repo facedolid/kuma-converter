@@ -11,20 +11,63 @@ def lazy_root(node):
     return node.kind in ('call', 'method') and node.value == 'lazy'
 
 
+def direct_owned_lazy_terminal_source(node):
+    """The operand of a direct zero-argument count/collect on bare lazy."""
+    if (node.kind != 'method' or node.value not in {'count', 'collect'}
+            or len(node.children) != 1
+            or any(node.extra.get(k) for k in ('kwargs', 'types', 'pointer'))):
+        return None
+    root = node.children[0]
+    if (root.kind == 'call' and root.value == root.token.text == 'lazy'
+            and len(root.children) == 1 and not (root.extra.get('kwargs') or root.extra.get('types'))):
+        return root.children[0]
+    return None
+
+
 def mixed_lazy_chain(node):
-    """A proven stock member or a bare call with an inline arrow opts in."""
+    """Opt in for explicit Kuma syntax or a proven stock source."""
+    if node.extra.get('kuma_lazy_owned_terminal_proven'):
+        return True
     marked = False
+    first = node
     while node.kind == 'method':
         if node.value == 'lazy':
             return bool(node.extra.get('kuma_lazy_member_proven'))
         marked |= any(child.kind == 'lambda' for child in node.children[1:])
-        node = node.children[0]
-    return marked and node.kind == 'call' and node.value == 'lazy'
+        first, node = node, node.children[0]
+    return (node.kind == 'call' and node.value == 'lazy' and
+            (marked or (direct_owned_lazy_terminal_source(first) is None
+                        and len(node.children) == 1 and node.children[0].kind == 'call'
+                        and node.children[0].value in ('zip_view', 'enumerate_view'))))
 
 
 def lower_mixed_lazy(emitter, node):
     from .compiler import pairwise_view_operand
     from .model import Node
+
+    def tuple_indices(expression, parameters):
+        # In a mixed lazy arrow, use the stock tuple slot for literal indices,
+        # keeping the usual native subscript for ordinary receivers.
+        if expression.kind == 'lambda':
+            return expression
+        children = [tuple_indices(item, parameters) for item in expression.children]
+        meta = expression.extra
+        if (expression.kind == 'index' and (
+                'kuma_lazy_tuple_index' in children[0].extra or
+                children[0].kind == 'name' and children[0].value in parameters)):
+            index = children[1]
+            if index.kind == 'literal' and index.extra.get('type') == 'i64':
+                text = index.value.replace("'", "")
+                if text.isascii() and text.isdecimal() and int(text) <= 2**31 - 1:
+                    meta = {**meta, 'kuma_lazy_tuple_index': int(text)}
+        return Node(expression.kind, expression.token, expression.value, children, meta)
+
+    def lazy_arrow_text(arrow):
+        if arrow.kind == 'lambda' and arrow.extra.get('expression'):
+            parameters = {name for name, annotation in arrow.extra['params'] if annotation is None}
+            arrow = Node(arrow.kind, arrow.token, arrow.value,
+                         [tuple_indices(arrow.children[0], parameters)], arrow.extra)
+        return emitter.expr(arrow)
 
     stages = []
     root = node
@@ -56,7 +99,7 @@ def lower_mixed_lazy(emitter, node):
     setup = []
     if pairwise is None:
         setup.append(f'const auto& {input_} = {source};')
-        allowed_source = ''
+        allowed_source = f'::kuma_rt::is_owned_iteration_view<{source_type}> || '
     else:
         setup.append(f'const auto& {input_} = ::kuma_rt::cpp_member_pairwise_view<true, true>'
                      f'(std::forward<decltype({source})>({source}));')
@@ -64,7 +107,7 @@ def lower_mixed_lazy(emitter, node):
     setup.extend([f'using {source_type} = std::remove_cvref_t<decltype({input_})>;',
                   f'static_assert({allowed_source}::kuma_rt::is_plain_vector<{source_type}> || '
                   f'std::is_same_v<{source_type}, std::string> || std::is_same_v<{source_type}, ::kuma_rt::Range>, '
-                  '"mixed lazy: expected a standard vector, string or Kuma range");',
+                  '"mixed lazy: expected a standard vector, string, Kuma range or owned zip/enumerate view");',
                   f'using {type_} = ::kuma_rt::cpp_item<{source_type}>;'])
     body = []
     current = item
@@ -101,12 +144,12 @@ def lower_mixed_lazy(emitter, node):
         if flat:
             unpacked = emitter.fresh('lazy_fields')
             ref = '&' if named else ''
-            setup.append(f'auto{ref} {unpacked} = {emitter.expr(key)};')
+            setup.append(f'auto{ref} {unpacked} = {lazy_arrow_text(key)};')
             setup.append(f'auto {callback} = [&](const auto& row) {{ '
                          f'return {unpacked}(std::get<0>(row), std::get<1>(row)); }};')
         else:
             ref = '&' if named else ''
-            setup.append(f'auto{ref} {callback} = {emitter.expr(key)};')
+            setup.append(f'auto{ref} {callback} = {lazy_arrow_text(key)};')
         if stage.value == 'filter':
             setup.append(f'using {result} = std::remove_cvref_t<std::invoke_result_t<decltype({callback})&, const {type_}&>>;')
             setup.append(condition(result, 'filter'))
@@ -137,7 +180,7 @@ def lower_mixed_lazy(emitter, node):
         callback = emitter.fresh('lazy_fold')
         setup.append(f'auto {output} = ({emitter.expr(terminal.children[1])});')
         ref = '&' if named else ''
-        setup.append(f'auto{ref} {callback} = {emitter.expr(operation)};')
+        setup.append(f'auto{ref} {callback} = {lazy_arrow_text(operation)};')
         if flat:
             expanded = emitter.fresh('lazy_fold_fields')
             setup.append(f'auto {expanded} = [&](const auto& acc, const auto& row) {{ '
@@ -167,7 +210,7 @@ def lower_mixed_lazy(emitter, node):
             setup.append(f'static_assert(::kuma_rt::ExtremaScalar<{type_}> || ::kuma_rt::is_extrema_pair<{type_}>, '
                          f'"mixed lazy.{name}: expected an owning scalar or a pair of owning scalars");')
         ref = '&' if named else ''
-        setup.append(f'auto{ref} {callback} = {emitter.expr(operation)};')
+        setup.append(f'auto{ref} {callback} = {lazy_arrow_text(operation)};')
         if flat:
             expanded = emitter.fresh('lazy_extrema_fields')
             setup.append(f'auto {expanded} = [&](const auto& row) {{ '
@@ -192,6 +235,12 @@ def lower_mixed_lazy(emitter, node):
             setup.append(f'using {collected_type} = decltype(::kuma_rt::copy_lazy_adjacent_row('
                          f'std::declval<const {type_}&>()));')
             kept = f'::kuma_rt::copy_lazy_adjacent_row({current})'
+        elif current == item:
+            collected_type = emitter.fresh('lazy_owned_row')
+            setup.append(f'using {collected_type} = std::decay_t<decltype('
+                         f'::kuma_rt::cpp_materialize_view_result<{source_type}>('
+                         f'std::declval<const {type_}&>()))>;')
+            kept = f'::kuma_rt::cpp_materialize_view_result<{source_type}>({current})'
         setup.append(f'std::vector<{collected_type}> {output};')
         body.append(f'{output}.emplace_back({kept});')
     elif name == 'sum':
