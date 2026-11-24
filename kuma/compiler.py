@@ -3600,21 +3600,28 @@ class Compiler(DeclarationSupport):
                                 lambda ns: f"::kuma_rt::{name}({', '.join(ns)}, {code})", borrow=True)
         if name == "sum_by" and node.kind == "method":
             if kwargs or node.extra.get("types") or len(args) != 2:
-                self.fail("辞書.sum_by(関数) と書いてください", node)
-            dictionary = self.expr(args[0])
-            if dictionary.type.name != "dict":
-                self.fail("純Kumaの sum_by は辞書に対応しています", node)
+                self.fail("配列.sum_by(関数) または 辞書.sum_by(関数) と書いてください", node)
+            sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if sequence.type.name not in ("vec", "dict"):
+                self.fail("純Kumaの sum_by は配列または辞書に使ってください", node)
             callback = self.expr(args[1])
             if not callback.function:
                 self.fail("sum_by には1引数の関数を指定してください", node)
-            element = Type("pair", dictionary.type.args)
-            with self.protect(dictionary.origins):
+            element = Type("pair", sequence.type.args) if sequence.type.name == "dict" else sequence.type.args[0]
+            with self.protect(sequence.origins):
                 code, result = self.lower_function(callback.function, [element], observe=True)
             if result not in NUMBER:
                 self.fail("sum_by の変換結果は数値にしてください", node)
             source = self.fresh("sum_by_source")
-            return Value(f"([&]() {{ const auto& {source} = {dictionary.code}; "
-                         f"return ::sum_by({source}, {code}); }}())", result)
+            prefix = f"([&]() {{ const auto& {source} = {sequence.code}; "
+            if sequence.type.name == "dict":
+                return Value(prefix + f"return ::sum_by({source}, {code}); }}())", result)
+            # The outer array is the sequence: a nested array or string is one
+            # element here, unlike the recursive leaf reduction in ::sum_by.
+            project, total, item = (self.fresh("sum_by_" + name) for name in ("project", "total", "item"))
+            return Value(prefix + f"const auto& {project} = {code}; {result.cpp()} {total}{{}}; "
+                         f"for (const auto& {item} : {source}) {total} += {project}({item}); "
+                         f"return {total}; }}())", result)
         if name in PROJECTED_EXTREMA and node.kind in ("call", "method"):
             if kwargs or len(args) != 2:
                 self.fail(f"{name}(配列, 関数) または 配列.{name}(関数) と書いてください", node)
