@@ -2706,16 +2706,20 @@ class Compiler(DeclarationSupport):
                 self.fail("min_cost_flow の頂点数は i32 または i64 にしてください", args[0])
             self.uses_acl_min_cost_flow = self.uses_graph = True
             return Value(f"{MIN_COST_FLOW.cpp()}({n.code})", MIN_COST_FLOW)
-        if node.kind == "method" and name in ("add_edge", "flow", "edge_flow", "min_cut"):
+        if node.kind == "method" and name in ("add_edge", "flow", "slope", "edge_flow", "get_edge", "edges", "min_cut"):
             receiver = self.expr(args[0])
-            if receiver.type == MIN_COST_FLOW and name in ("add_edge", "flow", "edge_flow"):
+            if receiver.type == MIN_COST_FLOW and name != "min_cut":
+                edge = Type("tuple", (I32, I32, I64, I64, I64))
                 signatures = {"add_edge": (4, "add_edge(from, to, capacity, cost)", I32),
                               "flow": (3, "flow(source, sink, limit)", Type("pair", (I64, I64))),
-                              "edge_flow": (1, "edge_flow(id)", I64)}
+                              "slope": (3, "slope(source, sink, limit)", Type("vec", (Type("pair", (I64, I64)),))),
+                              "edge_flow": (1, "edge_flow(id)", I64),
+                              "get_edge": (1, "get_edge(id)", edge),
+                              "edges": (0, "edges()", Type("vec", (edge,)))}
                 count, signature, result_type = signatures[name]
                 if len(args) - 1 != count or kwargs or node.extra.get("types") or node.extra.get("pointer"):
                     self.fail(f"g.{signature} の形で使ってください", node)
-                if name != "edge_flow":
+                if name in ("add_edge", "flow", "slope"):
                     self.writable(receiver, node)
                 with self.protect(receiver.origins):
                     values = [self.expr(arg) for arg in args[1:]]
@@ -2724,10 +2728,11 @@ class Compiler(DeclarationSupport):
                 recv = self.fresh("min_cost_flow")
                 result = self.ordered(values, result_type, lambda ns: f"{recv}.{name}({', '.join(ns)})")
                 return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", result_type)
-            if receiver.type == MAX_FLOW:
-                counts = {"add_edge": (3,), "flow": (2, 3), "edge_flow": (1,), "min_cut": (1,)}
+            if receiver.type == MAX_FLOW and name not in ("slope", "edges"):
+                counts = {"add_edge": (3,), "flow": (2, 3), "edge_flow": (1,),
+                          "get_edge": (1,), "min_cut": (1,)}
                 examples = {"add_edge": "add_edge(from, to, capacity)", "flow": "flow(s, t[, limit])",
-                            "edge_flow": "edge_flow(id)", "min_cut": "min_cut(source)"}
+                            "edge_flow": "edge_flow(id)", "get_edge": "get_edge(id)", "min_cut": "min_cut(source)"}
                 if len(args) - 1 not in counts[name] or kwargs or node.extra.get("types") or node.extra.get("pointer"):
                     self.fail(f"g.{examples[name]} の形で使ってください", node)
                 if name in ("add_edge", "flow"):
@@ -2737,7 +2742,9 @@ class Compiler(DeclarationSupport):
                 if any(v.type not in INTEGER for v in values):
                     self.fail("max_flow の頂点・容量・上限・辺 ID は i32 または i64 にしてください", node)
                 recv = self.fresh("max_flow")
-                result_type = {"add_edge": I32, "flow": I64, "edge_flow": I64, "min_cut": Type("vec", (BOOL,))}[name]
+                result_type = {"add_edge": I32, "flow": I64, "edge_flow": I64,
+                               "get_edge": Type("tuple", (I32, I32, I64, I64)),
+                               "min_cut": Type("vec", (BOOL,))}[name]
                 result = self.ordered(values, result_type, lambda ns: f"{recv}.{name}({', '.join(ns)})")
                 return Value(f"([&]() {{ auto&& {recv} = {receiver.code}; return {result.code}; }}())", result_type)
         if node.kind == "call" and name in _COUNT_IF_METHODS:
