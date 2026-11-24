@@ -777,8 +777,11 @@ def emit_mixed_key_vector(member, recv_expr, key_expr, fresh, *, type_probe=Fals
         f"if constexpr ({elem}) {{ {fallback} }} "
         f"else return {native}; }} "
         f"else return {native};")
+    string_branch = (f"else if constexpr (std::is_same_v<{bare}, std::string> && "
+                     f"!std::is_volatile_v<std::remove_reference_t<{tl}>>) {{ {fallback} }} "
+                     if member in ("sorted_by", "group_by", "partition_vec") else "")
     body = (f"using {bare} = std::remove_cvref_t<{tl}>; "
-            f"if constexpr (requires {{ {native}; }}) return {native}; else {kuma_branch}")
+            f"if constexpr (requires {{ {native}; }}) return {native}; {string_branch}else {kuma_branch}")
     invoke = (f"[]<class {tl}, class {tk}>({tl}&& {rx}, {tk}&& {kx}) "
               f"-> decltype(auto) {{ {body} }}")
     if type_probe:
@@ -1996,8 +1999,9 @@ class Compiler(DeclarationSupport):
         if len(node.children) == 2 and "compare" in kwargs:
             self.fail("比較関数は位置引数かcompareのどちらかで1回指定してください", node)
         sequence = self.expr(node.children[0])
-        if sequence.type.name != "vec":
-            self.fail("sort/sorted/reverse/reversedは配列に使ってください", node)
+        if sequence.type.name not in ("vec", "string"):
+            self.fail("sort/sorted/reverse/reversedは配列・文字列に使ってください", node)
+        element = CHAR if sequence.type == STRING else sequence.type.args[0]
         inplace = node.value in ("sort", "reverse")
         if inplace:
             self.writable(sequence, node)
@@ -2015,7 +2019,7 @@ class Compiler(DeclarationSupport):
                 compare = self.expr(comparator)
                 if compare.function is None:
                     self.fail("比較関数は2引数の関数にしてください", node)
-                code, result = self.lower_function(compare.function, [sequence.type.args[0]] * 2)
+                code, result = self.lower_function(compare.function, [element] * 2)
                 if result != BOOL:
                     self.fail("比較関数はboolを返してください。a < bのように書きます", node)
         source = self.fresh("sort_source")
@@ -2032,10 +2036,13 @@ class Compiler(DeclarationSupport):
                 body += f"long long {names[key]} = {bound.code}; "
             arguments.extend((names.get("start", "0LL"), names.get("end", "std::nullopt")))
             operation += "_range"
+        elif sequence.type == STRING:
+            # The mixed helpers already operate directly on the string's bytes.
+            operation = "cpp_" + operation
         if code is not None: arguments.append(code)
         # Native '<' with NaN is not a strict weak order. Check only the
         # selected range, before sorting, and leave explicit comparators alone.
-        if sorting and code is None and sequence.type.args[0] == F64:
+        if sorting and code is None and element == F64:
             first = self.fresh("sort_first")
             last = self.fresh("sort_last")
             current = self.fresh("sort_item")
@@ -3563,17 +3570,21 @@ class Compiler(DeclarationSupport):
             return collection
         if name == "partition_vec" and node.kind in ("call", "method"):
             if kwargs or node.extra.get("types") or len(args) != 2:
-                self.fail("partition_vec(配列, 条件) または 配列.partition_vec(条件) と書いてください", node)
+                self.fail("partition_vec(配列または文字列, 条件) または 対象.partition_vec(条件) と書いてください", node)
             sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
-            if sequence.type.name != "vec" or not self.ordered_owned_type_supported(sequence.type.args[0]):
-                self.fail("partition_vec は対応する所有値の配列に使ってください", node)
+            if sequence.type == STRING:
+                element, part = CHAR, Type("vec", (CHAR,))
+            elif sequence.type.name == "vec" and self.ordered_owned_type_supported(sequence.type.args[0]):
+                element, part = sequence.type.args[0], sequence.type
+            else:
+                self.fail("partition_vec は対応する所有値の配列または文字列に使ってください", node)
             callback = self.expr(args[1])
             if not callback.function:
                 self.fail("partition_vec の条件には1引数の関数を指定してください", node)
             with self.protect(sequence.origins):
-                code, result = self.lower_function(callback.function, [sequence.type.args[0]])
+                code, result = self.lower_function(callback.function, [element])
             self.condition(Value("", result), node)
-            output = Type("pair", (sequence.type, sequence.type))
+            output = Type("pair", (part, part))
             source_name = self.fresh("partition_source")
             return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; return ::partition_vec({source_name}, {code}); }}())", output)
         if name in KTH_METHODS and node.kind == "method":
@@ -3600,14 +3611,19 @@ class Compiler(DeclarationSupport):
                                 lambda ns: f"::kuma_rt::{name}({', '.join(ns)}, {code})", borrow=True)
         if name == "sum_by" and node.kind == "method":
             if kwargs or node.extra.get("types") or len(args) != 2:
-                self.fail("配列.sum_by(関数) または 辞書.sum_by(関数) と書いてください", node)
+                self.fail("配列・文字列・辞書のいずれかに .sum_by(関数) と書いてください", node)
             sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
-            if sequence.type.name not in ("vec", "dict"):
-                self.fail("純Kumaの sum_by は配列または辞書に使ってください", node)
+            if sequence.type != STRING and sequence.type.name not in ("vec", "dict"):
+                self.fail("純Kumaの sum_by は配列・文字列・辞書のいずれかに使ってください", node)
             callback = self.expr(args[1])
             if not callback.function:
                 self.fail("sum_by には1引数の関数を指定してください", node)
-            element = Type("pair", sequence.type.args) if sequence.type.name == "dict" else sequence.type.args[0]
+            if sequence.type == STRING:
+                element = CHAR
+            elif sequence.type.name == "dict":
+                element = Type("pair", sequence.type.args)
+            else:
+                element = sequence.type.args[0]
             with self.protect(sequence.origins):
                 code, result = self.lower_function(callback.function, [element], observe=True)
             if result not in NUMBER:
@@ -3616,8 +3632,8 @@ class Compiler(DeclarationSupport):
             prefix = f"([&]() {{ const auto& {source} = {sequence.code}; "
             if sequence.type.name == "dict":
                 return Value(prefix + f"return ::sum_by({source}, {code}); }}())", result)
-            # The outer array is the sequence: a nested array or string is one
-            # element here, unlike the recursive leaf reduction in ::sum_by.
+            # Fold immediate array elements or individual string bytes, not
+            # the recursive leaves used by the free ::sum_by function.
             project, total, item = (self.fresh("sum_by_" + name) for name in ("project", "total", "item"))
             return Value(prefix + f"const auto& {project} = {code}; {result.cpp()} {total}{{}}; "
                          f"for (const auto& {item} : {source}) {total} += {project}({item}); "
@@ -3645,30 +3661,39 @@ class Compiler(DeclarationSupport):
                          sequence.type.args[0] if returns_value else I32)
         if name == "sorted_by" and node.kind in ("call", "method"):
             if kwargs or node.extra.get("types") or len(args) != 2:
-                self.fail("sorted_by(配列, 関数) または 配列.sorted_by(関数) と書いてください", node)
+                self.fail("sorted_by(配列または文字列, 関数) または 対象.sorted_by(関数) と書いてください", node)
             sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
-            if sequence.type.name != "vec" or not self.ordered_owned_type_supported(sequence.type.args[0]):
-                self.fail("sorted_by は対応する所有値の配列に使ってください", node)
+            if sequence.type == STRING:
+                element = CHAR
+            elif sequence.type.name == "vec" and self.ordered_owned_type_supported(sequence.type.args[0]):
+                element = sequence.type.args[0]
+            else:
+                self.fail("sorted_by は対応する所有値の配列または文字列に使ってください", node)
             callback = self.expr(args[1])
             if not callback.function:
                 self.fail("sorted_by のキーには1引数の関数を指定してください", node)
             with self.protect(sequence.origins):
-                code, key_type = self.lower_function(callback.function, [sequence.type.args[0]])
+                code, key_type = self.lower_function(callback.function, [element])
             if not self.ordered_owned_type_supported(key_type):
                 self.fail("sorted_by のキーは対応する順序付き所有値にしてください", node)
+            output = Type("vec", (element,))
             source_name = self.fresh("sorted_by_source")
-            return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; return ::sorted_by({source_name}, {code}); }}())", sequence.type)
+            return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; return ::sorted_by({source_name}, {code}); }}())", output)
         if name == "count_by" and node.kind in ("call", "method"):
             if kwargs or node.extra.get("types") or len(args) != 2:
-                self.fail("count_by(配列, 関数) または 配列.count_by(関数) と書いてください", node)
+                self.fail("count_by(配列または文字列, 関数) または 対象.count_by(関数) と書いてください", node)
             sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
-            if sequence.type.name != "vec" or not self.ordered_owned_type_supported(sequence.type.args[0]):
-                self.fail("count_by は対応する所有値の配列に使ってください", node)
+            if sequence.type == STRING:
+                element = CHAR
+            elif sequence.type.name == "vec" and self.ordered_owned_type_supported(sequence.type.args[0]):
+                element = sequence.type.args[0]
+            else:
+                self.fail("count_by は対応する所有値の配列または文字列に使ってください", node)
             callback = self.expr(args[1])
             if not callback.function:
                 self.fail("count_by のキーには1引数の関数を指定してください", node)
             with self.protect(sequence.origins):
-                code, key_type = self.lower_function(callback.function, [sequence.type.args[0]])
+                code, key_type = self.lower_function(callback.function, [element])
             if not self.ordered_owned_type_supported(key_type):
                 self.fail("count_by のキーは対応する順序付き所有値にしてください", node)
             output = Type("dict", (key_type, I64))
@@ -3700,35 +3725,41 @@ class Compiler(DeclarationSupport):
                          f"return ::sum_by_key({source_name}, {key_code}, {value_code}); }}())", output)
         if name == "group_by" and node.kind in ("call", "method"):
             if kwargs or node.extra.get("types") or len(args) != 2:
-                self.fail("group_by(配列, 関数) または 配列.group_by(関数) と書いてください", node)
+                self.fail("group_by(配列または文字列, 関数) または 対象.group_by(関数) と書いてください", node)
             sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
-            if sequence.type.name != "vec" or not self.ordered_owned_type_supported(sequence.type.args[0]):
-                self.fail("group_by は対応する所有値の配列に使ってください", node)
+            if sequence.type == STRING:
+                element = CHAR
+            elif sequence.type.name == "vec" and self.ordered_owned_type_supported(sequence.type.args[0]):
+                element = sequence.type.args[0]
+            else:
+                self.fail("group_by は対応する所有値の配列または文字列に使ってください", node)
             callback = self.expr(args[1])
             if not callback.function:
                 self.fail("group_by のキーには1引数の関数を指定してください", node)
             with self.protect(sequence.origins):
-                code, key_type = self.lower_function(callback.function, [sequence.type.args[0]])
+                code, key_type = self.lower_function(callback.function, [element])
             if not self.ordered_owned_type_supported(key_type):
                 self.fail("group_by のキーは対応する順序付き所有値にしてください", node)
-            output = Type("dict", (key_type, sequence.type))
+            output = Type("dict", (key_type, Type("vec", (element,))))
             source_name = self.fresh("group_by_source")
             return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; return ::group_by({source_name}, {code}); }}())", output)
         if name in ("map", "filter"):
             if kwargs or len(args) != 2:
-                self.fail(f"{name} は配列と1引数の関数を指定してください", node)
+                self.fail(f"{name} は配列・文字列と1引数の関数を指定してください", node)
             sequence = self.expr(args[0])
             if sequence.type == VOID:
                 self.fail("値を返さない処理の結果には配列操作を続けられません", node,
                           code="KUMA_API", hint="sort/reverse は値を返しません。sorted/reversed か、別の文を使ってください。")
             windows = sequence.type.name == "windows_view"
-            if sequence.type.name != "vec" and not (windows and node.kind == "method"):
-                self.fail(f"{name} は配列に対応しています（windowsにはメンバ記法を使ってください）", node)
+            integer_range = sequence.type.name == "range" and node.kind == "method"
+            byte_string = sequence.type == STRING
+            if not byte_string and sequence.type.name != "vec" and not (windows and node.kind == "method" or integer_range):
+                self.fail(f"{name} は配列・文字列に対応しています（整数範囲とwindowsにはメンバ記法を使ってください）", node)
             callback = self.expr(args[1])
             if not callback.function:
                 self.fail(f"{name} の第2引数はアロー関数にしてください", node)
             function = callback.function
-            element = windows_element(sequence.type) if windows else sequence.type.args[0]
+            element = self.iter_element(sequence.type, node)
             window_arity = 0
             if windows:
                 arrow = function.node
@@ -3761,7 +3792,7 @@ class Compiler(DeclarationSupport):
                 code, result = self.lower_function(function, argument_types, observe=windows)
             if name == "filter":
                 self.condition(Value("", result), node)
-                output = sequence.type
+                output = Type("vec", (element,)) if integer_range or byte_string else sequence.type
             else:
                 self.owned(Value("", result), node)
                 output = Type("vec", (result,))
@@ -3770,6 +3801,10 @@ class Compiler(DeclarationSupport):
                 operation = (f"row_fields<{window_arity}, {'true' if name == 'filter' else 'false'}>"
                              if window_arity else name)
                 call = f"{source_name}.{operation}({code})"
+            elif integer_range or byte_string:
+                # Share the mixed collector and avoid an intermediate vector
+                # of input indices or bytes.
+                call = f"kuma_rt::cpp_{name}({source_name}, {code})"
             else:
                 call = f"kuma_rt::{name}({source_name}, {code})"
             return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; return {call}; }}())", output)
@@ -3780,7 +3815,8 @@ class Compiler(DeclarationSupport):
             values = [self.expr(a) for a in args]
             for v in values:
                 self.owned(v, node)
-                self.check_windows_output(v.type, node)
+                if v.type != Type("window_row", (STRING,)):
+                    self.check_windows_output(v.type, node)
                 for mint in FIXED_MODINTS:
                     if self.has_type(v.type, mint):
                         self.fail(f"{mint} を出力するには .val() で整数にしてください", node)
@@ -4506,14 +4542,16 @@ class Compiler(DeclarationSupport):
             return self.ordered([sequence], BOOL, lambda ns: f"::next_permutation({ns[0]}).found", borrow=True)
         if name == "unique_stable" and node.kind in ("call", "method"):
             if kwargs or node.extra.get("types") or len(args) != 1:
-                self.fail("unique_stable(配列) または 配列.unique_stable() と書いてください", node)
+                self.fail("unique_stable(a) または a.unique_stable() と書いてください", node)
             sequence = self.expr(args[0], Type("vec", (I64,)) if args[0].kind == "array" and not args[0].children else None)
+            if sequence.type == STRING:
+                return self.ordered([sequence], Type("vec", (CHAR,)), lambda ns: f"::unique_stable({ns[0]})", borrow=True)
             if sequence.type.name == "vec":
                 if not self.ordered_owned_type_supported(sequence.type.args[0]):
                     self.fail("unique_stable は対応する順序付き所有値の配列に使ってください", node)
                 return self.ordered([sequence], sequence.type, lambda ns: f"::unique_stable({ns[0]})", borrow=True)
             if node.kind == "call":
-                self.fail("unique_stable は配列に使ってください", node)
+                self.fail("unique_stable は配列または文字列に使ってください", node)
         if node.kind == "call" and name == "sort_unique":
             if len(args) != 1 or node.extra.get("types"):
                 self.fail("sort_unique(配列) と書いてください", node)

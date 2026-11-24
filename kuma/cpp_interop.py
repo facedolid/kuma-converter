@@ -1930,7 +1930,7 @@ def emit_mixed_window_extreme(name, recv_expr, width_expr, fresh, *, type_probe=
         f'if constexpr (requires {{ {native}; }}) return {native}; '
         'else if constexpr (kuma_rt::is_plain_vector<Vec>) { using Elem = typename Vec::value_type; '
         'if constexpr ((std::is_same_v<Elem, int> || std::is_same_v<Elem, long long>) && '
-        '(std::is_same_v<Width, int> || std::is_same_v<Width, long long>)) { '
+        'kuma_rt::CollectionInteger<Width>) { '
         f'const auto n = {recv}.size(); '
         'if (std::cmp_greater(n, std::numeric_limits<int>::max())) '
         f'throw std::out_of_range("{name}: too many elements"); '
@@ -1987,6 +1987,12 @@ def emit_mixed_sum_by(recv_expr, projection_expr, fresh, *, type_probe=False):
     body = (
         f'using Vec = std::remove_cvref_t<{vec_type}>; '
         f'if constexpr (requires {{ {native}; }}) return {native}; '
+        'else if constexpr (std::is_same_v<Vec, std::string>) { '
+        f'using R = std::remove_cvref_t<std::invoke_result_t<decltype(({arg})), const char&>>; '
+        'static_assert(std::is_arithmetic_v<R> && !std::is_same_v<R, bool> && !std::is_same_v<R, char>, '
+        '"sum_by on a string requires a numeric projection"); '
+        f'R total{{}}; for (const char& byte : std::as_const({recv})) total += std::invoke({arg}, byte); '
+        'return total; } '
         # Exact standard associative specializations with mapped values only.
         'else if constexpr (::kuma_rt::is_associative<Vec>::value && requires { typename Vec::mapped_type; }) '
         f'return ::sum_by({forward_vec}, {forward_fn}); '
@@ -2095,6 +2101,10 @@ def emit_mixed_numeric_vector_method(name, recv_expr, fresh):
         f'if constexpr ({elem}) {{ {fallback} }} '
         f'else return {native}; }} '
         f'else return {native};')
+    if name == 'unique_stable':
+        kuma_branch = (
+            f'if constexpr (std::same_as<{bare}, std::string> && '
+            f'!std::is_volatile_v<std::remove_reference_t<{typ}>>) {{ {fallback} }} else {kuma_branch}')
     body = (f'using {bare} = std::remove_cvref_t<{typ}>; '
             f'if constexpr (requires {{ {native}; }}) return {native}; else {kuma_branch}')
     invoke = f'[]<class {typ}>({typ}&& {recv}) -> decltype(auto) {{ {body} }}'
@@ -2119,8 +2129,7 @@ def emit_mixed_combinations(name, recv_expr, count_expr, fresh, *, type_probe=Fa
     body = (
         f'if constexpr (requires {{ {native}; }}) return {native}; '
         f'else if constexpr (kuma_rt::is_plain_vector<std::remove_cvref_t<{rt}>> '
-        f'&& (std::is_same_v<std::remove_cvref_t<{kt}>, int> '
-        f'|| std::is_same_v<std::remove_cvref_t<{kt}>, long long>)) {{ {fallback} }} '
+        f'&& kuma_rt::CollectionInteger<std::remove_cvref_t<{kt}>>) {{ {fallback} }} '
         f'else return {native};')
     if type_probe:
         return (f'([]<class {rt}, class {kt}>({rt}&& {recv}, {kt}&& {count}) -> decltype(auto) '
@@ -2141,15 +2150,15 @@ def emit_mixed_range_sum(recv_expr, lo_expr, hi_expr, fresh, *, type_probe=False
     native = f'({recv_fwd}).range_sum({lo_fwd}, {hi_fwd})'
     elem = ' || '.join(f'std::is_same_v<Elem, {t}>' for t in _NUMERIC_VECTOR_ELEMENTS)
     ints = ' && '.join(
-        f'(std::is_same_v<std::remove_cvref_t<{t}>, int> || '
-        f'std::is_same_v<std::remove_cvref_t<{t}>, long long>)' for t in (lt, ht))
+        f'kuma_rt::CollectionInteger<std::remove_cvref_t<{t}>>' for t in (lt, ht))
     body = (
         f'using {bare} = std::remove_cvref_t<{rt}>; '
         f'if constexpr (requires {{ {native}; }}) return {native}; '
         f'else if constexpr (kuma_rt::is_plain_vector<{bare}> && {ints}) {{ '
         f'using Elem = typename {bare}::value_type; '
         f'if constexpr ({elem}) {{ '
-        f'if ({lo} < 0 || {lo} > {hi} || static_cast<unsigned long long>({hi}) >= ({recv_fwd}).size()) '
+        f'if (std::cmp_less({lo}, 0) || std::cmp_greater({lo}, {hi}) || '
+        f'!std::in_range<long long>({hi}) || std::cmp_greater_equal({hi}, ({recv_fwd}).size())) '
         'throw std::out_of_range("range_sum: require 0 <= l <= r < prefix size"); '
         f'return ::range_sum({recv_fwd}, {lo}, {hi}); '
         f'}} else return {native}; }} else return {native};')
@@ -2185,10 +2194,10 @@ def emit_mixed_positions_method(recv_expr, start_expr, fresh, *, has_start, type
         tt = fresh('pos_tt')
         fwd_s = f'std::forward<{tt}>({tx})'
         native = f'({fwd_r}).positions({fwd_s})'
-        fallback = f'return ::positions({fwd_r}, {fwd_s});'
-        start_type = f'std::remove_cvref_t<{tt}>'
-        start_permitted = (f' && (std::is_same_v<{start_type}, int> '
-                           f'|| std::is_same_v<{start_type}, long long>)')
+        fallback = (f'if (!std::in_range<long long>({tx})) '
+                    'throw std::overflow_error("positions: start exceeds ll maximum"); '
+                    f'return ::positions({fwd_r}, static_cast<long long>({tx}));')
+        start_permitted = f' && kuma_rt::CollectionInteger<std::remove_cvref_t<{tt}>>'
     else:
         native = f'({fwd_r}).positions()'
         fallback = f'return ::positions({fwd_r});'
@@ -2570,7 +2579,10 @@ class CppEmitter:
         if kind == 'literal':
             literal = self.mark(value, node.token)
             if not native and node.extra['type'] == 'i64' and re.fullmatch(r"[0-9][0-9']*", value): return literal + 'LL'
-            if not native and node.extra['type'] == 'string': return f'std::string({literal})'
+            if not native and node.extra['type'] == 'string':
+                # Do not let a C++ C-string constructor discard bytes after an escape for NUL.
+                return (f'::std::string({literal}, sizeof({literal}) - 1)' if '\\' in value
+                        else f'std::string({literal})')
             return literal
         if kind == 'array':
             if not node.children:
@@ -2829,8 +2841,8 @@ class CppEmitter:
                                    | _NUMERIC_VECTOR_ZERO_ARG_METHODS | PROJECTED_EXTREMA
                                    | _POSITIONS_METHODS | _SORTED_BY_METHODS | _BOUND_INDEX_METHODS
                                    | _WINDOW_EXTREMA_METHODS | _PREDICATE_INDEX_METHODS
-                                   | {'get', 'to_str', 'in_range', 'range_sum', 'combination_indices', 'combinations', 'next_greater_indices', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec', 'pairwise', 'chunks'})
-            extension_members = extension_members | {'windows', 'at_wrap'}
+                                   | {'get', 'contains', 'to_str', 'in_range', 'range_sum', 'combination_indices', 'combinations', 'next_greater_indices', 'sum_by', 'group_by', 'unique_stable', 'unique_by', 'partition_vec', 'pairwise', 'chunks'})
+            extension_members = extension_members | {'windows', 'at_wrap', 'count'}
 
             def windows_index(child):
                 if child.kind != 'index':
@@ -2893,7 +2905,9 @@ class CppEmitter:
                                                                 or adjacent_chain(c)
                                                                 or c.extra.get('kuma_kth_proven')
                                                                 or c.extra.get('kuma_transpose_proven'))
-                                        or c.kind == 'call' and c.value in PROJECTED_EXTREMA | _OWNED_VIEW_CALLS
+                                        or c.kind == 'call' and (
+                                            c.value in PROJECTED_EXTREMA | _OWNED_VIEW_CALLS
+                                            or c.extra.get('kuma_collection_byte_literal'))
                                         or c.kind == 'method' and mixed_lazy_chain(c)
                                         or c.extra.get('kuma_lazy_owned_inline')
                                         or c.kind == 'member' and c.value == 'to_str'
@@ -2903,14 +2917,21 @@ class CppEmitter:
                                         or c.extra.get('kuma_to_f64')
                                         or c.extra.get('kuma_vector_index_type')))))
                     for c in children]
+            if not native and node.extra.get('kuma_collection_byte_literal'):
+                args[0] = self.expr(children[0])
             if tuple_arrow_arity:
                 filtering = 'true' if value == 'filter' else 'false'
                 member = 'true' if kind == 'method' else 'false'
                 return (f'::kuma_rt::cpp_map_filter_tuple_arrow<{tuple_arrow_arity}, {filtering}, {member}>'
                         f'({args[0]}, {args[1]})')
-            integer_literal = False
-            if not native and kind == 'method' and value == 'reduce' and len(children) == 3:
-                seed = children[2]
+            integer_literal = string_literal = False
+            if (not native and kind == 'method' and value == 'reduce' and len(children) == 3
+                    and not node.extra.get('pointer') and not node.extra.get('types') and not kw):
+                receiver, _, seed = children
+                if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                    args[0] = f'::kuma_rt::cpp_reduce_string_literal({args[0]})'
+                # Keep the original literal available to native overload resolution.
+                string_literal = seed.kind == 'literal' and seed.extra.get('type') == 'string'
                 if seed.kind == 'unary' and seed.value == '-':
                     seed = seed.children[0]
                 # Only stock windows widens an unadorned seed to Kuma i64.
@@ -2919,8 +2940,9 @@ class CppEmitter:
                                    and tuple_get_literal(seed) >= 0)
             if windows_reduce_arity:
                 # Native members receive the original flat callback and seed.
+                literal_flags = str(integer_literal).lower() + (', true' if string_literal else '')
                 return (f'::kuma_rt::windows_reduce_receiver<{windows_reduce_arity}, '
-                        f'{str(integer_literal).lower()}>({args[0]}).reduce({args[1]}, {args[2]})')
+                        f'{literal_flags}>({args[0]}).reduce({args[1]}, {args[2]})')
             # Forwarding an unproven native callback or a braced argument can
             # change deduction. Only an inline or locally proved Kuma arrow
             # opts into projected extrema fallback.
@@ -2930,6 +2952,14 @@ class CppEmitter:
                 return emit_mixed_projected_extreme(value, *args, self.fresh, member=kind == 'method',
                                                      type_probe=self.type_probe)
             if not native and kind == 'method' and not node.extra.get('pointer'):
+                if (value == 'contains' and len(args) == 2 and not kw and not node.extra.get('types')
+                        and not any(t.kind == 'CPP_DIRECTIVE' and re.match(
+                            r'#(?:[ \t]|/\*.*?\*/)*define(?:[ \t]|/\*.*?\*/)+contains\b',
+                            re.sub(r'\\[ \t]*\r?\n', '', t.text)) for t in self.source_tokens)):
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
+                    return f'::kuma_rt::contains_receiver({args[0]}).contains({args[1]})'
                 if value == 'chunks' and len(args) == 2 and not kw and not node.extra.get('types'):
                     receiver = node.children[0]
                     if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
@@ -2968,14 +2998,14 @@ class CppEmitter:
                 if (value in ('combination_indices', 'combinations') and len(args) == 2
                         and not kw and not node.extra.get('types')):
                     return emit_mixed_combinations(value, *args, self.fresh, type_probe=self.type_probe)
-                if (value == 'at_wrap' and len(args) == 2 and not kw and not node.extra.get('types')
+                if (value in ('at_wrap', 'count') and len(args) == 2 and not kw and not node.extra.get('types')
                         and not any(t.kind == 'CPP_DIRECTIVE' and re.match(
-                            r'#(?:[ \t]|/\*.*?\*/)*define(?:[ \t]|/\*.*?\*/)+at_wrap\b',
+                            rf'#(?:[ \t]|/\*.*?\*/)*define(?:[ \t]|/\*.*?\*/)+{value}\b',
                             re.sub(r'\\[ \t]*\r?\n', '', t.text)) for t in self.source_tokens)):
                     receiver = node.children[0]
                     if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
                         args[0] = self.expr(receiver)
-                    return f'::kuma_rt::at_wrap_receiver({args[0]}).at_wrap({args[1]})'
+                    return f'::kuma_rt::{value}_receiver({args[0]}).{value}({args[1]})'
                 if value == 'get' and len(args) == 2 and not kw and not node.extra.get('types'):
                     recv, index = args
                     position = tuple_get_literal(node.children[1])
@@ -2993,7 +3023,11 @@ class CppEmitter:
                             f'(&::transpose)({args[0]})')
                 if not self.type_probe and node.extra.get('kuma_kth_proven'):
                     return emit_mixed_kth(value, args, self.fresh)
-                if value == 'sum_by' and len(args) == 2 and not kw and not node.extra.get('types'):
+                if (value == 'sum_by' and len(args) == 2 and not kw and not node.extra.get('types')
+                        and not node.extra.get('pointer')):
+                    receiver = node.children[0]
+                    if receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
                     return emit_mixed_sum_by(*args, self.fresh, type_probe=self.type_probe)
                 if value == 'in_range' and len(args) == 2 and not kw and not node.extra.get('types'):
                     interval = node.children[1]
@@ -3080,6 +3114,9 @@ class CppEmitter:
                 if (value in _NUMERIC_VECTOR_ZERO_ARG_METHODS | {'unique_stable'} and len(args) == 1 and not kw
                         and not node.extra.get('types')):
                     self.options(node, kw)
+                    receiver = node.children[0]
+                    if value == 'unique_stable' and receiver.kind == 'literal' and receiver.extra.get('type') == 'string':
+                        args[0] = self.expr(receiver)
                     return emit_mixed_numeric_vector_method(value, args[0], self.fresh)
                 if (value in _POSITIONS_METHODS and len(args) in (1, 2) and not kw
                         and not node.extra.get('types')):
@@ -3139,7 +3176,11 @@ class CppEmitter:
                                                            type_probe=self.type_probe)
             if kind == 'method' and value in member_helpers and not node.extra.get('pointer'):
                 self.options(node, kw)
-                helper = f'cpp_member_{value}' + ('<true>' if integer_literal else '')
+                helper = f'cpp_member_{value}'
+                if string_literal:
+                    helper += '<false, true>'
+                elif integer_literal:
+                    helper += '<true>'
                 return f'kuma_rt::{helper}(' + ', '.join(args) + ')'
             if kind == 'method' and (node.extra.get('pointer') or value not in {'map', 'filter', 'sum', 'sorted', 'sort', 'reversed', 'reverse', 'len', 'reduce', 'zip', 'enumerate', 'any', 'all', 'some', 'every'}):
                 self.options(node, kw)
@@ -4906,6 +4947,47 @@ def mark_mixed_byte_conversions(nodes, parser):
                 local[stmt.value[0]] = inferred
 
 
+def mark_mixed_collection_byte_literals(nodes, parser):
+    """Normalize byte literals only where the unqualified stock call is known."""
+    names = {'unique_stable': 1, 'partition_vec': 2, 'sorted_by': 2, 'group_by': 2, 'count_by': 2}
+    tokens = parser.tokens
+    if (not any(t.text in names for t in tokens)
+            or any(t.text in {'import', 'module'} for t in tokens)
+            or any(t.kind == 'CPP_DIRECTIVE' and not re.fullmatch(
+                   r'#[ \t]*include[ \t]*(?:"ac(?:_io)?\.hpp"|<bits/stdc\+\+\.h>)[ \t]*',
+                   t.text) for t in tokens)):
+        # Opaque headers/macros may introduce a native overload.
+        return
+
+    calls = set()
+    candidates = []
+    pending = [nodes]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, Node):
+            if (item.kind in {'call', 'method'} and isinstance(item.value, str)
+                    and item.value in names and item.token.text == item.value):
+                calls.add(item.token)
+                if (item.kind == 'call' and not item.extra.get('types') and not item.extra.get('kwargs')
+                        and len(item.children) == names[item.value]
+                        and item.children[0].kind == 'literal'
+                        and item.children[0].extra.get('type') == 'string'):
+                    candidates.append(item)
+            pending.extend(item.children)
+            pending.extend(item.extra.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+        elif isinstance(item, dict):
+            pending.extend(item.values())
+
+    # A declaration, using-declaration, callable binding or opaque C++ use
+    # cannot be distinguished by the lexical pass. Leave that name to C++.
+    ambiguous = {t.text for t in tokens if t.kind == 'IDENT' and t.text in names and t not in calls}
+    for item in candidates:
+        if item.value not in ambiguous:
+            item.extra['kuma_collection_byte_literal'] = True
+
+
 def mark_mixed_to_f64(nodes, parser):
     """Lower only scalar numeric and string receivers whose spelling and scope are known."""
     from .compiler import _TO_F64_METHODS
@@ -5235,6 +5317,7 @@ def transpile_cpp(source: str, filename: str, *, emitter=None,
     nodes = parser.program()
     mixed_main = validate_mixed_main_entries(nodes, parser)
     checked_tuple_key_functions(nodes, parser.tokens, source, filename)
+    mark_mixed_collection_byte_literals(nodes, parser)
     mark_iter_collect(nodes, parser.tokens)
     uses_adaptors = bool(mark_mixed_adaptors(nodes, parser))
     if not mixed_main and not parser.has_native_main:
