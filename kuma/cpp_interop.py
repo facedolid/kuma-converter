@@ -3549,18 +3549,22 @@ class CppEmitter:
         if kind == 'lambda':
             params = node.extra['params']
             if pattern := node.extra.get('param_pattern'):
-                if not node.extra.get('kuma_map_filter_arrow'):
-                    self.fail(node, '混在では ((f, s)) => ... を map/filter に直接渡してください')
+                predicate = node.extra.get('kuma_count_if_arrow')
+                if not predicate and not node.extra.get('kuma_map_filter_arrow'):
+                    self.fail(node, '混在では ((f, s)) => ... を map/filter/count_if に直接渡してください')
                 arg = self.fresh('arrow_tuple')
                 body = (f'return {self.expr(node.children[0])};' if node.extra.get('expression')
                         else self.statements(node.extra['body']))
+                binding_type, row = ('const auto&', arg) if predicate else ('auto', f'std::move({arg})')
                 bindings = '\n'.join(
-                    f'auto {self.mark(child.value, child.token)} = std::get<{i}>(std::move({arg}));'
+                    f'{binding_type} {self.mark(child.value, child.token)} = std::get<{i}>({row});'
                     for i, child in enumerate(pattern.children))
                 condition = (f'::kuma_rt::arrow_tuple_arity<{len(pattern.children)}, '
                              f'std::remove_cvref_t<decltype({arg})>>()')
                 checked = (f'if constexpr ({condition}) {{\n{bindings}\n{body}\n}} else {{\n'
                            f'static_assert({condition}, "arrow pattern: expected a pair or tuple with matching arity");\n}}')
+                if predicate:
+                    return f'[&](const auto& {arg}) {{ {checked} }}'
                 return self.callback([(arg, None)], checked, False)
             if node.extra.get('kuma_map_filter_arrow') and node.extra.get('expression') and len(params) == 1 and params[0][1] is None:
                 name = params[0][0]
@@ -4076,6 +4080,13 @@ class CppEmitter:
                         and not any(child.extra.get(k) for k in ('pointer', 'kwargs', 'types')))
 
             children = node.children
+            if (not native and kind in ('call', 'method') and value == 'count_if'
+                    and len(children) == 2 and not any(node.extra.get(k) for k in ('pointer', 'types', 'kwargs'))):
+                from .compiler import split_callback_pattern
+                predicate = split_callback_pattern(children[1])
+                if predicate.extra.get('param_pattern'):
+                    children = [children[0], Node(predicate.kind, predicate.token, predicate.value,
+                                                  predicate.children, {**predicate.extra, 'kuma_count_if_arrow': True})]
             if (value in ('map', 'filter') and len(children) == 2 and children[1].kind == 'lambda'
                     and not node.extra.get('pointer') and not node.extra.get('types') and not kw):
                 key = children[1]

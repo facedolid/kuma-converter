@@ -1234,6 +1234,19 @@ def emit_mixed_between(recv_expr, lo_expr, hi_expr, fresh, *, string_literals, t
             f"std::forward<decltype({sl})>({sl}), std::forward<decltype({sh})>({sh})); }}())")
 
 
+def split_callback_pattern(arrow: Node) -> Node:
+    """Turn direct, untyped callback parameters into a single row pattern."""
+    if arrow.kind != "lambda" or arrow.extra.get("param_pattern"):
+        return arrow
+    params = arrow.extra["params"]
+    if len(params) < 2 or any(annotation is not None for _, annotation in params):
+        return arrow
+    pattern = Node("bind_tuple", arrow.token, children=[
+        Node("bind_name", arrow.token, name) for name, _ in params])
+    return Node(arrow.kind, arrow.token, arrow.value, arrow.children,
+                {**arrow.extra, "params": [("", None)], "param_pattern": pattern})
+
+
 def emit_mixed_count_if(recv_expr, pred_expr, fresh, *, type_probe=False):
     sr, sp = (fresh(suffix) for suffix in ("cif_sr", "cif_sp"))
     rx, px = (fresh(suffix) for suffix in ("cif_rx", "cif_px"))
@@ -1254,6 +1267,11 @@ def emit_mixed_count_if(recv_expr, pred_expr, fresh, *, type_probe=False):
         f"using Elem = typename {bare}::value_type; "
         f"if constexpr (std::is_same_v<{bare}, std::deque<Elem>> && {bool_pred('Elem')}) "
         f"return static_cast<long long>(::count_if(std::as_const({rx}), {fwd_p})); "
+        f"else return {native}; }} "
+        f"else if constexpr (kuma_rt::is_std_map<{bare}>) {{ "
+        f"using Elem = typename {bare}::value_type; "
+        f"if constexpr ({bool_pred('Elem')}) "
+        f"return static_cast<long long>(std::ranges::count_if(std::as_const({rx}), {fwd_p})); "
         f"else return {native}; }} "
         f"else if constexpr (std::is_same_v<{bare}, std::string>) {{ "
         f"if constexpr ({bool_pred('char')}) "
@@ -3578,6 +3596,8 @@ class Compiler(DeclarationSupport):
             self.fail("count_if(条件) の引数は位置指定で渡してください", node)
         if len(args) != 2:
             self.fail("配列.count_if(条件) と書いてください", node)
+        if split_callback_pattern(args[1]).extra.get("param_pattern"):
+            return None  # Row predicates use the shared predicate reduction.
         sequence = self.expr(args[0])
         if sequence.type.name not in ("vec", "deque", "string"):
             return None  # Other input types use the shared predicate reduction.
@@ -10410,6 +10430,10 @@ class Compiler(DeclarationSupport):
                     code, key = self.lower_function(projection, [element], observe=True)
                     self.owned(Value("", key), args[2])
                     callbacks.append(code)
+                if name == "count_if":
+                    pattern = split_callback_pattern(args[1])
+                    if pattern is not args[1]:
+                        predicate = Function(pattern, predicate.captures)
                 code, result = self.lower_function(predicate, [key], observe=True)
                 if result != BOOL:
                     self.fail("述語は bool を返してください", args[1])
