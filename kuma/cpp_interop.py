@@ -3549,7 +3549,7 @@ class CppEmitter:
         if kind == 'lambda':
             params = node.extra['params']
             if pattern := node.extra.get('param_pattern'):
-                predicate = node.extra.get('kuma_count_if_arrow')
+                predicate = node.extra.get('kuma_row_predicate_arrow')
                 if not predicate and not node.extra.get('kuma_map_filter_arrow'):
                     self.fail(node, '混在では ((f, s)) => ... を map/filter/count_if に直接渡してください')
                 arg = self.fresh('arrow_tuple')
@@ -4080,13 +4080,13 @@ class CppEmitter:
                         and not any(child.extra.get(k) for k in ('pointer', 'kwargs', 'types')))
 
             children = node.children
-            if (not native and kind in ('call', 'method') and value == 'count_if'
+            if (not native and kind in ('call', 'method') and value in ('count_if', 'all', 'any', 'every', 'some', 'all_of', 'any_of', 'none_of')
                     and len(children) == 2 and not any(node.extra.get(k) for k in ('pointer', 'types', 'kwargs'))):
                 from .compiler import split_callback_pattern
                 predicate = split_callback_pattern(children[1])
                 if predicate.extra.get('param_pattern'):
                     children = [children[0], Node(predicate.kind, predicate.token, predicate.value,
-                                                  predicate.children, {**predicate.extra, 'kuma_count_if_arrow': True})]
+                                                  predicate.children, {**predicate.extra, 'kuma_row_predicate_arrow': True})]
             if (value in ('map', 'filter') and len(children) == 2 and children[1].kind == 'lambda'
                     and not node.extra.get('pointer') and not node.extra.get('types') and not kw):
                 key = children[1]
@@ -4109,20 +4109,20 @@ class CppEmitter:
                                          {**owner.extra, 'kuma_windows_binding': (tuple_arrow_arity, literal)})
                             children = [owner, children[1]]
 
-            windows_reduce_arity = 0
-            if (not native and kind == 'method' and value == 'reduce' and len(children) == 3
+            reduce_tuple_arity = 0
+            if (not native and kind in ('call', 'method') and value == 'reduce' and len(children) == 3
                     and not node.extra.get('pointer') and not node.extra.get('types') and not kw
                     and children[1].kind == 'lambda' and not children[1].extra.get('param_pattern')):
                 params = children[1].extra['params']
                 if len(params) > 2 and all(annotation is None for _, annotation in params):
                     from .compiler import direct_windows_width
-                    windows_reduce_arity = len(params) - 1
+                    reduce_tuple_arity = len(params) - 1
                     owner = children[0]
-                    width = direct_windows_width(owner, mixed=True)
+                    width = direct_windows_width(owner, mixed=True) if kind == "method" else None
                     literal = tuple_get_literal(width) if width is not None else -1
                     if literal > 0:
                         owner = Node(owner.kind, owner.token, owner.value, owner.children,
-                                     {**owner.extra, 'kuma_windows_binding': (windows_reduce_arity, literal)})
+                                     {**owner.extra, 'kuma_windows_binding': (reduce_tuple_arity, literal)})
                         children = [owner, *children[1:]]
 
             prefix_lis_enabled = (not native and kind == 'method' and value == 'prefix_lis_query'
@@ -4180,11 +4180,12 @@ class CppEmitter:
                 integer_literal = (seed.kind == 'literal' and seed.extra.get('type') == 'i64'
                                    and re.fullmatch(r"[0-9][0-9']*", seed.value) is not None
                                    and tuple_get_literal(seed) >= 0)
-            if windows_reduce_arity:
+            if reduce_tuple_arity:
                 # Native members receive the original flat callback and seed.
+                member = str(kind == 'method').lower()
                 literal_flags = str(integer_literal).lower() + (', true' if string_literal else '')
-                return (f'::kuma_rt::windows_reduce_receiver<{windows_reduce_arity}, '
-                        f'{literal_flags}>({args[0]}).reduce({args[1]}, {args[2]})')
+                return (f'::kuma_rt::cpp_reduce_tuple_arrow<{reduce_tuple_arity}, {member}, '
+                        f'{literal_flags}>({args[0]}, {args[1]}, {args[2]})')
             # Forwarding an unproven native callback or a braced argument can
             # change deduction. Only an inline or locally proved Kuma arrow
             # opts into projected extrema fallback.

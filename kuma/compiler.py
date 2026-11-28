@@ -1234,17 +1234,18 @@ def emit_mixed_between(recv_expr, lo_expr, hi_expr, fresh, *, string_literals, t
             f"std::forward<decltype({sl})>({sl}), std::forward<decltype({sh})>({sh})); }}())")
 
 
-def split_callback_pattern(arrow: Node) -> Node:
+def split_callback_pattern(arrow: Node, *, leading=0) -> Node:
     """Turn direct, untyped callback parameters into a single row pattern."""
     if arrow.kind != "lambda" or arrow.extra.get("param_pattern"):
         return arrow
     params = arrow.extra["params"]
-    if len(params) < 2 or any(annotation is not None for _, annotation in params):
+    if len(params) < leading + 2 or any(annotation is not None for _, annotation in params):
         return arrow
     pattern = Node("bind_tuple", arrow.token, children=[
-        Node("bind_name", arrow.token, name) for name, _ in params])
+        Node("bind_name", arrow.token, name) for name, _ in params[leading:]])
     return Node(arrow.kind, arrow.token, arrow.value, arrow.children,
-                {**arrow.extra, "params": [("", None)], "param_pattern": pattern})
+                {**arrow.extra, "params": [*params[:leading], ("", None)],
+                 "param_pattern": pattern, "param_pattern_index": leading})
 
 
 def emit_mixed_count_if(recv_expr, pred_expr, fresh, *, type_probe=False):
@@ -2194,7 +2195,11 @@ class Compiler(DeclarationSupport):
 
     def arrow_parameter_names(self, node: Node) -> list[str]:
         pattern = node.extra.get("param_pattern")
-        return self.pattern_names(pattern) if pattern else [name for name, _ in node.extra["params"]]
+        names = [name for name, _ in node.extra["params"]]
+        if pattern:
+            i = node.extra.get("param_pattern_index", 0)
+            names[i:i + 1] = self.pattern_names(pattern)
+        return names
 
     def capture_function(self, node: Node) -> Function:
         """Fix free names at definition time, including unused generic arrows.
@@ -2320,7 +2325,8 @@ class Compiler(DeclarationSupport):
             declarations = []
             for i, ((name, annotation), actual) in enumerate(zip(params, argument_types)):
                 observe_arg = observe and i >= observe_from and (observe_to is None or i < observe_to)
-                if pattern := node.extra.get("param_pattern"):
+                pattern = node.extra.get("param_pattern") if i == node.extra.get("param_pattern_index", 0) else None
+                if pattern:
                     if actual.name not in ("tuple", "pair") or len(actual.args) != len(pattern.children):
                         self.fail("アロー関数の分割引数の名前と tuple・pair の要素数を一致させてください", pattern)
                     arg = self.fresh("arrow_tuple")
@@ -3175,10 +3181,15 @@ class Compiler(DeclarationSupport):
                         [initial.type, *([windows_element(element)] * window_arity)],
                         observe=True, observe_from=1)
                 else:
-                    code, result = self.lower_function(callback.function, [initial.type, element])
+                    pattern = split_callback_pattern(args[1], leading=1)
+                    func = callback.function if pattern is args[1] else Function(pattern, callback.function.captures)
+                    code, result = self.lower_function(func, [initial.type, element],
+                                                       observe=pattern is not args[1], observe_from=1)
                 self.coerce(Value("", result), initial.type, node)
             elif callback is not None and callback.function is not None:
-                code, result = self.lower_function(callback.function, [element])
+                pattern = split_callback_pattern(args[1])
+                func = callback.function if pattern is args[1] else Function(pattern, callback.function.captures)
+                code, result = self.lower_function(func, [element], observe=pattern is not args[1])
                 self.condition(Value("", result), node)
             elif name == "count":
                 self.owned(callback, node)
@@ -7379,8 +7390,10 @@ class Compiler(DeclarationSupport):
             windows = sequence.type.name == "windows_view"
             integer_range = sequence.type.name == "range" and node.kind == "method"
             byte_string = sequence.type == STRING
-            if not byte_string and sequence.type.name != "vec" and not (windows and node.kind == "method" or integer_range):
-                self.fail(f"{name} は配列・文字列に対応しています（整数範囲とwindowsにはメンバ記法を使ってください）", node)
+            dictionary = sequence.type.name == "dict"
+            if not (byte_string or dictionary or sequence.type.name == "vec"
+                    or windows and node.kind == "method" or integer_range):
+                self.fail(f"{name} は配列・文字列・辞書に対応しています（整数範囲とwindowsにはメンバ記法を使ってください）", node)
             callback = self.expr(args[1])
             if not callback.function:
                 self.fail(f"{name} の第2引数はアロー関数にしてください", node)
@@ -7415,10 +7428,10 @@ class Compiler(DeclarationSupport):
                                         function.captures)
             argument_types = [windows_element(element)] * window_arity if window_arity else [element]
             with self.protect(sequence.origins):
-                code, result = self.lower_function(function, argument_types, observe=windows)
+                code, result = self.lower_function(function, argument_types, observe=windows or dictionary)
             if name == "filter":
                 self.condition(Value("", result), node)
-                output = Type("vec", (element,)) if integer_range or byte_string else sequence.type
+                output = Type("vec", (element,)) if integer_range or byte_string or dictionary else sequence.type
             else:
                 self.owned(Value("", result), node)
                 output = Type("vec", (result,))
@@ -7427,6 +7440,13 @@ class Compiler(DeclarationSupport):
                 operation = (f"row_fields<{window_arity}, {'true' if name == 'filter' else 'false'}>"
                              if window_arity else name)
                 call = f"{source_name}.{operation}({code})"
+            elif dictionary and name == "filter":
+                # Own the selected pairs without keeping the map's const-qualified key.
+                return Value(f"([&]() {{ auto&& {source_name} = {sequence.code}; auto predicate = {code}; "
+                             f"{output.cpp()} result; for (const auto& item : {source_name}) "
+                             "if (predicate(item)) result.emplace_back(item); return result; }())", output)
+            elif dictionary:
+                call = f"kuma_rt::cpp_map({source_name}, {code})"
             elif integer_range or byte_string:
                 # Share the mixed collector and avoid an intermediate vector
                 # of input indices or bytes.
@@ -10430,7 +10450,7 @@ class Compiler(DeclarationSupport):
                     code, key = self.lower_function(projection, [element], observe=True)
                     self.owned(Value("", key), args[2])
                     callbacks.append(code)
-                if name == "count_if":
+                if name in ("count_if", "any_of", "all_of", "none_of"):
                     pattern = split_callback_pattern(args[1])
                     if pattern is not args[1]:
                         predicate = Function(pattern, predicate.captures)
