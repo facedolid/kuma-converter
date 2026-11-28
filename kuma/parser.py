@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .lexer import lex
 from .model import KumaError, Node, Token
+from .native_cpp import source_mode
 
 
 _SCALARS = {
@@ -15,6 +16,7 @@ _SCALARS = {
 _CONSTRUCTORS = {"set", "dict", "map", "pair"}
 FIXED_MODULI = {"mint998244353": 998244353, "mint1000000007": 1000000007}
 QUEUE_STACK = frozenset({"queue", "stack"})
+VECTOR_INDEX_ARITIES = {"insert_at": 3, "erase_at": 2, "erase_range": 3, "pop_at": 2}
 _TYPE_NAMES = _SCALARS | {"vec", "vector", "tuple", "auto", "prefix2d", *_CONSTRUCTORS}
 _BARE_CALLS = {
     "input", "print", "debug", "sort", "reverse", "sum", "len", "size",
@@ -40,8 +42,12 @@ _BINDING_POWER = {
 
 
 class Parser:
-    def __init__(self, source: str, *, cpp: bool = False):
+    def __init__(self, source: str, *, cpp: bool = False, mode: str = "auto"):
         self.cpp = cpp
+        self.allow_array_spread = not cpp and source_mode(source, mode) == "auto"
+        self.allow_dict_spread = self.allow_array_spread
+        self.allow_call_spread = self.allow_array_spread
+        self.has_ellipsis = "..." in source
         self.queue_stack_types = QUEUE_STACK if not cpp else frozenset()
         self.tokens = lex(source, cpp=cpp)
         self.position = 0
@@ -54,10 +60,20 @@ class Parser:
         self.user_types = {self.tokens[i + 1].text for i, t in enumerate(self.tokens[:-1])
                            if t.text == "struct" and self.tokens[i + 1].kind == "IDENT"}
         if not cpp:
-            self.user_types.update((*FIXED_MODULI, "range_add_range_sum", "range_assign_range_min", "max_flow",
-                                    "range_assign_range_sum", "two_sat",
+            self.user_types.update((*FIXED_MODULI, "modint", "dynamic_modint", "range_add_range_sum", "range_add_range_min", "range_add_range_max",
+                                    "range_assign_range_min", "max_flow",
+                                    "range_assign_range_sum", "two_sat", "scc_graph",
                                     "heavy_light", "min_cost_flow", "weighted_union_find", "range_min_static",
-                                    "wavelet_matrix", "weighted_wavelet_matrix"))
+                                    "wavelet_matrix", "weighted_wavelet_matrix", "k_smallest_sum", "interval_set",
+                                    "imos", "imos2d", "optional", "setpq", "array", "list", "matrix", "multiset", "multimap", "unordered_set", "unordered_multiset", "unordered_map", "unordered_multimap", "dp_options", "rolling_hash", "trie", "aho_corasick",
+                                    "functional_graph_info", "functional_graph_orbit", "functional_graph_doubling",
+                                    "minimum_spanning_forest", "shortest_path_result", "grid_bfs_result",
+                                    "grid_bounds_result",
+                                    "connected_components_result", "strongly_connected_components_result",
+                                    "bellman_ford_result", "floyd_warshall_result", "graph",
+                                    "tree_info", "lowest_common_ancestor", "tree_diameter_result", "euler_trail_result",
+                                    "graph_cycle_result", "low_link_result", "comb", "gauss_jordan_result",
+                                    "shaped_gauss_jordan_result", "linear_system_result"))
         self.bare_functions: set[str] = set()
         self.lines = source.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         self.indent_style: str | None = None
@@ -190,8 +206,6 @@ class Parser:
     def end_statement(self) -> None:
         if self.current.kind in {"NEWLINE", "EOF"} or self.current.text in {";", "}"}:
             return
-        if self.current.text in {"++", "--"}:
-            raise KumaError("++ / -- は 現時点では未対応です。+= 1 / -= 1 を使ってください", self.current)
         if self.current.kind == "IDENT":
             raise KumaError("文の続きが解釈できません", self.current,
                             hint="入れ子の呼び出しは print max(a,b) のように () を残してください。同じ行の別の文は ; で区切ります。")
@@ -265,7 +279,8 @@ class Parser:
             self.end_statement()
             return Node("write", start, children=arguments)
         if start.text == "return":
-            if not self.lambda_depth and not self.main_entry_depth:
+            # Pure top-level execution belongs to the implicit entry.
+            if self.cpp and not self.lambda_depth and not self.main_entry_depth:
                 raise KumaError("return は関数の本体で使用してください", start)
             self.take()
             values = [] if self.at_end() else [self.rhs()]
@@ -309,15 +324,23 @@ class Parser:
 
         adaptor_type_head = (self.current.text in self.queue_stack_types
                              and self.queue_stack_type_head(self.current, self.tokens[self.position + 1]))
+        lazy_type_head = (not self.cpp and self.current.text == "lazy_segment_tree"
+                          and self.tokens[self.position + 1].text == "<"
+                          and self.tokens[self.position + 2].text in _TYPE_NAMES | self.user_types | {"("})
         if ((self.current.text in _TYPE_NAMES | self.user_types and self.tokens[self.position + 1].text != "(")
+                or (not self.cpp and self.current.text == "random_engine"
+                    and self.tokens[self.position + 1].kind == "IDENT")
                 or (self.current.text == "bitset" and self.current.text not in self.user_types
                     and self.tokens[self.position + 1].text == "<"
                     and self.tokens[self.position + 2].kind == "NUMBER")
-                or (self.current.text in {"min_heap", "max_heap", "deque"}
+                or (self.current.text in ({"min_heap", "max_heap", "deque"} if self.cpp else
+                                          {"min_heap", "max_heap", "deque", "coordinate_compressor", "fenwick", "range_fenwick", "segment_tree",
+                                           "disjoint_sparse_table", "sliding_window_aggregation", "sparse_table",
+                                           "subset_sum_counter"})
                     and self.current.text not in self.user_types
                     and self.tokens[self.position + 1].text == "<"
                     and (self.tokens[self.position + 2].text in _TYPE_NAMES | self.user_types or self.tokens[self.position + 2].text == "("))
-                or adaptor_type_head
+                or adaptor_type_head or lazy_type_head
                 or (self.current.text in {"max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"} and self.tokens[self.position + 1].kind == "IDENT"
                     and self.tokens[self.position + 2].text in {"=", "{"})
                 or self.current.text == "("):
@@ -328,7 +351,7 @@ class Parser:
                 declared_type = self.type_name()
             except KumaError:
                 # A tuple or contextual adaptor prefix may instead be an expression.
-                if start.text != "(" and not adaptor_type_head:
+                if start.text != "(" and not adaptor_type_head and not lazy_type_head:
                     raise
                 self.restore_type_trial(position, depth, split_mark)
             else:
@@ -542,7 +565,7 @@ class Parser:
         if self.accept("("):
             self.group_depth += 1
             self.soft_newlines()
-            if self.current.text in _TYPE_NAMES | self.user_types:
+            if self.current.text in _TYPE_NAMES | self.user_types or (not self.cpp and self.current.text == "random_engine"):
                 declared_type = self.type_name()
                 if declared_type == "auto":
                     declared_type = None
@@ -605,18 +628,45 @@ class Parser:
         if name.text == "long":
             self.expect("long", "64bit 整数には long long または ll を使ってください")
             return "long long"
+        if not self.cpp and name.text == "lazy_segment_tree" and self.accept("<"):
+            self.newlines()
+            parts = [self.type_name()]
+            for index in range(6):
+                self.newlines()
+                self.expect(",", "lazy_segment_tree の型には S, F と5つの演算関数名が必要です")
+                self.newlines()
+                parts.append(self.type_name() if index == 0 else self.identifier().text)
+            self.newlines()
+            self.close_type_arguments()
+            return name.text + "<" + ",".join(parts) + ">"
         if ((name.text in {"min_heap", "max_heap", "deque"} and name.text not in self.user_types
                 and self.current.text == "<") or self.queue_stack_type_head(name, self.current)
-                or (not self.cpp and name.text in {"range_min_static", "wavelet_matrix", "weighted_wavelet_matrix"})):
+                or (not self.cpp and name.text in {"range_min_static", "wavelet_matrix", "weighted_wavelet_matrix"})
+                or (not self.cpp and name.text in {"coordinate_compressor", "fenwick", "range_fenwick", "imos", "imos2d", "optional", "setpq", "list", "matrix", "multiset", "multimap", "unordered_set", "unordered_multiset", "unordered_map", "unordered_multimap", "segment_tree", "disjoint_sparse_table",
+                                                  "sliding_window_aggregation", "sparse_table", "subset_sum_counter", "comb",
+                                                  "weighted_union_find", "interval_set", "k_smallest_sum", "max_flow", "min_cost_flow",
+                                                  "gauss_jordan_result", "shaped_gauss_jordan_result", "linear_system_result",
+                                                  "minimum_spanning_forest"}
+                    and self.current.text == "<")):
             self.expect("<")
             arguments = self.type_arguments_after_open()
-            if len(arguments) != 1:
-                raise KumaError("型引数は1個にしてください", name)
-            return name.text + "<" + arguments[0] + ">"
+            arity = 2 if name.text in ("multimap", "unordered_map", "unordered_multimap", "min_cost_flow") else 1
+            if len(arguments) != arity:
+                raise KumaError(f"型引数は{arity}個にしてください", name)
+            return name.text + "<" + ",".join(arguments) + ">"
         if name.text == "bitset" and name.text not in self.user_types and self.current.text == "<":
             self.expect("<")
             width = self.bitset_width_literal(name)
             return f"bitset<{width}>"
+        if not self.cpp and name.text == "array" and self.accept("<"):
+            element, length = self.array_type_arguments()
+            return f"array<{element},{length}>"
+        if not self.cpp and name.text == "modint" and self.accept("<"):
+            return f"modint<{self.modulus_argument()}>"
+        if not self.cpp and name.text == "dynamic_modint" and self.accept("<"):
+            return f"dynamic_modint<{self.modint_id_argument()}>"
+        if not self.cpp and name.text == "random_engine":
+            return name.text
         if name.text in _SCALARS | {"auto", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"} | self.user_types:
             return name.text
         if name.text in {"vec", "vector", "tuple", "prefix2d", *_CONSTRUCTORS}:
@@ -628,13 +678,18 @@ class Parser:
             return name.text + "<" + ",".join(arguments) + ">"
         raise KumaError(f"現時点では未対応の型です: {name.text}", name)
 
-    def bitset_width_literal(self, token: Token) -> str:
+    def bitset_width_literal(self, token: Token, *, multiline=False) -> str:
+        if multiline:
+            self.newlines()
         if self.current.kind != "NUMBER" or "." in self.current.text:
             raise KumaError("bitset の幅は 0 以上の10進整数リテラルにしてください", self.current)
         width = self.take().text
         if not re.fullmatch(r"[0-9]+", width):
             raise KumaError("bitset の幅は 0 以上の10進整数リテラルにしてください", token)
-        self.soft_newlines()
+        if multiline:
+            self.newlines()
+        else:
+            self.soft_newlines()
         if self.current.text == ">>":
             marker = self.current
             self.type_splits.append((self.position, marker))
@@ -642,6 +697,46 @@ class Parser:
         else:
             self.expect(">", "bitset の型引数を閉じる > が必要です")
         return width
+
+    def modint_id_argument(self) -> str:
+        self.newlines()
+        negative = self.accept("-")
+        identifier = self.take()
+        if identifier.kind != "NUMBER" or not re.fullmatch(r"[0-9]+", identifier.text):
+            raise KumaError("dynamic_modint のIDには10進整数リテラルを使ってください", identifier)
+        self.newlines()
+        self.close_type_arguments()
+        return ("-" if negative else "") + identifier.text
+
+    def modulus_argument(self) -> str:
+        self.newlines()
+        modulus = self.take()
+        if modulus.kind != "NUMBER" or not re.fullmatch(r"[0-9]+", modulus.text):
+            raise KumaError("modint の法には正の10進整数リテラルを使ってください", modulus)
+        self.newlines()
+        self.close_type_arguments()
+        return modulus.text
+
+    def array_type_arguments(self) -> tuple[str, str]:
+        self.newlines()
+        element = self.type_name()
+        self.newlines()
+        self.expect(",")
+        self.newlines()
+        length = self.take()
+        if length.kind != "NUMBER" or not re.fullmatch(r"[0-9]+", length.text):
+            raise KumaError("array の長さには0以上の10進整数リテラルを使ってください", length)
+        self.newlines()
+        self.close_type_arguments()
+        return element, length.text
+
+    def close_type_arguments(self) -> None:
+        if self.current.text == ">>":
+            token = self.current
+            self.type_splits.append((self.position, token))
+            self.tokens[self.position] = Token(">", ">", token.line, token.column + 1, token.indent)
+        else:
+            self.expect(">", "型引数を閉じる > が必要です")
 
     def type_arguments_after_open(self) -> list[str]:
         self.newlines()
@@ -651,13 +746,34 @@ class Parser:
             self.newlines()
             arguments.append(self.type_name())
             self.newlines()
-        if self.current.text == ">>":
-            token = self.current
-            self.type_splits.append((self.position, token))
-            self.tokens[self.position] = Token(">", ">", token.line, token.column + 1, token.indent)
-        else:
-            self.expect(">", "型引数を閉じる > が必要です")
+        self.close_type_arguments()
         return arguments
+
+    def _grouped_print_argument(self, start: Token) -> bool:
+        # A spaced group with a postfix is an argument, not the call to print.
+        opening = self.current
+        if (self.cpp or start.text != "print" or opening.line != start.line
+                or opening.column <= start.column + len(start.text)):
+            return False
+        closers = {"(": ")", "[": "]", "{": "}"}
+        stack = []
+        for index in range(self.position, len(self.tokens)):
+            token = self.tokens[index]
+            if token.kind in closers:
+                stack.append(closers[token.kind])
+            elif token.kind in closers.values():
+                if token.kind != stack.pop():
+                    return False
+                if not stack:
+                    following = self.tokens[index + 1]
+                    if following.kind == "[" or following.text in {"++", "--"}:
+                        return True
+                    # expression_tail also allows a leading dot on a later line.
+                    while following.kind == "NEWLINE":
+                        index += 1
+                        following = self.tokens[index + 1]
+                    return following.kind == "." and self.tokens[index + 2].kind == "IDENT"
+        return False
 
     def rhs(self) -> Node:
         """Bare calls are allowed only for an entire RHS or statement."""
@@ -677,7 +793,10 @@ class Parser:
         types = []
         if start.text == "input" and self.accept("<"):
             types = self.type_arguments_after_open()
-        if self.current.text == "(":
+        if self.current.text == "(" and not self._grouped_print_argument(start):
+            spread = self.named_call_spread(start) if not types else None
+            if spread is not None:
+                return self.expression_tail(spread, 0)
             arguments, keywords = self.arguments()
             node = Node("call", start, start.text, arguments, {"types": types, "kwargs": keywords})
             return self.expression_tail(node, 0)
@@ -701,7 +820,12 @@ class Parser:
     def expression(self, minimum: int = 0) -> Node:
         self.soft_newlines()
         start = self.current
-        if start.text in {"+", "-", "!", "~"}:
+        if start.text in {"++", "--"}:
+            self.take()
+            self.newlines()
+            kind = "unary" if self.cpp else "modint_update"
+            left = Node(kind, start, start.text, [self.expression(15)])
+        elif start.text in {"+", "-", "!", "~"}:
             self.take()
             self.newlines()
             left = Node("unary", start, start.text, [self.expression(13)])
@@ -719,6 +843,11 @@ class Parser:
                 if self.tokens[lookahead].text == ".":
                     self.position = lookahead
             token = self.current
+            if token.text in {"++", "--"}:
+                self.take()
+                kind = "postfix" if self.cpp else "modint_update"
+                left = Node(kind, token, token.text, [left], {"postfix": True})
+                continue
             if token.text in {"(", "["}:
                 # An opening delimiter on a later line is not an implicit call.
                 previous = self.tokens[self.position - 1]
@@ -727,6 +856,10 @@ class Parser:
                 if token.text == "(":
                     if left.kind == "name" and left.value in _LATER_CALLS:
                         raise KumaError(f"{left.value} は現時点では未対応です", left.token)
+                    spread = self.named_call_spread(left.token) if left.kind == "name" and left.value == left.token.text else None
+                    if spread is not None:
+                        left = spread
+                        continue
                     arguments, keywords = self.arguments()
                     if left.kind == "name":
                         left = Node("call", left.token, left.value, arguments, {"types": [], "kwargs": keywords})
@@ -839,13 +972,90 @@ class Parser:
         if token.kind == "IDENT":
             if self.accept("=>"):
                 return self.lambda_body(token, [(token.text, None)])
-            if ((token.text in _CONSTRUCTORS or (not self.cpp and token.text in {"wavelet_matrix", "weighted_wavelet_matrix"}))
+            if (not self.cpp and token.text in {"scan", "in", "in_tuple", "in_rows"}
+                    and [t.text for t in self.tokens[self.position:self.position + 3]] == ["<", ">", "("]):
+                self.position += 2
+                arguments, keywords = self.arguments()
+                return Node("call", token, token.text, arguments, {"kwargs": keywords})
+            if not self.cpp and token.text == "between" and self.current.text == "<":
+                tail = [t.text for t in self.tokens[self.position + 1:self.position + 6]]
+                single = len(tail) >= 3 and tail[0] in ("true", "false") and tail[1:3] == [">", "("]
+                double = (len(tail) == 5 and tail[0] in ("true", "false") and tail[1] == ","
+                          and tail[2] in ("true", "false") and tail[3:] == [">", "("])
+                if single or double:
+                    self.position += 3 if single else 5
+                    arguments, keywords = self.arguments()
+                    endpoints = (tail[0], tail[2] if double else "true")
+                    return Node("call", token, "between", arguments, {"kwargs": keywords, "interval_endpoints": endpoints})
+            if (not self.cpp and token.text in {"all_adjacent", "any_adjacent", "filter_adjacent"}
+                    and self.current.text == "<" and self.tokens[self.position + 1].kind == "NUMBER"
+                    and self.tokens[self.position + 2].text == ">" and self.tokens[self.position + 3].text == "("):
+                self.take()
+                width = self.take()
+                self.expect(">")
+                arguments, keywords = self.arguments()
+                arguments.insert(1 if arguments else 0, Node("literal", width, width.text, extra={"type": "i64"}))
+                return Node("call", token, token.text, arguments, {"kwargs": keywords})
+            if not self.cpp and token.text in {"array", "in_array"} and self.accept("<"):
+                element, length = self.array_type_arguments()
+                arguments, keywords = self.arguments()
+                return Node("call", token, token.text, arguments, {"types": [element, length], "kwargs": keywords})
+            if not self.cpp and token.text == "modint" and self.accept("<"):
+                modulus = self.modulus_argument()
+                arguments, keywords = self.arguments()
+                return Node("call", token, token.text, arguments, {"types": [modulus], "kwargs": keywords})
+            if not self.cpp and token.text in {"dynamic_modint", "set_mod"} and self.accept("<"):
+                identifier = self.modint_id_argument()
+                arguments, keywords = self.arguments()
+                return Node("call", token, token.text, arguments, {"types": [identifier], "kwargs": keywords})
+            checked_typed = (not self.cpp and token.text in {
+                "lazy_segment_tree", "divisor_sum", "sum_sq", "sum_cu", "nCr", "nPr", "nHr", "comb",
+                "weighted_union_find", "interval_set", "k_smallest_sum", "max_flow", "min_cost_flow", "kruskal",
+                "make_segtree", "make_min_segtree", "make_max_segtree",
+                "make_sum_segtree", "make_gcd_segtree", "make_and_segtree", "make_or_segtree", "make_xor_segtree",
+                "inclusion_exclusion_sum",
+                "sum_as",
+                "mint_cast", "mint_raw",
+                "scan", "in", "rd", "in_tuple", "in_vector", "in_rows", "in_mat", "in_mat3",
+                "in_deque", "in_queue", "in_stack", "in_pq", "in_maxpq", "in_minpq", "in_set", "in_map",
+                "recur", "memoize", "optional", "setpq", "in_setpq", "min_heap", "max_heap", "list", "in_list_seq", "matrix", "matrix_identity", "multiset", "multimap", "unordered_set", "unordered_multiset", "unordered_map", "unordered_multimap", "in_mset", "in_mmap", "in_uset", "in_umset", "in_umap", "in_ummap", "split", "split_into", "getline_vec", "getline_into", "coordinate_compressor", "imos", "imos2d",
+            }
+                             and self.current.text == "<"
+                             and (self.tokens[self.position + 1].text in _TYPE_NAMES | self.user_types | {"("}
+                                  or token.text in {"split_into", "getline_into"}
+                                  and self.tokens[self.position + 1].text in QUEUE_STACK | {"deque", "min_heap", "max_heap"}))
+            multiline_list = (token.text == "list" and self.current.text == "<"
+                              and self.tokens[self.position + 1].kind == "NEWLINE")
+            if (not self.cpp and self.current.text == "<"
+                    and (token.text in ({"vec", "vector", "deque"} | QUEUE_STACK) or multiline_list)):
+                saved = self.position, self.group_depth, len(self.type_splits)
+                self.take()
+                try:
+                    types = self.type_arguments_after_open()
+                except KumaError:
+                    self.restore_type_trial(*saved)
+                else:
+                    if self.current.text == "(":
+                        # Keep a nonempty group available as the RHS of an
+                        # existing comparison outside known constructor syntax.
+                        empty_only = token.text in QUEUE_STACK or token.text == "deque" or multiline_list
+                        call = self.position + 1
+                        if empty_only:
+                            while self.tokens[call].kind == "NEWLINE":
+                                call += 1
+                        if not empty_only or self.tokens[call].text == ")":
+                            arguments, keywords = self.arguments()
+                            return Node("call", token, token.text, arguments, {"types": types, "kwargs": keywords})
+                    self.restore_type_trial(*saved)
+            if ((checked_typed or token.text in _CONSTRUCTORS or (not self.cpp and token.text in
+                    {"wavelet_matrix", "weighted_wavelet_matrix", "fenwick", "range_fenwick", "segment_tree",
+                     "disjoint_sparse_table", "sliding_window_aggregation", "sparse_table", "subset_sum_counter"}))
                     and self.accept("<")):
                 types = self.type_arguments_after_open()
                 arguments, keywords = self.arguments()
                 return Node("call", token, token.text, arguments, {"types": types, "kwargs": keywords})
             if token.text == "bitset" and self.accept("<"):
-                width = self.bitset_width_literal(token)
+                width = self.bitset_width_literal(token, multiline=not self.cpp)
                 arguments, keywords = self.arguments()
                 if arguments or keywords:
                     raise KumaError("bitset<N>() と書いてください", token)
@@ -881,14 +1091,30 @@ class Parser:
             self.expect(")")
             self.group_depth -= 1
             return first
+        if token.text == "{" and not self.cpp:
+            return self.dict_spread_literal(token)
         if token.text == "[":
             self.group_depth += 1
             self.soft_newlines()
             elements = []
             while self.current.text != "]":
-                elements.append(self.expression())
+                spread = self.accept("...")
+                if spread:
+                    if not self.allow_array_spread:
+                        raise KumaError("配列リテラルの ... は純Kumaで使ってください", spread,
+                                        code="KUMA_ARRAY_SPREAD")
+                    self.soft_newlines()
+                    if self.current.kind == "EOF" or self.current.text in ("]", ",", "for"):
+                        raise KumaError("... の後に展開する配列を書いてください", spread,
+                                        code="KUMA_ARRAY_SPREAD")
+                    elements.append(Node("spread_element", spread, children=[self.expression()]))
+                else:
+                    elements.append(self.expression())
                 self.soft_newlines()
                 if self.current.text == "for":
+                    if any(element.kind == "spread_element" for element in elements):
+                        raise KumaError("内包表記の結果には ... を使えません", self.current,
+                                        code="KUMA_ARRAY_SPREAD")
                     if len(elements) != 1:
                         raise KumaError("内包表記の結果は1つの式です。組を作る場合は (a, b) と書いてください", self.current)
                     clauses = self.comprehension_clauses()
@@ -900,10 +1126,47 @@ class Parser:
                 self.newlines()
             self.expect("]")
             self.group_depth -= 1
-            return Node("array", token, children=elements)
-        if token.text in {"++", "--"}:
-            raise KumaError("++ / -- は 現時点では未対応です。+= 1 / -= 1 を使ってください", token)
+            kind = "array_spread" if any(element.kind == "spread_element" for element in elements) else "array"
+            return Node(kind, token, children=elements)
+        if token.text == "...":
+            raise KumaError("... は配列リテラルの要素として使ってください", token,
+                            code="KUMA_ARRAY_SPREAD")
         raise KumaError("式が必要です", token)
+
+    def dict_spread_literal(self, opening: Token) -> Node:
+        """Parse a brace expression containing at least one dictionary spread."""
+        self.group_depth += 1
+        try:
+            self.soft_newlines()
+            parts = []
+            has_spread = False
+            while self.current.text != "}":
+                spread = self.accept("...")
+                if spread:
+                    if not self.allow_dict_spread:
+                        raise KumaError("辞書リテラルの ... は純Kumaで使ってください", spread,
+                                        code="KUMA_DICT_SPREAD")
+                    self.soft_newlines()
+                    if self.current.kind == "EOF" or self.current.text in ("}", ","):
+                        raise KumaError("... の後に展開する辞書を書いてください", spread,
+                                        code="KUMA_DICT_SPREAD")
+                    parts.append(Node("spread_element", spread, children=[self.expression()]))
+                    has_spread = True
+                else:
+                    key = self.expression()
+                    self.expect(":", "辞書の要素は key: value と書いてください")
+                    parts.append(Node("dict_spread_entry", key.token, children=[key, self.expression()]))
+                self.soft_newlines()
+                if not self.accept(","):
+                    break
+                self.newlines()
+            self.expect("}")
+            if not has_spread:
+                raise KumaError("辞書の波括弧リテラルには ... で展開する辞書が必要です", opening,
+                                code="KUMA_DICT_SPREAD", hint="個別の要素から作るなら dict([(key, value)]) を使います。")
+            return Node("dict_spread", opening, children=parts)
+        finally:
+            self.group_depth -= 1
 
     def parenthesized_lambda(self) -> bool:
         """Recognize a parameter header without changing parser/type state."""
@@ -929,6 +1192,10 @@ class Parser:
             annotation = None
             const = bool(self.accept("const"))
             if (self.current.text in _TYPE_NAMES | self.user_types | {"deque", "bitset", "max_heap", "min_heap", "coordinate_compressor", "range_fenwick", "fenwick", "union_find", "dfs_result"}
+                    or (not self.cpp and self.current.text == "random_engine")
+                    or (not self.cpp and self.current.text in {"segment_tree", "disjoint_sparse_table", "sliding_window_aggregation",
+                                                              "sparse_table", "subset_sum_counter", "lazy_segment_tree"}
+                        and self.tokens[self.position + 1].text == "<")
                     or self.current.text == "("
                     or (self.current.text in self.queue_stack_types
                         and self.queue_stack_type_head(self.current, self.tokens[self.position + 1]))):
@@ -1041,6 +1308,65 @@ class Parser:
             self.soft_newlines()
         return clauses
 
+    def call_ellipsis(self, position: int) -> tuple[Token | None, int]:
+        token = self.tokens[position]
+        return (token, 1) if token.text == "..." else (None, 0)
+
+    def named_call_spread(self, callee: Token) -> Node | None:
+        """Recognize a prefix ellipsis at an argument boundary."""
+        if not self.has_ellipsis:
+            return None
+        depth, boundary = 0, True
+        for position in range(self.position + 1, len(self.tokens)):
+            current = self.tokens[position]
+            if current.kind == "EOF" or (depth == 0 and current.text in (")", ";", "}")):
+                return None
+            if current.kind == "NEWLINE":
+                continue
+            if depth == 0 and boundary and (token := self.call_ellipsis(position)[0]):
+                break
+            if current.text in ("(", "[", "{"):
+                depth += 1
+            elif current.text in (")", "]", "}"):
+                depth -= 1
+            boundary = depth == 0 and current.text == ","
+        else:
+            return None
+        if not self.allow_call_spread:
+            raise KumaError("関数の引数の ... は純Kumaまたは対応する標準混在Kumaで使ってください",
+                            token, code="KUMA_CALL_SPREAD")
+        self.take()
+        self.group_depth += 1
+        try:
+            self.soft_newlines()
+            parts = []
+            found = False
+            while self.current.text != ")":
+                spread, width = self.call_ellipsis(self.position)
+                if spread:
+                    if found:
+                        raise KumaError("1回の呼び出しで展開できる組は1つです", spread, code="KUMA_CALL_SPREAD")
+                    found = True
+                    self.position += width
+                    self.soft_newlines()
+                    if self.current.kind == "EOF" or self.current.text in (")", ","):
+                        raise KumaError("... の後に展開する pair または tuple を書いてください", spread,
+                                        code="KUMA_CALL_SPREAD")
+                    parts.append(Node("spread_element", spread, children=[self.expression()]))
+                else:
+                    if self.current.kind == "IDENT" and self.tokens[self.position + 1].text == "=":
+                        raise KumaError("引数の展開とオプション引数は併用できません", self.current,
+                                        code="KUMA_CALL_SPREAD")
+                    parts.append(self.expression())
+                self.soft_newlines()
+                if not self.accept(","):
+                    break
+                self.newlines()
+            self.expect(")")
+            return Node("call_spread", token, callee.text, parts, {"callee_token": callee})
+        finally:
+            self.group_depth -= 1
+
     def arguments(self) -> tuple[list[Node], dict[str, Node]]:
         self.expect("(")
         self.group_depth += 1
@@ -1048,6 +1374,9 @@ class Parser:
         keywords = {}
         self.soft_newlines()
         while self.current.text != ")":
+            if self.current.text == "...":
+                raise KumaError("引数の展開は名前付き関数への f(...p) に限ります。他の引数は並べられません",
+                                self.current, code="KUMA_CALL_SPREAD")
             if self.current.kind == "IDENT" and self.tokens[self.position + 1].text == "=":
                 name = self.take()
                 self.take()
@@ -1068,9 +1397,9 @@ class Parser:
         return arguments, keywords
 
 
-def parse(source: str) -> list[Node]:
+def parse(source: str, *, mode: str = "auto") -> list[Node]:
     """Parse the complete source or raise a location-bearing KumaError."""
-    return Parser(source).program()
+    return Parser(source, mode=mode).program()
 
 @dataclass
 class _Segment:
@@ -1188,6 +1517,9 @@ def parse_interpolation(owner, token: Token) -> Node:
             pending_text = ''
             try:
                 sub = Parser(segment.expr_source or '', cpp=owner.cpp)
+                sub.allow_array_spread = owner.allow_array_spread
+                sub.allow_dict_spread = owner.allow_dict_spread
+                sub.allow_call_spread = owner.allow_call_spread
                 sub.tokens = [Token(t.kind, t.text, token.line,
                                     token.column + segment.expr_offset + t.column - 1,
                                     token.indent) for t in sub.tokens]
@@ -1206,6 +1538,8 @@ def parse_interpolation(owner, token: Token) -> Node:
                     raise KumaError('ここでは !r / !s / !a・デバッグ用の = は未対応です'
                                     if sub.current.text in {'!', '='} else '式の続きが解釈できません', token)
             except KumaError as error:
+                if error.code in ('KUMA_ARRAY_SPREAD', 'KUMA_DICT_SPREAD', 'KUMA_CALL_SPREAD'):
+                    raise
                 raise KumaError('文字列内の式: ' + error.message, token,
                                 hint='プレースホルダ内は単一のKuma式にしてください。') from error
             expressions.append(expr)

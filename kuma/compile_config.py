@@ -7,6 +7,7 @@ silently discard unfamiliar flags, follow response files, or invoke a launcher.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,91 @@ import shlex
 from .model import KumaError
 
 MAX_DATABASE_BYTES = 2 * 1024 * 1024
+
+
+# The shipped ACL submodule at 864245a00b00dd008d1abfdc239618fdb7d139da.
+# Only atcoder/ participates in the compiler include paths. The names, format
+# and content fingerprint exclude replacements under that namespace too.
+_STOCK_ACL_HEADERS_SHA256 = 'f21a392d5e240dcc6a657736a6938445b483f7b076547380c84fffb15a42f4cd'
+_STOCK_ACL_ROOT_FILES = frozenset({
+    '.clang-format', '.git', '.gitignore', '.gitmodules', 'LICENSE', 'README.md', 'expander.py',
+})
+_STOCK_ACL_ROOT_DIRS = frozenset({
+    '.github', 'atcoder', 'document_en', 'document_ja', 'test', 'tools',
+})
+
+
+def _stock_acl_include_path(value):
+    """Trust only the current package's unmodified, narrow ACL include root."""
+    if value is None:
+        return True
+    if not value or os.pathsep in value or not Path(value).is_absolute():
+        return False
+    try:
+        expected = Path(__file__).resolve().parents[1] / 'third_party' / 'ac-library'
+        if expected.is_symlink() or expected.parent.is_symlink() or Path(value).resolve(strict=True) != expected:
+            return False
+        for entry in expected.iterdir():
+            if (entry.is_symlink() or not (
+                    entry.name in _STOCK_ACL_ROOT_FILES and entry.is_file()
+                    or entry.name in _STOCK_ACL_ROOT_DIRS and entry.is_dir())):
+                return False
+        headers = sorted((expected / 'atcoder').iterdir())
+        if len(headers) != 37:
+            return False
+        digest = hashlib.sha256()
+        for header in headers:
+            if header.is_symlink() or not header.is_file() or header.stat().st_size > 128 * 1024:
+                return False
+            digest.update(header.name.encode('ascii') + b'\0' + hashlib.sha256(header.read_bytes()).digest())
+        return digest.hexdigest() == _STOCK_ACL_HEADERS_SHA256
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def stock_cpp_flags(flags) -> bool:
+    """Whether the supplied flags leave standard name/header lookup intact."""
+    return not any(flag != '-DAC_NO_ACL' and flag.startswith((
+        '@', '-include', '--include', '-imacros', '-D', '-U', '-Xclang',
+        '-I', '-isystem', '-iquote', '-idirafter', '-iprefix', '-iwithprefix',
+        '-isysroot', '--sysroot', '-nostdinc', '-Wp,', '--config',
+        '--compile-commands-dir', '-Xpreprocessor', '-B', '-specs', '--specs',
+    )) for flag in flags)
+
+
+def stock_compiler_preprocessing(filename: str | Path, compile_commands=None) -> bool:
+    """Conservatively check the stock CLI's configured/discoverable C++ driver.
+
+    This cannot infer flags on a separately invoked compiler for a caller
+    that does not give the transpiler its CXX or compile_commands settings.
+    """
+    from .toolchain import GNU_CXX_NAMES, _which
+
+    if (any(os.environ.get(name) for name in (
+            'CPATH', 'C_INCLUDE_PATH', 'OBJC_INCLUDE_PATH', 'CCC_OVERRIDE_OPTIONS', 'GCC_EXEC_PREFIX'))
+            or not _stock_acl_include_path(os.environ.get('CPLUS_INCLUDE_PATH'))):
+        return False
+    try:
+        configured = os.environ.get('CXX')
+        if configured is None:
+            driver = next((path for name in GNU_CXX_NAMES if (path := _which(name))), None)
+            arguments = []
+        else:
+            command = shlex.split(configured)
+            driver = _which(command[0]) if command else None
+            arguments = command[1:]
+        if driver is None:
+            return False
+        path = str(Path(driver).resolve(strict=True))
+        flags = compile_config(filename, compile_commands).flags
+    except (KumaError, OSError, RuntimeError, ValueError):
+        return False
+    # Do not execute an arbitrary program to test whether it is a compiler.
+    return bool(re.fullmatch(
+        r'(?:/usr/bin/(?:[\w-]+-)?|/usr/lib/llvm-\d+/bin/|'
+        r'/(?:opt/homebrew|usr/local)/Cellar/(?:gcc|llvm)(?:@\d+)?/[^/]+/bin/)'
+        r'(?:clang(?:\+\+)?|g\+\+)(?:-\d+)?', path
+    )) and stock_cpp_flags((*flags, *arguments))
 
 
 @dataclass(frozen=True)

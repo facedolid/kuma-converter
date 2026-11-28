@@ -35,9 +35,9 @@ python3 convert.py example.kuma -o example.cpp
 
 ## 生成C++をコンパイルする
 
-変換結果は`kuma.hpp`を参照します。このヘッダは`ac.hpp`と`ac_io.hpp`に依存します。変換器の配布物にこれらは含めていません。
+純Kumaの変換結果は通常 `kuma_runtime.hpp` と、その依存先の `ac.hpp` を使います。混在コードと `split` などの分割関数を使うコードは、`ac_io.hpp` も読み込む互換用の `kuma.hpp` を使います。変換器の配布物にヘッダは含めていません。
 
-公開ヘッダは[atcoder-headers](https://github.com/facedolid/atcoder-headers)で管理されています。互換性のある同一版の`kuma.hpp`、`ac.hpp`、`ac_io.hpp`を別の`headers/`フォルダへ置きます。入力ソースが別のライブラリをincludeしていれば、その依存も必要です。ヘッダの取得や更新を変換器が自動で行うことはありません。
+公開ヘッダは[atcoder-headers](https://github.com/facedolid/atcoder-headers)で管理されています。変換器と組み合わせて使える公開版の `include/` を別の `headers/` フォルダへ置きます。入力ソースが別のライブラリをincludeしていれば、その依存も必要です。ヘッダの取得や更新を変換器が自動で行うことはありません。
 
 GNU C++23対応のGCCを使う場合の例です。`g++`は実際にインストールしたGCCの名前に読み替えます。
 

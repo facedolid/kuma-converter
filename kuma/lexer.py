@@ -174,7 +174,10 @@ def lex(source: str, *, cpp: bool = False) -> list[Token]:
             column += len(text)
             continue
 
-        operator = next((op for op in _OPERATORS if source.startswith(op, position)), None)
+        # Pure Kuma uses an ellipsis only for array spread. Preserve the
+        # existing mixed/C++ tokenization, including native parameter packs.
+        operator = ("..." if not cpp and source.startswith("...", position) else
+                    next((op for op in _OPERATORS if source.startswith(op, position)), None))
         if operator is not None:
             tokens.append(Token(operator, operator, line, column, indent))
             position += len(operator)

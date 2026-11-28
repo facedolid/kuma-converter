@@ -10,7 +10,8 @@ from .model import Token
 
 
 class NativeBodies:
-    def __init__(self, tokens: list[Token], macros: set[str] | None = None):
+    def __init__(self, tokens: list[Token], macros: set[str] | None = None, *,
+                 stock_yn_after_line: int | None = None):
         self.tokens = tokens
         self.pairs: dict[int, int] = {}
         self.following: dict[int, int] = {}
@@ -48,6 +49,8 @@ class NativeBodies:
         for i in significant:
             before = self.previous.get(i, -1)
             likely_macro = (tokens[i].text.isupper() and tokens[i].text not in class_names
+                            and not (tokens[i].text == 'YN' and stock_yn_after_line is not None
+                                     and tokens[i].line > stock_yn_after_line)
                             and not (before >= 0 and tokens[before].kind == 'IDENT'
                                      and tokens[before].text not in {'return', 'co_return'}))
             if tokens[i].kind != 'IDENT' or not (tokens[i].text in (macros or set()) or likely_macro):
